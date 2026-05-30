@@ -1,0 +1,534 @@
+//! External-store-backed session storage.
+//!
+//! [`StoreBackedSessionStore`] keeps an encrypted pointer cookie in the browser
+//! and delegates actual session data to an [`ExternalSessionStore`] (Redis, a
+//! database, etc.). The external store receives [`PersistedSessionState`] on
+//! creation and returns its own `Session` type, which may enrich the persisted
+//! state with domain-specific fields.
+
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use http::HeaderValue;
+use huskarl::core::crypto::cipher::{
+    AeadSealer, AeadUnsealer, AeadV1Sealer, AeadV1Unsealer, BoxedAeadCipher,
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::{
+    cookie::{cookie_attrs, get_cookie},
+    session::{SessionDriver, SessionError, to_session_err},
+    session_state::{Session, SessionState},
+};
+
+/// Trait for external session data stores (Redis, database, etc.).
+///
+/// This is the only trait users need to implement to use store-backed sessions.
+/// The cookie mechanics (pointer cookie encryption, session key generation) are
+/// handled by [`StoreBackedSessionStore`].
+///
+/// The associated [`Session`](Self::SessionType) type is what the middleware works
+/// with after login. For the simplest case, use [`PersistedSessionState`]
+/// directly. For enriched sessions (e.g. with user profile data), define a
+/// custom type that implements [`Session`] and [`PersistedSession`], embedding
+/// a `PersistedSessionState`.
+pub trait ExternalSessionStore: Send + Sync {
+    /// The session type returned by this store.
+    ///
+    /// Must implement [`Session`] so the middleware can inspect token expiry,
+    /// refresh tokens, etc., and [`PersistedSession`] so the framework can
+    /// reach the embedded [`PersistedSessionState`] (session key plus any
+    /// future framework-managed fields).
+    type SessionType: Session + PersistedSession + Send + Sync + 'static;
+
+    /// The error type returned by store operations.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Create a new session from framework-prepared state.
+    ///
+    /// Called after a successful OAuth callback. The store should persist the
+    /// session and return its (possibly enriched) session type.
+    ///
+    /// `completed` is provided so the store can read ID token claims (e.g.
+    /// `email`, `name`, non-standard `extra` fields) when denormalizing into
+    /// a user record. Standard `sub`/`sid` are already extracted into
+    /// `persisted.state` and don't need to be re-parsed.
+    fn create(
+        &self,
+        persisted: PersistedSessionState,
+        completed: &crate::grant::CompletedLogin,
+    ) -> impl Future<Output = Result<Self::SessionType, Self::Error>> + Send;
+
+    /// Load a session by its key. Returns `None` if the key does not exist.
+    ///
+    /// The key is a `UUIDv7` — passed by value because `Uuid` is `Copy` and
+    /// 16 bytes. Implementations that key records by string form should call
+    /// `session_key.to_string()` (or `as_simple()` for a hyphen-free form).
+    fn load(
+        &self,
+        session_key: Uuid,
+    ) -> impl Future<Output = Result<Option<Self::SessionType>, Self::Error>> + Send;
+
+    /// Save a session. Called when the session has been mutated (e.g. after a
+    /// token refresh).
+    fn save(
+        &self,
+        session: &Self::SessionType,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Extend the TTL of a session without rewriting data.
+    ///
+    /// Called on every authenticated request that doesn't trigger a full save.
+    /// Implementations may choose to no-op or throttle this.
+    fn touch(
+        &self,
+        session: &Self::SessionType,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Delete a session.
+    fn delete(
+        &self,
+        session: &Self::SessionType,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// Framework-managed session state carried by every store-backed session.
+///
+/// Contains the session key, session state, and any future framework-managed
+/// fields (e.g. step-up auth timestamp, MFA assertions, revocation versions).
+/// Built by the framework and passed to [`ExternalSessionStore::create`] after
+/// a successful login.
+///
+/// The struct is `#[non_exhaustive]` so new framework-managed fields can be
+/// added in a minor release without breaking store implementations.
+///
+/// For simple stores that don't need to enrich sessions, use
+/// `PersistedSessionState` directly as your [`ExternalSessionStore::SessionType`]
+/// type. For enriched sessions, embed this in your custom type and implement
+/// [`PersistedSession`] (and [`Session`]) by forwarding to the embedded value.
+#[non_exhaustive]
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PersistedSessionState {
+    /// The random session key used as the primary lookup key in the external
+    /// store. A time-ordered `UUIDv7`.
+    pub session_key: Uuid,
+    /// Shared token and timing state. See [`SessionState`] for the field set.
+    pub state: SessionState,
+}
+
+impl PersistedSessionState {
+    /// The random session key used as the primary lookup key in the external store.
+    #[must_use]
+    pub fn session_key(&self) -> Uuid {
+        self.session_key
+    }
+
+    /// The subject identifier (`sub` claim) from the ID token, if present.
+    #[must_use]
+    pub fn sub(&self) -> Option<&str> {
+        self.state.sub.as_deref()
+    }
+
+    /// The session identifier (`sid` claim) from the ID token, if present.
+    #[must_use]
+    pub fn sid(&self) -> Option<&str> {
+        self.state.sid.as_deref()
+    }
+}
+
+impl Session for PersistedSessionState {
+    fn state(&self) -> &SessionState {
+        &self.state
+    }
+    fn set_state(&mut self, state: SessionState) {
+        self.state = state;
+    }
+}
+
+/// Trait implemented by every store-backed session type, exposing the
+/// embedded [`PersistedSessionState`] to the framework.
+///
+/// `PersistedSessionState` carries the session key plus any framework-managed
+/// fields. Requiring this trait on `ExternalSessionStore::SessionType` lets the
+/// framework rely on those fields being present without store implementations
+/// having to opt in per-capability.
+///
+/// The default implementation on `PersistedSessionState` itself is trivial;
+/// enriched session types implement this by forwarding to their embedded
+/// `PersistedSessionState` field.
+pub trait PersistedSession {
+    /// Returns a shared reference to the embedded [`PersistedSessionState`].
+    fn persisted(&self) -> &PersistedSessionState;
+
+    /// Returns a mutable reference to the embedded [`PersistedSessionState`].
+    fn persisted_mut(&mut self) -> &mut PersistedSessionState;
+}
+
+impl PersistedSession for PersistedSessionState {
+    fn persisted(&self) -> &PersistedSessionState {
+        self
+    }
+    fn persisted_mut(&mut self) -> &mut PersistedSessionState {
+        self
+    }
+}
+
+/// Generates a time-ordered session key using UUID v7.
+fn generate_session_key() -> Uuid {
+    Uuid::now_v7()
+}
+
+/// A session store that keeps an encrypted pointer cookie in the browser and
+/// stores session data in an external [`ExternalSessionStore`].
+///
+/// The pointer cookie contains the encrypted session key (a random string).
+/// The actual session data is stored via the external store, which receives
+/// [`PersistedSessionState`] on creation and returns its own session type.
+pub struct StoreBackedSessionStore<E> {
+    external: E,
+    sealer: AeadV1Sealer<BoxedAeadCipher>,
+    unsealer: AeadV1Unsealer<BoxedAeadCipher>,
+    cookie_name: String,
+    secure: bool,
+    cookie_path: String,
+}
+
+impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
+    /// Creates a new store-backed session store.
+    ///
+    /// - `external` -- the external store implementation (Redis, DB, etc.)
+    /// - `cipher` -- AEAD cipher for encrypting/decrypting the pointer cookie
+    /// - `cookie_name` -- name of the pointer cookie
+    /// - `secure` -- whether to set the `Secure` cookie attribute
+    /// - `cookie_path` -- the `Path` cookie attribute
+    pub fn new(
+        external: E,
+        cipher: BoxedAeadCipher,
+        cookie_name: impl Into<String>,
+        secure: bool,
+        cookie_path: impl Into<String>,
+    ) -> Self {
+        Self {
+            external,
+            sealer: AeadV1Sealer::new(cipher.clone()),
+            unsealer: AeadV1Unsealer::new(cipher),
+            cookie_name: cookie_name.into(),
+            secure,
+            cookie_path: cookie_path.into(),
+        }
+    }
+
+    fn cookie_attrs(&self) -> String {
+        cookie_attrs(self.secure, &self.cookie_path)
+    }
+
+    /// Encrypt and return a pointer cookie header value.
+    ///
+    /// The plaintext is the UUID's 16 raw bytes — not the 36-byte hyphenated
+    /// string form. This is the same compact representation Postgres uses
+    /// for its `uuid` type, and saves ~27 bytes off the wire on every
+    /// authenticated request once AEAD overhead and base64 expansion are
+    /// accounted for.
+    async fn pointer_cookie_header(&self, session_key: Uuid) -> Result<HeaderValue, SessionError> {
+        let bundle = self
+            .sealer
+            .seal(session_key.as_bytes(), b"session_ptr")
+            .await
+            .map_err(to_session_err)?;
+        let cookie_value = URL_SAFE_NO_PAD.encode(&bundle);
+        let attrs = self.cookie_attrs();
+        HeaderValue::from_str(&format!("{}={cookie_value}; {attrs}", self.cookie_name))
+            .map_err(to_session_err)
+    }
+
+    /// Read and decrypt the pointer cookie to get the session key.
+    async fn read_pointer_cookie(&self, headers: &http::HeaderMap) -> Option<Uuid> {
+        let encoded = get_cookie(headers, &self.cookie_name)?;
+        let bundle = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+        let plaintext = self
+            .unsealer
+            .unseal(None, &bundle, b"session_ptr")
+            .await
+            .ok()?;
+        // Must be exactly 16 bytes (UUID); anything else is a corrupted cookie.
+        let bytes: [u8; 16] = plaintext.try_into().ok()?;
+        Some(Uuid::from_bytes(bytes))
+    }
+}
+
+// -- Internal methods --
+
+impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
+    pub(crate) async fn create_session(
+        &self,
+        completed: &crate::grant::CompletedLogin,
+        default_lifetime: std::time::Duration,
+    ) -> Result<(E::SessionType, Vec<HeaderValue>), SessionError> {
+        let persisted = PersistedSessionState {
+            session_key: generate_session_key(),
+            state: SessionState::from_completed(completed, default_lifetime),
+        };
+
+        let session = self
+            .external
+            .create(persisted, completed)
+            .await
+            .map_err(to_session_err)?;
+        let cookie = self
+            .pointer_cookie_header(session.persisted().session_key())
+            .await?;
+        Ok((session, vec![cookie]))
+    }
+
+    pub(crate) async fn load_session(
+        &self,
+        headers: &http::HeaderMap,
+    ) -> Result<Option<E::SessionType>, E::Error> {
+        let Some(session_key) = self.read_pointer_cookie(headers).await else {
+            return Ok(None);
+        };
+
+        self.external.load(session_key).await
+    }
+
+    pub(crate) async fn save_session(
+        &self,
+        session: &E::SessionType,
+    ) -> Result<Vec<HeaderValue>, SessionError> {
+        self.external.save(session).await.map_err(to_session_err)?;
+        // The pointer cookie's value (the session_key) doesn't change after
+        // creation, so subsequent saves don't reissue it. The initial cookie
+        // is emitted by `create_session`.
+        Ok(vec![])
+    }
+
+    pub(crate) async fn touch_session(
+        &self,
+        session: &E::SessionType,
+    ) -> Result<Vec<HeaderValue>, SessionError> {
+        self.external.touch(session).await.map_err(to_session_err)?;
+        Ok(vec![])
+    }
+
+    pub(crate) async fn delete_session(
+        &self,
+        session: &E::SessionType,
+    ) -> Result<Vec<HeaderValue>, SessionError> {
+        self.external
+            .delete(session)
+            .await
+            .map_err(to_session_err)?;
+        // Clear the pointer cookie.
+        let attrs = self.cookie_attrs();
+        let mut headers = Vec::new();
+        if let Ok(v) = HeaderValue::from_str(&format!("{}=; {attrs}; Max-Age=0", self.cookie_name))
+        {
+            headers.push(v);
+        }
+        Ok(headers)
+    }
+}
+
+impl<E: ExternalSessionStore> crate::session::sealed::Sealed for StoreBackedSessionStore<E> {}
+
+impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
+    type SessionType = E::SessionType;
+    type LoadError = E::Error;
+
+    async fn create(
+        &self,
+        completed: crate::grant::CompletedLogin,
+        default_lifetime: std::time::Duration,
+        _headers: &http::HeaderMap,
+    ) -> Result<(E::SessionType, Vec<HeaderValue>), SessionError> {
+        self.create_session(&completed, default_lifetime).await
+    }
+
+    async fn load(&self, headers: &http::HeaderMap) -> Result<Option<E::SessionType>, E::Error> {
+        self.load_session(headers).await
+    }
+
+    async fn save(
+        &self,
+        session: &E::SessionType,
+        _headers: &http::HeaderMap,
+    ) -> Result<Vec<HeaderValue>, SessionError> {
+        self.save_session(session).await
+    }
+
+    async fn touch(
+        &self,
+        session: &E::SessionType,
+        _headers: &http::HeaderMap,
+    ) -> Result<Vec<HeaderValue>, SessionError> {
+        self.touch_session(session).await
+    }
+
+    async fn delete(
+        &self,
+        session: &E::SessionType,
+        _headers: &http::HeaderMap,
+    ) -> Result<Vec<HeaderValue>, SessionError> {
+        self.delete_session(session).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+
+    use huskarl::core::{
+        crypto::cipher::BoxedAeadCipher,
+        secrets::{Secret, SecretBytes, SecretOutput},
+    };
+    use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
+
+    use super::*;
+    use crate::session_state::{Session, SessionState};
+
+    #[derive(Clone)]
+    struct TestSecret(SecretBytes);
+
+    impl Secret for TestSecret {
+        type Output = SecretBytes;
+        type Error = Infallible;
+        async fn get_secret_value(&self) -> Result<SecretOutput<SecretBytes>, Infallible> {
+            Ok(SecretOutput {
+                value: self.0.clone(),
+                identity: None,
+            })
+        }
+    }
+
+    async fn test_cipher() -> BoxedAeadCipher {
+        let key = AesGcmKey::from_secret(
+            AesGcmKeyType::Aes256,
+            TestSecret(SecretBytes::new(vec![0u8; 32])),
+            |_| None,
+        )
+        .await
+        .unwrap();
+        BoxedAeadCipher::new(key)
+    }
+
+    #[derive(Clone)]
+    struct MinimalSession {
+        persisted: PersistedSessionState,
+    }
+
+    impl Session for MinimalSession {
+        fn state(&self) -> &SessionState {
+            self.persisted.state()
+        }
+        fn set_state(&mut self, s: SessionState) {
+            self.persisted.set_state(s);
+        }
+    }
+
+    impl PersistedSession for MinimalSession {
+        fn persisted(&self) -> &PersistedSessionState {
+            &self.persisted
+        }
+        fn persisted_mut(&mut self) -> &mut PersistedSessionState {
+            &mut self.persisted
+        }
+    }
+
+    struct MinimalExternalStore(MinimalSession);
+
+    impl ExternalSessionStore for MinimalExternalStore {
+        type SessionType = MinimalSession;
+        type Error = Infallible;
+
+        async fn create(
+            &self,
+            _: PersistedSessionState,
+            _: &crate::grant::CompletedLogin,
+        ) -> Result<MinimalSession, Infallible> {
+            Ok(self.0.clone())
+        }
+
+        async fn load(&self, _: Uuid) -> Result<Option<MinimalSession>, Infallible> {
+            Ok(Some(self.0.clone()))
+        }
+
+        async fn save(&self, _: &MinimalSession) -> Result<(), Infallible> {
+            Ok(())
+        }
+
+        async fn touch(&self, _: &MinimalSession) -> Result<(), Infallible> {
+            Ok(())
+        }
+
+        async fn delete(&self, _: &MinimalSession) -> Result<(), Infallible> {
+            Ok(())
+        }
+    }
+
+    fn test_session() -> MinimalSession {
+        let now = std::time::SystemTime::now();
+        MinimalSession {
+            persisted: PersistedSessionState {
+                session_key: Uuid::now_v7(),
+                state: SessionState::builder()
+                    .token_expiry(now + std::time::Duration::from_hours(1))
+                    .created_at(now)
+                    .last_active(now)
+                    .build(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn touch_returns_no_cookies() {
+        let session = test_session();
+        let store = StoreBackedSessionStore::new(
+            MinimalExternalStore(session.clone()),
+            test_cipher().await,
+            "session",
+            true,
+            "/",
+        );
+
+        let headers = store.touch_session(&session).await.unwrap();
+
+        assert!(
+            headers.is_empty(),
+            "touch should not re-emit the pointer cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn pointer_cookie_roundtrips_uuid() {
+        let session = test_session();
+        let original_key = session.persisted.session_key;
+        let store = StoreBackedSessionStore::new(
+            MinimalExternalStore(session.clone()),
+            test_cipher().await,
+            "session",
+            true,
+            "/",
+        );
+
+        // Seal a pointer cookie, then read it back through the request-side path.
+        let header = store.pointer_cookie_header(original_key).await.unwrap();
+        let header_str = header.to_str().unwrap();
+        let cookie_value = header_str
+            .split(';')
+            .next()
+            .unwrap()
+            .split('=')
+            .nth(1)
+            .unwrap();
+        let mut req_headers = http::HeaderMap::new();
+        req_headers.insert(
+            http::header::COOKIE,
+            format!("session={cookie_value}").parse().unwrap(),
+        );
+
+        let recovered = store
+            .read_pointer_cookie(&req_headers)
+            .await
+            .expect("decodes");
+        assert_eq!(recovered, original_key);
+    }
+}

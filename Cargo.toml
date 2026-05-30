@@ -1,0 +1,35 @@
+[package]
+name = "huskarl-login"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "OAuth2/OIDC login flow helpers for huskarl."
+repository = "https://github.com/huskarl-rs/huskarl-login"
+homepage = "https://github.com/huskarl-rs/huskarl-login"
+documentation = "https://docs.rs/huskarl-login"
+license = "MIT OR Apache-2.0"
+keywords = ["oauth2", "oidc", "security", "authentication", "login"]
+categories = ["authentication"]
+readme = "README.md"
+
+[dependencies]
+base64 = "0.22"
+bon = { version = "3.9", features = ["experimental-generics-setters"] }
+bytes = "1"
+ciborium = "0.2"
+http = { version = "1", default-features = false }
+huskarl = { version = "0.7.1", default-features = false }
+log = "0.4"
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_html_form = "0.4"
+serde_json = { version = "1", default-features = false }
+tokio = { version = "1", default-features = false, features = ["time"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+
+[dev-dependencies]
+hex = "0.4"
+huskarl-crypto-native = "0.7"
+rand = "0.10"
+tokio = { version = "1", features = ["full"] }
+url = "2"
