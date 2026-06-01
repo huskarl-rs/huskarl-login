@@ -9,13 +9,14 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
 use huskarl::core::crypto::cipher::{
-    AeadSealer, AeadUnsealer, AeadV1Sealer, AeadV1Unsealer, BoxedAeadCipher,
+    AeadEncryptor, AeadSealer, AeadUnsealer, AeadV1Sealer, AeadV1Unsealer, BoxedAeadCipher,
+    CipherMatch,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    cookie::{cookie_attrs, get_cookie},
+    cookie::{cookie_attrs, encode_kid, get_cookie, get_kid_cookie, kid_cookie_name},
     session::{SessionDriver, SessionError, to_session_err},
     session_state::{Session, SessionState},
 };
@@ -221,32 +222,66 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         cookie_attrs(self.secure, &self.cookie_path)
     }
 
-    /// Encrypt and return a pointer cookie header value.
+    /// Encrypt the pointer cookie and emit it alongside the kid sidecar.
     ///
     /// The plaintext is the UUID's 16 raw bytes — not the 36-byte hyphenated
     /// string form. This is the same compact representation Postgres uses
     /// for its `uuid` type, and saves ~27 bytes off the wire on every
     /// authenticated request once AEAD overhead and base64 expansion are
     /// accounted for.
-    async fn pointer_cookie_header(&self, session_key: Uuid) -> Result<HeaderValue, SessionError> {
+    ///
+    /// The kid sidecar is set when the sealer reports an active identity, and
+    /// emitted as a `Max-Age=0` clear otherwise. The sidecar lets the unsealer
+    /// skip trial-decrypt when multiple keys are configured; absence (or any
+    /// corruption) degrades gracefully to trial-decrypt.
+    async fn pointer_cookie_headers(
+        &self,
+        session_key: Uuid,
+    ) -> Result<Vec<HeaderValue>, SessionError> {
         let bundle = self
             .sealer
             .seal(session_key.as_bytes(), b"session_ptr")
             .await
             .map_err(to_session_err)?;
+        // See cookie_session.rs for the rationale on reading `key_id()` from
+        // the same sealer that just sealed the bundle: stable for single-key
+        // ciphers; if multi-key sealers land, switch to `AeadCipherSelector`.
+        let kid = self.sealer.key_id();
         let cookie_value = URL_SAFE_NO_PAD.encode(&bundle);
         let attrs = self.cookie_attrs();
-        HeaderValue::from_str(&format!("{}={cookie_value}; {attrs}", self.cookie_name))
-            .map_err(to_session_err)
+        let pointer = HeaderValue::from_str(&format!(
+            "{}={cookie_value}; {attrs}",
+            self.cookie_name
+        ))
+        .map_err(to_session_err)?;
+        let kid_header = self.build_kid_header(kid.as_deref(), &attrs)?;
+        Ok(vec![pointer, kid_header])
+    }
+
+    /// Builds the `Set-Cookie` for the kid sidecar (or a `Max-Age=0` clear
+    /// when no identity is available — see [`Self::pointer_cookie_headers`]).
+    fn build_kid_header(
+        &self,
+        kid: Option<&str>,
+        attrs: &str,
+    ) -> Result<HeaderValue, SessionError> {
+        let name = kid_cookie_name(&self.cookie_name);
+        let value = match kid {
+            Some(k) => format!("{name}={}; {attrs}", encode_kid(k)),
+            None => format!("{name}=; {attrs}; Max-Age=0"),
+        };
+        HeaderValue::from_str(&value).map_err(to_session_err)
     }
 
     /// Read and decrypt the pointer cookie to get the session key.
     async fn read_pointer_cookie(&self, headers: &http::HeaderMap) -> Option<Uuid> {
         let encoded = get_cookie(headers, &self.cookie_name)?;
         let bundle = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+        let kid = get_kid_cookie(headers, &self.cookie_name);
+        let cipher_match = kid.as_deref().map(|k| CipherMatch::builder().kid(k).build());
         let plaintext = self
             .unsealer
-            .unseal(None, &bundle, b"session_ptr")
+            .unseal(cipher_match.as_ref(), &bundle, b"session_ptr")
             .await
             .ok()?;
         // Must be exactly 16 bytes (UUID); anything else is a corrupted cookie.
@@ -273,10 +308,10 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             .create(persisted, completed)
             .await
             .map_err(to_session_err)?;
-        let cookie = self
-            .pointer_cookie_header(session.persisted().session_key())
+        let cookies = self
+            .pointer_cookie_headers(session.persisted().session_key())
             .await?;
-        Ok((session, vec![cookie]))
+        Ok((session, cookies))
     }
 
     pub(crate) async fn load_session(
@@ -317,11 +352,15 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             .delete(session)
             .await
             .map_err(to_session_err)?;
-        // Clear the pointer cookie.
+        // Clear the pointer cookie and the kid sidecar.
         let attrs = self.cookie_attrs();
         let mut headers = Vec::new();
         if let Ok(v) = HeaderValue::from_str(&format!("{}=; {attrs}; Max-Age=0", self.cookie_name))
         {
+            headers.push(v);
+        }
+        let kid_name = kid_cookie_name(&self.cookie_name);
+        if let Ok(v) = HeaderValue::from_str(&format!("{kid_name}=; {attrs}; Max-Age=0")) {
             headers.push(v);
         }
         Ok(headers)
@@ -510,15 +549,27 @@ mod tests {
         );
 
         // Seal a pointer cookie, then read it back through the request-side path.
-        let header = store.pointer_cookie_header(original_key).await.unwrap();
-        let header_str = header.to_str().unwrap();
-        let cookie_value = header_str
+        let headers_out = store.pointer_cookie_headers(original_key).await.unwrap();
+        // The pointer cookie is the one whose value is non-empty (the kid
+        // sidecar is a Max-Age=0 clear for the no-identity test cipher).
+        let pointer = headers_out
+            .iter()
+            .find(|h| {
+                let s = h.to_str().unwrap();
+                let value_part = s.split(';').next().unwrap();
+                let (name, value) = value_part.split_once('=').unwrap();
+                name.trim() == "session" && !value.is_empty()
+            })
+            .expect("pointer cookie present");
+        let cookie_value = pointer
+            .to_str()
+            .unwrap()
             .split(';')
             .next()
             .unwrap()
-            .split('=')
-            .nth(1)
-            .unwrap();
+            .split_once('=')
+            .unwrap()
+            .1;
         let mut req_headers = http::HeaderMap::new();
         req_headers.insert(
             http::header::COOKIE,
@@ -530,5 +581,64 @@ mod tests {
             .await
             .expect("decodes");
         assert_eq!(recovered, original_key);
+    }
+
+    async fn test_cipher_with_kid(kid: &str) -> BoxedAeadCipher {
+        let kid_owned = kid.to_owned();
+        let key = AesGcmKey::from_secret(
+            AesGcmKeyType::Aes256,
+            TestSecret(SecretBytes::new(vec![0u8; 32])),
+            move |_| Some(kid_owned.clone()),
+        )
+        .await
+        .unwrap();
+        BoxedAeadCipher::new(key)
+    }
+
+    #[tokio::test]
+    async fn pointer_cookie_emits_kid_sidecar_when_cipher_has_identity() {
+        let session = test_session();
+        let store = StoreBackedSessionStore::new(
+            MinimalExternalStore(session.clone()),
+            test_cipher_with_kid("kid-7").await,
+            "session",
+            true,
+            "/",
+        );
+
+        let headers_out = store
+            .pointer_cookie_headers(session.persisted.session_key)
+            .await
+            .unwrap();
+        let expected_value = URL_SAFE_NO_PAD.encode("kid-7".as_bytes());
+        let sidecar_set = headers_out.iter().any(|h| {
+            let s = h.to_str().unwrap();
+            s.starts_with(&format!("session.kid={expected_value};"))
+        });
+        assert!(sidecar_set, "expected kid sidecar set to base64url(identity)");
+    }
+
+    #[tokio::test]
+    async fn delete_clears_pointer_and_kid_sidecar() {
+        let session = test_session();
+        let store = StoreBackedSessionStore::new(
+            MinimalExternalStore(session.clone()),
+            test_cipher().await,
+            "session",
+            true,
+            "/",
+        );
+
+        let clears = store.delete_session(&session).await.unwrap();
+        let bare = clears.iter().any(|h| {
+            let s = h.to_str().unwrap();
+            s.starts_with("session=;") && s.contains("Max-Age=0")
+        });
+        let kid = clears.iter().any(|h| {
+            let s = h.to_str().unwrap();
+            s.starts_with("session.kid=;") && s.contains("Max-Age=0")
+        });
+        assert!(bare, "expected pointer cookie clear");
+        assert!(kid, "expected kid sidecar clear");
     }
 }

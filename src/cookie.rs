@@ -13,6 +13,7 @@
 //! flow. No explicit format-versioning is needed because re-login already
 //! recovers gracefully.
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::header;
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -89,6 +90,41 @@ pub fn login_state_cookie_name(state: &str, secure: bool, path: &str) -> String 
 pub fn cookie_attrs(secure: bool, path: &str) -> String {
     let secure = if secure { "; Secure" } else { "" };
     format!("HttpOnly; SameSite=Lax; Path={path}{secure}")
+}
+
+/// Suffix appended to a session cookie's base name to form its kid sidecar
+/// cookie name. The sidecar carries the active key's identity (as reported by
+/// the sealer) base64url-encoded; the unsealer uses it as a search-space hint
+/// so multi-key decrypt doesn't have to trial every candidate.
+///
+/// The sidecar is not security-bearing: tampering or absence just degrades to
+/// trial-decrypt across all configured keys, which is the safe baseline. The
+/// AEAD seal remains the sole authenticity gate.
+pub(crate) const KID_COOKIE_SUFFIX: &str = ".kid";
+
+/// Returns the sidecar cookie name for the given session cookie base name.
+#[must_use]
+pub(crate) fn kid_cookie_name(base_name: &str) -> String {
+    format!("{base_name}{KID_COOKIE_SUFFIX}")
+}
+
+/// Reads the kid sidecar cookie associated with `base_name` and returns the
+/// decoded identity string, or `None` if the cookie is missing, not valid
+/// base64url, or not valid UTF-8. Any failure mode is treated the same: the
+/// unsealer falls back to trial-decrypt.
+pub(crate) fn get_kid_cookie(headers: &http::HeaderMap, base_name: &str) -> Option<String> {
+    let name = kid_cookie_name(base_name);
+    let encoded = get_cookie(headers, &name)?;
+    let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Returns the base64url encoding of `identity`, used as the kid sidecar
+/// cookie's value. Identities can contain characters outside the cookie-value
+/// charset (e.g. `:` in KMS ARNs), so they're always encoded.
+#[must_use]
+pub(crate) fn encode_kid(identity: &str) -> String {
+    URL_SAFE_NO_PAD.encode(identity.as_bytes())
 }
 
 /// Extracts a cookie value by name from request headers.
@@ -223,5 +259,54 @@ mod tests {
     #[test]
     fn state_rejects_non_ascii() {
         assert!(!is_valid_oauth_state("café"));
+    }
+
+    // -- kid sidecar tests --
+
+    #[test]
+    fn kid_cookie_name_suffixes_base() {
+        assert_eq!(kid_cookie_name("huskarl_session"), "huskarl_session.kid");
+    }
+
+    #[test]
+    fn get_kid_cookie_decodes_present_value() {
+        let mut headers = http::HeaderMap::new();
+        let encoded = encode_kid("arn:aws:kms:us-east-1:111:key/abc");
+        headers.insert(
+            header::COOKIE,
+            format!("huskarl_session.kid={encoded}").parse().unwrap(),
+        );
+        assert_eq!(
+            get_kid_cookie(&headers, "huskarl_session").as_deref(),
+            Some("arn:aws:kms:us-east-1:111:key/abc")
+        );
+    }
+
+    #[test]
+    fn get_kid_cookie_absent_returns_none() {
+        let headers = http::HeaderMap::new();
+        assert_eq!(get_kid_cookie(&headers, "huskarl_session"), None);
+    }
+
+    #[test]
+    fn get_kid_cookie_invalid_base64_returns_none() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            "huskarl_session.kid=!!!notbase64!!!".parse().unwrap(),
+        );
+        assert_eq!(get_kid_cookie(&headers, "huskarl_session"), None);
+    }
+
+    #[test]
+    fn get_kid_cookie_invalid_utf8_returns_none() {
+        let mut headers = http::HeaderMap::new();
+        // base64url of [0xff, 0xfe, 0xfd] — valid base64 but not valid UTF-8.
+        let bad = URL_SAFE_NO_PAD.encode([0xff_u8, 0xfe, 0xfd]);
+        headers.insert(
+            header::COOKIE,
+            format!("huskarl_session.kid={bad}").parse().unwrap(),
+        );
+        assert_eq!(get_kid_cookie(&headers, "huskarl_session"), None);
     }
 }
