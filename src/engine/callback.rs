@@ -10,7 +10,9 @@ use serde::Deserialize;
 use super::{LoginEngine, LoginResponse, LoginStateCookie, error_chain};
 use crate::{
     LoginGrant, SessionDriver,
-    cookie::{decode_payload, get_cookie, is_valid_oauth_state, login_state_cookie_name},
+    cookie::{
+        cookie_attrs, decode_payload, get_cookie, is_valid_oauth_state, login_state_cookie_name,
+    },
 };
 
 impl<G, SD, H> LoginEngine<G, SD, H>
@@ -179,12 +181,8 @@ where
     /// Returns `None` only if the name produces an invalid header value, which
     /// shouldn't happen for cookies we generated.
     fn clear_login_state_cookie(&self, cookie_name: &str) -> Option<HeaderValue> {
-        let secure = if self.config.secure { "; Secure" } else { "" };
-        let callback_path = &self.config.browser_callback_path;
-        HeaderValue::from_str(&format!(
-            "{cookie_name}=; HttpOnly; SameSite=Lax; Path={callback_path}; Max-Age=0{secure}"
-        ))
-        .ok()
+        let attrs = cookie_attrs(self.config.secure, &self.config.browser_callback_path);
+        HeaderValue::from_str(&format!("{cookie_name}=; {attrs}; Max-Age=0")).ok()
     }
 
     /// Builds an error response for a failed callback and appends a

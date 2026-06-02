@@ -235,10 +235,14 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         self
     }
 
+    fn base_cookie_attrs(&self) -> String {
+        cookie_attrs(self.secure, &self.cookie_path)
+    }
+
     fn cookie_attrs(&self) -> String {
         format!(
             "{}; Max-Age={}",
-            cookie_attrs(self.secure, &self.cookie_path),
+            self.base_cookie_attrs(),
             self.max_age.as_secs()
         )
     }
@@ -273,21 +277,17 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         let pointer =
             HeaderValue::from_str(&format!("{}={cookie_value}; {attrs}", self.cookie_name))
                 .map_err(to_session_err)?;
-        let kid_header = self.build_kid_header(kid.as_deref(), &attrs)?;
+        let kid_header = self.build_kid_header(kid.as_deref())?;
         Ok(vec![pointer, kid_header])
     }
 
     /// Builds the `Set-Cookie` for the kid sidecar (or a `Max-Age=0` clear
     /// when no identity is available — see [`Self::pointer_cookie_headers`]).
-    fn build_kid_header(
-        &self,
-        kid: Option<&str>,
-        attrs: &str,
-    ) -> Result<HeaderValue, SessionError> {
+    fn build_kid_header(&self, kid: Option<&str>) -> Result<HeaderValue, SessionError> {
         let name = kid_cookie_name(&self.cookie_name);
         let value = match kid {
-            Some(k) => format!("{name}={}; {attrs}", encode_kid(k)),
-            None => format!("{name}=; {attrs}; Max-Age=0"),
+            Some(k) => format!("{name}={}; {}", encode_kid(k), self.cookie_attrs()),
+            None => format!("{name}=; {}; Max-Age=0", self.base_cookie_attrs()),
         };
         HeaderValue::from_str(&value).map_err(to_session_err)
     }
@@ -374,14 +374,13 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             .await
             .map_err(to_session_err)?;
         // Clear the pointer cookie and the kid sidecar.
-        let attrs = self.cookie_attrs();
+        let clear_attrs = format!("{}; Max-Age=0", self.base_cookie_attrs());
         let mut headers = Vec::new();
-        if let Ok(v) = HeaderValue::from_str(&format!("{}=; {attrs}; Max-Age=0", self.cookie_name))
-        {
+        if let Ok(v) = HeaderValue::from_str(&format!("{}=; {clear_attrs}", self.cookie_name)) {
             headers.push(v);
         }
         let kid_name = kid_cookie_name(&self.cookie_name);
-        if let Ok(v) = HeaderValue::from_str(&format!("{kid_name}=; {attrs}; Max-Age=0")) {
+        if let Ok(v) = HeaderValue::from_str(&format!("{kid_name}=; {clear_attrs}")) {
             headers.push(v);
         }
         Ok(headers)

@@ -9,7 +9,7 @@ use huskarl::core::{crypto::cipher::AeadSealer, http::HttpClient};
 use super::{EngineError, LoginEngine, LoginResponse, LoginStateCookie, error_chain};
 use crate::{
     LoginGrant, SessionDriver,
-    cookie::{encode_payload, login_state_cookie_name},
+    cookie::{cookie_attrs, encode_payload, login_state_cookie_name},
     url::{base_url_as_string, original_url},
 };
 
@@ -76,11 +76,10 @@ where
             &self.config.browser_callback_path,
         );
         let cookie_value = URL_SAFE_NO_PAD.encode(&bundle);
-        let secure = if self.config.secure { "; Secure" } else { "" };
-        let callback_path = &self.config.browser_callback_path;
+        let attrs = cookie_attrs(self.config.secure, &self.config.browser_callback_path);
         let max_age = self.config.login_state_ttl.as_secs();
         Ok(HeaderValue::from_str(&format!(
-            "{cookie_name}={cookie_value}; HttpOnly; SameSite=Lax; Path={callback_path}; Max-Age={max_age}{secure}"
+            "{cookie_name}={cookie_value}; {attrs}; Max-Age={max_age}"
         ))?)
     }
 

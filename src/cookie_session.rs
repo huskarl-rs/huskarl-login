@@ -206,10 +206,14 @@ impl<C> CookieSessionStore<C> {
         self
     }
 
+    fn base_cookie_attrs(&self) -> String {
+        cookie_attrs(self.secure, &self.cookie_path)
+    }
+
     fn cookie_attrs(&self) -> String {
         format!(
             "{}; Max-Age={}",
-            cookie_attrs(self.secure, &self.cookie_path),
+            self.base_cookie_attrs(),
             self.max_age.as_secs()
         )
     }
@@ -313,8 +317,8 @@ impl<C: CookieData> CookieSessionStore<C> {
         for (i, chunk) in chunks.iter().enumerate() {
             headers.push(self.build_chunk_header(i, chunk, &attrs)?);
         }
-        self.append_clears_for_leftover_chunks(&mut headers, num_chunks, request_headers, &attrs);
-        headers.push(self.build_kid_header(kid.as_deref(), &attrs)?);
+        self.append_clears_for_leftover_chunks(&mut headers, num_chunks, request_headers);
+        headers.push(self.build_kid_header(kid.as_deref())?);
         Ok(headers)
     }
 
@@ -336,15 +340,11 @@ impl<C: CookieData> CookieSessionStore<C> {
     /// `Max-Age=0` clear is emitted so that a sidecar set under a previous
     /// (identity-bearing) key doesn't linger after operators switch to a key
     /// source with no natural identity.
-    fn build_kid_header(
-        &self,
-        kid: Option<&str>,
-        attrs: &str,
-    ) -> Result<HeaderValue, SessionError> {
+    fn build_kid_header(&self, kid: Option<&str>) -> Result<HeaderValue, SessionError> {
         let name = kid_cookie_name(&self.cookie_name);
         let value = match kid {
-            Some(k) => format!("{name}={}; {attrs}", encode_kid(k)),
-            None => format!("{name}=; {attrs}; Max-Age=0"),
+            Some(k) => format!("{name}={}; {}", encode_kid(k), self.cookie_attrs()),
+            None => format!("{name}=; {}; Max-Age=0", self.base_cookie_attrs()),
         };
         HeaderValue::from_str(&value).map_err(to_session_err)
     }
@@ -358,13 +358,13 @@ impl<C: CookieData> CookieSessionStore<C> {
         headers: &mut Vec<HeaderValue>,
         num_chunks: usize,
         request_headers: &http::HeaderMap,
-        attrs: &str,
     ) {
+        let clear_attrs = format!("{}; Max-Age=0", self.base_cookie_attrs());
         let cookie_name = &self.cookie_name;
         self.for_each_request_chunk_index(request_headers, |idx| {
             if idx >= num_chunks
                 && let Ok(v) =
-                    HeaderValue::from_str(&format!("{cookie_name}.{idx}=; {attrs}; Max-Age=0"))
+                    HeaderValue::from_str(&format!("{cookie_name}.{idx}=; {clear_attrs}"))
             {
                 headers.push(v);
             }
@@ -372,23 +372,21 @@ impl<C: CookieData> CookieSessionStore<C> {
     }
 
     pub(crate) fn delete_headers(&self, request_headers: &http::HeaderMap) -> Vec<HeaderValue> {
-        let attrs = self.cookie_attrs();
+        let clear_attrs = format!("{}; Max-Age=0", self.base_cookie_attrs());
         let cookie_name = &self.cookie_name;
         let mut headers = Vec::new();
         // Clear the kid sidecar unconditionally — cheap and avoids leaving a
         // stale hint that would just degrade the next request to trial-decrypt
         // against a session that no longer exists.
         let kid_name = kid_cookie_name(cookie_name);
-        if let Ok(v) = HeaderValue::from_str(&format!("{kid_name}=; {attrs}; Max-Age=0")) {
+        if let Ok(v) = HeaderValue::from_str(&format!("{kid_name}=; {clear_attrs}")) {
             headers.push(v);
         }
         // Clear every chunk slot the browser currently has — we don't have
         // a fixed cap to sweep, but we don't need one: the request tells us
         // exactly which slots exist.
         self.for_each_request_chunk_index(request_headers, |idx| {
-            if let Ok(v) =
-                HeaderValue::from_str(&format!("{cookie_name}.{idx}=; {attrs}; Max-Age=0"))
-            {
+            if let Ok(v) = HeaderValue::from_str(&format!("{cookie_name}.{idx}=; {clear_attrs}")) {
                 headers.push(v);
             }
         });
