@@ -32,8 +32,8 @@ use serde::{Deserialize, Serialize};
 /// that return a new value rather than mutating in place.
 ///
 /// The struct is `#[non_exhaustive]` so new fields can be added in a minor
-/// release. Construct via [`SessionState::from_completed`] for OAuth flows or
-/// via [`SessionState::builder`] for tests and custom flows.
+/// release. For OAuth flows the framework constructs it from the completed
+/// login; use [`SessionState::builder`] for tests and custom flows.
 ///
 /// The raw `id_token` JWT is not stored here — see [`Session::id_token`]
 /// for the rationale and the override hook.

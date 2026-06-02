@@ -224,6 +224,12 @@ pub struct LoginConfig {
     /// to `end_session_endpoint`. When no `end_session_endpoint` is set, used
     /// as the redirect target directly. When `None`, defaults to `base_url`.
     pub post_logout_redirect_uri: Option<String>,
+    /// Prefix for login-state cookie names. Defaults to `"huskarl_login"`.
+    ///
+    /// The full cookie name is `{security_prefix}{login_cookie_prefix}_{state}`,
+    /// where `security_prefix` is `__Host-` or `__Secure-` when `secure` is
+    /// enabled. Change this to avoid conflicts with other apps on the same domain.
+    pub login_cookie_prefix: String,
     /// The browser-facing callback path, computed from `base_url`, `strip_prefix`,
     /// and `callback_path`. Used as the `Path` attribute on login-state cookies
     /// so they are scoped to only the callback endpoint.
@@ -284,6 +290,9 @@ impl LoginConfig {
         /// URI to redirect to after logout. Defaults to `base_url`.
         #[builder(into)]
         post_logout_redirect_uri: Option<String>,
+        /// Prefix for login-state cookie names. Defaults to `"huskarl_login"`.
+        #[builder(default = crate::cookie::DEFAULT_LOGIN_COOKIE_PREFIX.to_owned())]
+        login_cookie_prefix: String,
     ) -> Result<Self, ConfigError> {
         validate_path(&callback_path, |path, reason| {
             ConfigError::InvalidCallbackPath { path, reason }
@@ -328,6 +337,7 @@ impl LoginConfig {
             logout_path,
             end_session_endpoint,
             post_logout_redirect_uri,
+            login_cookie_prefix,
             browser_callback_path,
         })
     }

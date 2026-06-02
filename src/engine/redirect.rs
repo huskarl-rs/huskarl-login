@@ -74,6 +74,7 @@ where
             state,
             self.config.secure,
             &self.config.browser_callback_path,
+            &self.config.login_cookie_prefix,
         );
         let cookie_value = URL_SAFE_NO_PAD.encode(&bundle);
         let attrs = cookie_attrs(self.config.secure, &self.config.browser_callback_path);

@@ -377,7 +377,12 @@ async fn seal_login_cookie(state: &str, original_url: &str) -> String {
 }
 
 fn headers_with_login_cookie(state: &str, value: &str) -> HeaderMap {
-    let name = crate::cookie::login_state_cookie_name(state, true, "/callback");
+    let name = crate::cookie::login_state_cookie_name(
+        state,
+        true,
+        "/callback",
+        crate::cookie::DEFAULT_LOGIN_COOKIE_PREFIX,
+    );
     headers(&[("cookie", &format!("{name}={value}"))])
 }
 

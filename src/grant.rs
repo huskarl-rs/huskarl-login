@@ -28,33 +28,13 @@ use serde::{Deserialize, Serialize};
 /// ID token (OIDC), the validated identity claims extracted from it. The
 /// claims use the default `HashMap<String, serde_json::Value>` extra type so
 /// non-standard claims are accessible via `claims.extra.get("…")`.
+#[derive(bon::Builder)]
 pub struct CompletedLogin {
     token_response: TokenResponse,
     id_token_claims: Option<IdTokenClaims>,
 }
 
 impl CompletedLogin {
-    /// Creates a `CompletedLogin` without ID token claims (non-OIDC flow).
-    #[must_use]
-    pub fn without_id_token_claims(token_response: TokenResponse) -> Self {
-        Self {
-            token_response,
-            id_token_claims: None,
-        }
-    }
-
-    /// Creates a `CompletedLogin` with validated ID token claims.
-    #[must_use]
-    pub fn with_id_token_claims(
-        token_response: TokenResponse,
-        id_token_claims: IdTokenClaims,
-    ) -> Self {
-        Self {
-            token_response,
-            id_token_claims: Some(id_token_claims),
-        }
-    }
-
     /// Returns the token response.
     #[must_use]
     pub fn token_response(&self) -> &TokenResponse {
@@ -160,10 +140,10 @@ where
             })
             .transpose()?;
 
-        Ok(match id_token_claims {
-            Some(claims) => CompletedLogin::with_id_token_claims(token_response, claims),
-            None => CompletedLogin::without_id_token_claims(token_response),
-        })
+        Ok(CompletedLogin::builder()
+            .token_response(token_response)
+            .maybe_id_token_claims(id_token_claims)
+            .build())
     }
 
     async fn refresh(

@@ -112,33 +112,13 @@ pub trait ExternalSessionStore: Send + Sync {
 /// type. For enriched sessions, embed this in your custom type and implement
 /// [`PersistedSession`] (and [`Session`]) by forwarding to the embedded value.
 #[non_exhaustive]
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, bon::Builder)]
 pub struct PersistedSessionState {
     /// The random session key used as the primary lookup key in the external
     /// store. A time-ordered `UUIDv7`.
     pub session_key: Uuid,
     /// Shared token and timing state. See [`SessionState`] for the field set.
     pub state: SessionState,
-}
-
-impl PersistedSessionState {
-    /// The random session key used as the primary lookup key in the external store.
-    #[must_use]
-    pub fn session_key(&self) -> Uuid {
-        self.session_key
-    }
-
-    /// The subject identifier (`sub` claim) from the ID token, if present.
-    #[must_use]
-    pub fn sub(&self) -> Option<&str> {
-        self.state.sub.as_deref()
-    }
-
-    /// The session identifier (`sid` claim) from the ID token, if present.
-    #[must_use]
-    pub fn sid(&self) -> Option<&str> {
-        self.state.sid.as_deref()
-    }
 }
 
 impl Session for PersistedSessionState {
@@ -199,40 +179,31 @@ pub struct StoreBackedSessionStore<E> {
     max_age: Duration,
 }
 
+#[bon::bon]
 impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     /// Creates a new store-backed session store.
-    ///
-    /// - `external` -- the external store implementation (Redis, DB, etc.)
-    /// - `cipher` -- AEAD cipher for encrypting/decrypting the pointer cookie
-    /// - `cookie_name` -- name of the pointer cookie
-    /// - `secure` -- whether to set the `Secure` cookie attribute
-    /// - `cookie_path` -- the `Path` cookie attribute
+    #[builder]
     pub fn new(
         external: E,
         cipher: BoxedAeadCipher,
-        cookie_name: impl Into<String>,
+        #[builder(into)] cookie_name: String,
         secure: bool,
-        cookie_path: impl Into<String>,
+        #[builder(into)] cookie_path: String,
+        /// Defaults to 400 days. If `max_lifetime` is configured in `LoginConfig`,
+        /// pass it here so the browser discards the cookie when the session can
+        /// no longer be valid.
+        #[builder(default = DEFAULT_COOKIE_MAX_AGE)]
+        max_age: Duration,
     ) -> Self {
         Self {
             external,
             sealer: AeadV1Sealer::new(cipher.clone()),
             unsealer: AeadV1Unsealer::new(cipher),
-            cookie_name: cookie_name.into(),
+            cookie_name,
             secure,
-            cookie_path: cookie_path.into(),
-            max_age: DEFAULT_COOKIE_MAX_AGE,
+            cookie_path,
+            max_age,
         }
-    }
-
-    /// Sets the `Max-Age` for the pointer cookie.
-    ///
-    /// Defaults to 400 days. See [`CookieSessionStore::with_max_age`] for
-    /// the rationale; the same reasoning applies here.
-    #[must_use]
-    pub fn with_max_age(mut self, max_age: Duration) -> Self {
-        self.max_age = max_age;
-        self
     }
 
     fn base_cookie_attrs(&self) -> String {
@@ -330,7 +301,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             .await
             .map_err(to_session_err)?;
         let cookies = self
-            .pointer_cookie_headers(session.persisted().session_key())
+            .pointer_cookie_headers(session.persisted().session_key)
             .await?;
         Ok((session, cookies))
     }
@@ -540,13 +511,13 @@ mod tests {
     #[tokio::test]
     async fn touch_returns_no_cookies() {
         let session = test_session();
-        let store = StoreBackedSessionStore::new(
-            MinimalExternalStore(session.clone()),
-            test_cipher().await,
-            "session",
-            true,
-            "/",
-        );
+        let store = StoreBackedSessionStore::builder()
+            .external(MinimalExternalStore(session.clone()))
+            .cipher(test_cipher().await)
+            .cookie_name("session")
+            .secure(true)
+            .cookie_path("/")
+            .build();
 
         let headers = store.touch_session(&session).await.unwrap();
 
@@ -560,13 +531,13 @@ mod tests {
     async fn pointer_cookie_roundtrips_uuid() {
         let session = test_session();
         let original_key = session.persisted.session_key;
-        let store = StoreBackedSessionStore::new(
-            MinimalExternalStore(session.clone()),
-            test_cipher().await,
-            "session",
-            true,
-            "/",
-        );
+        let store = StoreBackedSessionStore::builder()
+            .external(MinimalExternalStore(session.clone()))
+            .cipher(test_cipher().await)
+            .cookie_name("session")
+            .secure(true)
+            .cookie_path("/")
+            .build();
 
         // Seal a pointer cookie, then read it back through the request-side path.
         let headers_out = store.pointer_cookie_headers(original_key).await.unwrap();
@@ -618,13 +589,13 @@ mod tests {
     #[tokio::test]
     async fn pointer_cookie_emits_kid_sidecar_when_cipher_has_identity() {
         let session = test_session();
-        let store = StoreBackedSessionStore::new(
-            MinimalExternalStore(session.clone()),
-            test_cipher_with_kid("kid-7").await,
-            "session",
-            true,
-            "/",
-        );
+        let store = StoreBackedSessionStore::builder()
+            .external(MinimalExternalStore(session.clone()))
+            .cipher(test_cipher_with_kid("kid-7").await)
+            .cookie_name("session")
+            .secure(true)
+            .cookie_path("/")
+            .build();
 
         let headers_out = store
             .pointer_cookie_headers(session.persisted.session_key)
@@ -644,13 +615,13 @@ mod tests {
     #[tokio::test]
     async fn delete_clears_pointer_and_kid_sidecar() {
         let session = test_session();
-        let store = StoreBackedSessionStore::new(
-            MinimalExternalStore(session.clone()),
-            test_cipher().await,
-            "session",
-            true,
-            "/",
-        );
+        let store = StoreBackedSessionStore::builder()
+            .external(MinimalExternalStore(session.clone()))
+            .cipher(test_cipher().await)
+            .cookie_name("session")
+            .secure(true)
+            .cookie_path("/")
+            .build();
 
         let clears = store.delete_session(&session).await.unwrap();
         let bare = clears.iter().any(|h| {

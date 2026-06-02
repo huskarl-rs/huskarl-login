@@ -170,40 +170,31 @@ pub struct CookieSessionStore<C = CookieSession> {
     _phantom: PhantomData<C>,
 }
 
+#[bon::bon]
 impl<C> CookieSessionStore<C> {
     /// Creates a new cookie session store.
-    ///
-    /// - `cipher` -- AEAD cipher for encrypting/decrypting session data
-    /// - `cookie_name` -- base name for the session cookies (e.g. `"huskarl_session"`)
-    /// - `secure` -- whether to set the `Secure` cookie attribute
-    /// - `cookie_path` -- the `Path` cookie attribute (e.g. `"/"`)
+    #[builder]
     pub fn new(
         cipher: BoxedAeadCipher,
-        cookie_name: impl Into<String>,
+        #[builder(into)] cookie_name: String,
         secure: bool,
-        cookie_path: impl Into<String>,
+        #[builder(into)] cookie_path: String,
+        /// Defaults to 400 days — finite but generous enough that the cookie
+        /// never expires before the server-side session does. If `max_lifetime`
+        /// is configured in `LoginConfig`, pass it here so the browser discards
+        /// the cookie around the time the session can no longer be valid.
+        #[builder(default = DEFAULT_COOKIE_MAX_AGE)]
+        max_age: Duration,
     ) -> Self {
         Self {
             sealer: AeadV1Sealer::new(cipher.clone()),
             unsealer: AeadV1Unsealer::new(cipher),
-            cookie_name: cookie_name.into(),
+            cookie_name,
             secure,
-            cookie_path: cookie_path.into(),
-            max_age: DEFAULT_COOKIE_MAX_AGE,
+            cookie_path,
+            max_age,
             _phantom: PhantomData,
         }
-    }
-
-    /// Sets the `Max-Age` for session cookies.
-    ///
-    /// Defaults to 400 days — finite but generous enough that the cookie
-    /// never expires before the server-side session does. If `max_lifetime`
-    /// is configured in `LoginConfig`, pass it here so the browser discards
-    /// the cookie around the time the session can no longer be valid.
-    #[must_use]
-    pub fn with_max_age(mut self, max_age: Duration) -> Self {
-        self.max_age = max_age;
-        self
     }
 
     fn base_cookie_attrs(&self) -> String {
@@ -531,7 +522,12 @@ mod tests {
     }
 
     async fn test_store() -> CookieSessionStore<CookieSession> {
-        CookieSessionStore::new(test_cipher().await, "huskarl_session", true, "/")
+        CookieSessionStore::builder()
+            .cipher(test_cipher().await)
+            .cookie_name("huskarl_session")
+            .secure(true)
+            .cookie_path("/")
+            .build()
     }
 
     /// A cipher whose `key_id()` reports a fixed identity, used to exercise
@@ -646,12 +642,12 @@ mod tests {
 
     #[tokio::test]
     async fn save_emits_kid_set_when_cipher_has_identity() {
-        let store = CookieSessionStore::<CookieSession>::new(
-            test_cipher_with_kid("arn:aws:kms:us-east-1:111:key/abc").await,
-            "huskarl_session",
-            true,
-            "/",
-        );
+        let store = CookieSessionStore::<CookieSession>::builder()
+            .cipher(test_cipher_with_kid("arn:aws:kms:us-east-1:111:key/abc").await)
+            .cookie_name("huskarl_session")
+            .secure(true)
+            .cookie_path("/")
+            .build();
         let session = CookieSession(test_state());
         let cookies = store
             .save_session(&session, &HeaderMap::new())
@@ -667,12 +663,12 @@ mod tests {
 
     #[tokio::test]
     async fn save_then_load_roundtrips_with_kid_sidecar() {
-        let store = CookieSessionStore::<CookieSession>::new(
-            test_cipher_with_kid("test-kid").await,
-            "huskarl_session",
-            true,
-            "/",
-        );
+        let store = CookieSessionStore::<CookieSession>::builder()
+            .cipher(test_cipher_with_kid("test-kid").await)
+            .cookie_name("huskarl_session")
+            .secure(true)
+            .cookie_path("/")
+            .build();
         let session = CookieSession(test_state());
         let set_cookies = store
             .save_session(&session, &HeaderMap::new())
@@ -696,12 +692,12 @@ mod tests {
         // Sidecar present but garbled (not base64url): the helper returns None,
         // and load proceeds with trial-decrypt — which still succeeds because
         // the AEAD bundle authenticates regardless of the hint.
-        let store = CookieSessionStore::<CookieSession>::new(
-            test_cipher_with_kid("test-kid").await,
-            "huskarl_session",
-            true,
-            "/",
-        );
+        let store = CookieSessionStore::<CookieSession>::builder()
+            .cipher(test_cipher_with_kid("test-kid").await)
+            .cookie_name("huskarl_session")
+            .secure(true)
+            .cookie_path("/")
+            .build();
         let session = CookieSession(test_state());
         let set_cookies = store
             .save_session(&session, &HeaderMap::new())

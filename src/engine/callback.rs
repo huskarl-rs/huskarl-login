@@ -55,6 +55,7 @@ where
             &state,
             self.config.secure,
             &self.config.browser_callback_path,
+            &self.config.login_cookie_prefix,
         );
         let Some(cookie_encoded) = get_cookie(headers, &cookie_name).map(str::to_owned) else {
             // No cookie to clear — either none was set, or the browser sent a
