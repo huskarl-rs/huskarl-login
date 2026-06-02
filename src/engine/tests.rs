@@ -593,8 +593,25 @@ async fn load_session_empty_store_returns_none() {
 }
 
 #[tokio::test]
-async fn load_session_valid_returns_session_with_touch() {
+async fn load_session_valid_returns_skip_when_recently_active() {
+    // last_active is "now" — well within the default 1h touch_min_interval.
     let e = engine(MockSessionStore::with_session(valid_session())).await;
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    let (_session, persistence) = loaded.session.expect("session present");
+    assert!(matches!(persistence, SessionPersistence::Skip));
+    assert!(loaded.clear_cookies.is_empty());
+}
+
+#[tokio::test]
+async fn load_session_valid_returns_touch_when_interval_elapsed() {
+    // last_active is 2h ago — past the default 1h touch_min_interval.
+    let session = session_with(
+        SystemTime::now() + Duration::from_hours(1),
+        None,
+        SystemTime::now() - Duration::from_hours(2),
+        SystemTime::now() - Duration::from_hours(2),
+    );
+    let e = engine(MockSessionStore::with_session(session)).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let (_session, persistence) = loaded.session.expect("session present");
     assert!(matches!(persistence, SessionPersistence::Touch));

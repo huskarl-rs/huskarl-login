@@ -165,18 +165,18 @@ pub struct LoginConfig {
     ///
     /// Defaults to 600 seconds (10 minutes).
     pub login_state_ttl: Duration,
-    /// Minimum interval between idle-timeout "touches" for an active session.
+    /// Minimum interval between activity "touches" for an active session.
     ///
-    /// On every authenticated request, the middleware refreshes the session's
-    /// `last_active` timestamp and asks the framework adapter to persist it
-    /// (`SessionPersistence::Touch`). For store-backed sessions that is one
-    /// write per request, which can dominate hot-path cost.
+    /// On each authenticated request, the middleware updates `last_active` and
+    /// asks the adapter to persist it (`SessionPersistence::Touch`) — but only
+    /// if `last_active` is older than this interval. For cookie sessions a
+    /// touch re-encrypts the session and emits `Set-Cookie`; for store-backed
+    /// sessions it is one write to the external store.
     ///
-    /// Setting this to a non-zero value skips the touch unless `last_active`
-    /// is older than this interval. The skipped activity is lost — pick a
-    /// value comfortably below [`idle_timeout`](Self::idle_timeout).
+    /// The skipped activity is lost — pick a value comfortably below
+    /// [`idle_timeout`](Self::idle_timeout) so idle expiry still fires on time.
     ///
-    /// Defaults to `Duration::ZERO` (touch on every request).
+    /// Defaults to 1 hour.
     pub touch_min_interval: Duration,
     /// `Path` attribute for login-state cookies.
     ///
@@ -269,9 +269,8 @@ impl LoginConfig {
         /// Lifetime of the per-flow login-state cookie. Defaults to 10 minutes.
         #[builder(default = Duration::from_mins(10))]
         login_state_ttl: Duration,
-        /// Minimum interval between idle-timeout touches. Defaults to `Duration::ZERO`
-        /// (touch on every request).
-        #[builder(default = Duration::ZERO)]
+        /// Minimum interval between activity touches. Defaults to 1 hour.
+        #[builder(default = Duration::from_hours(1))]
         touch_min_interval: Duration,
         /// `Path` attribute for login-state cookies. Defaults to `"/"`.
         #[builder(default = "/".to_owned())]
@@ -410,8 +409,11 @@ mod tests {
     }
 
     #[test]
-    fn login_config_touch_min_interval_defaults_zero() {
-        assert_eq!(default_policy_config().touch_min_interval, Duration::ZERO);
+    fn login_config_touch_min_interval_defaults_one_hour() {
+        assert_eq!(
+            default_policy_config().touch_min_interval,
+            Duration::from_hours(1)
+        );
     }
 
     #[test]
