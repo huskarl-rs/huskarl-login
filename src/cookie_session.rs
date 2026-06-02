@@ -16,7 +16,9 @@ use huskarl::core::crypto::cipher::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    cookie::{cookie_attrs, decode_payload, encode_kid, encode_payload, get_kid_cookie, kid_cookie_name},
+    cookie::{
+        cookie_attrs, decode_payload, encode_kid, encode_payload, get_kid_cookie, kid_cookie_name,
+    },
     grant::CompletedLogin,
     session::{SessionDriver, SessionError, to_session_err},
     session_state::{Session, SessionState},
@@ -202,7 +204,9 @@ impl<C: CookieData> CookieSessionStore<C> {
         let raw_encoded = reassemble_chunks(&chunks)?;
         let bundle = URL_SAFE_NO_PAD.decode(&raw_encoded).ok()?;
         let kid = get_kid_cookie(headers, &self.cookie_name);
-        let cipher_match = kid.as_deref().map(|k| CipherMatch::builder().kid(k).build());
+        let cipher_match = kid
+            .as_deref()
+            .map(|k| CipherMatch::builder().kid(k).build());
         let plaintext = self
             .unsealer
             .unseal(cipher_match.as_ref(), &bundle, b"session")
@@ -292,11 +296,6 @@ impl<C: CookieData> CookieSessionStore<C> {
         }
         self.append_clears_for_leftover_chunks(&mut headers, num_chunks, request_headers, &attrs);
         headers.push(self.build_kid_header(kid.as_deref(), &attrs)?);
-        // Clear the old base name in case it was left over from a previous version.
-        if let Ok(v) = HeaderValue::from_str(&format!("{}=; {attrs}; Max-Age=0", self.cookie_name))
-        {
-            headers.push(v);
-        }
         Ok(headers)
     }
 
@@ -357,10 +356,6 @@ impl<C: CookieData> CookieSessionStore<C> {
         let attrs = self.cookie_attrs();
         let cookie_name = &self.cookie_name;
         let mut headers = Vec::new();
-        // Clear the bare base name (legacy single-cookie format).
-        if let Ok(v) = HeaderValue::from_str(&format!("{cookie_name}=; {attrs}; Max-Age=0")) {
-            headers.push(v);
-        }
         // Clear the kid sidecar unconditionally — cheap and avoids leaving a
         // stale hint that would just degrade the next request to trial-decrypt
         // against a session that no longer exists.
@@ -608,22 +603,12 @@ mod tests {
 
     #[tokio::test]
     async fn save_emits_no_chunk_clears_when_request_has_none() {
-        // Without any request-side chunks to clear, the save emits only the
-        // new chunk cookies plus the bare-name legacy clear.
         let store = test_store().await;
         let session = CookieSession(test_state());
         let cookies = store
             .save_session(&session, &HeaderMap::new())
             .await
             .unwrap();
-        let bare_clear = cookies
-            .iter()
-            .filter(|c| {
-                let s = c.to_str().unwrap();
-                s.starts_with("huskarl_session=;") && s.contains("Max-Age=0")
-            })
-            .count();
-        assert_eq!(bare_clear, 1, "expected exactly the legacy bare-name clear");
         let chunk_clears = cookies
             .iter()
             .filter(|c| {
@@ -683,7 +668,10 @@ mod tests {
             Some("test-kid")
         );
         let loaded = store.load_session(&req_headers).await;
-        assert!(loaded.is_some(), "session should load with kid sidecar present");
+        assert!(
+            loaded.is_some(),
+            "session should load with kid sidecar present"
+        );
     }
 
     #[tokio::test]
@@ -736,7 +724,10 @@ mod tests {
             let s = c.to_str().unwrap();
             s.starts_with("huskarl_session.kid=;") && s.contains("Max-Age=0")
         });
-        assert!(kid_clear, "expected kid sidecar clear with no-identity cipher");
+        assert!(
+            kid_clear,
+            "expected kid sidecar clear with no-identity cipher"
+        );
     }
 
     #[tokio::test]
@@ -881,8 +872,8 @@ mod tests {
         let store = test_store().await;
         let req = request_with_chunk_slots(5);
         let clears = store.delete_headers(&req);
-        // Bare name + kid sidecar + 5 chunk slots (.0 through .4).
-        assert_eq!(clears.len(), 7);
+        // Kid sidecar + 5 chunk slots (.0 through .4).
+        assert_eq!(clears.len(), 6);
         for c in &clears {
             assert!(c.to_str().unwrap().contains("Max-Age=0"));
         }
@@ -901,22 +892,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_emits_legacy_and_kid_clears_when_request_has_no_chunks() {
-        // Edge case: a logout with no session cookies present still emits the
-        // bare-name clear (defense against legacy single-cookie format) and
-        // the kid sidecar clear, but doesn't sweep any speculative chunk slots.
+    async fn delete_emits_only_kid_clear_when_request_has_no_chunks() {
         let store = test_store().await;
         let clears = store.delete_headers(&HeaderMap::new());
-        assert_eq!(clears.len(), 2);
-        let bare = clears.iter().any(|c| {
-            let s = c.to_str().unwrap();
-            s.starts_with("huskarl_session=;") && s.contains("Max-Age=0")
-        });
+        assert_eq!(clears.len(), 1);
         let kid = clears.iter().any(|c| {
             let s = c.to_str().unwrap();
             s.starts_with("huskarl_session.kid=;") && s.contains("Max-Age=0")
         });
-        assert!(bare, "expected bare-name clear");
         assert!(kid, "expected kid sidecar clear");
     }
 

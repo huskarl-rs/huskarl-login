@@ -249,11 +249,9 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         let kid = self.sealer.key_id();
         let cookie_value = URL_SAFE_NO_PAD.encode(&bundle);
         let attrs = self.cookie_attrs();
-        let pointer = HeaderValue::from_str(&format!(
-            "{}={cookie_value}; {attrs}",
-            self.cookie_name
-        ))
-        .map_err(to_session_err)?;
+        let pointer =
+            HeaderValue::from_str(&format!("{}={cookie_value}; {attrs}", self.cookie_name))
+                .map_err(to_session_err)?;
         let kid_header = self.build_kid_header(kid.as_deref(), &attrs)?;
         Ok(vec![pointer, kid_header])
     }
@@ -278,7 +276,9 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         let encoded = get_cookie(headers, &self.cookie_name)?;
         let bundle = URL_SAFE_NO_PAD.decode(encoded).ok()?;
         let kid = get_kid_cookie(headers, &self.cookie_name);
-        let cipher_match = kid.as_deref().map(|k| CipherMatch::builder().kid(k).build());
+        let cipher_match = kid
+            .as_deref()
+            .map(|k| CipherMatch::builder().kid(k).build());
         let plaintext = self
             .unsealer
             .unseal(cipher_match.as_ref(), &bundle, b"session_ptr")
@@ -615,7 +615,10 @@ mod tests {
             let s = h.to_str().unwrap();
             s.starts_with(&format!("session.kid={expected_value};"))
         });
-        assert!(sidecar_set, "expected kid sidecar set to base64url(identity)");
+        assert!(
+            sidecar_set,
+            "expected kid sidecar set to base64url(identity)"
+        );
     }
 
     #[tokio::test]
