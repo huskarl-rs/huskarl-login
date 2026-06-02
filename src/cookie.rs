@@ -13,9 +13,17 @@
 //! flow. No explicit format-versioning is needed because re-login already
 //! recovers gracefully.
 
+use std::time::Duration;
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::header;
 use serde::{Serialize, de::DeserializeOwned};
+
+/// Default `Max-Age` for session cookies. 400 days is the practical ceiling
+/// most browsers enforce; using it as the default means the cookie is finite
+/// (never a true session cookie) but generous enough to never be the binding
+/// constraint — the encrypted payload enforces actual session policy.
+pub(crate) const DEFAULT_COOKIE_MAX_AGE: Duration = Duration::from_hours(9600);
 
 /// Encodes a cookie payload as CBOR. Used for both the session cookie and
 /// the login-state cookie before they are AEAD-sealed and base64-encoded.

@@ -5,7 +5,7 @@
 //! payloads are automatically split across multiple cookies (`.0`, `.1`, ...)
 //! to stay within browser size limits.
 
-use std::marker::PhantomData;
+use std::{marker::PhantomData, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cookie::{
-        cookie_attrs, decode_payload, encode_kid, encode_payload, get_kid_cookie, kid_cookie_name,
+        DEFAULT_COOKIE_MAX_AGE, cookie_attrs, decode_payload, encode_kid, encode_payload,
+        get_kid_cookie, kid_cookie_name,
     },
     grant::CompletedLogin,
     session::{SessionDriver, SessionError, to_session_err},
@@ -165,6 +166,7 @@ pub struct CookieSessionStore<C = CookieSession> {
     cookie_name: String,
     secure: bool,
     cookie_path: String,
+    max_age: Duration,
     _phantom: PhantomData<C>,
 }
 
@@ -187,12 +189,29 @@ impl<C> CookieSessionStore<C> {
             cookie_name: cookie_name.into(),
             secure,
             cookie_path: cookie_path.into(),
+            max_age: DEFAULT_COOKIE_MAX_AGE,
             _phantom: PhantomData,
         }
     }
 
+    /// Sets the `Max-Age` for session cookies.
+    ///
+    /// Defaults to 400 days — finite but generous enough that the cookie
+    /// never expires before the server-side session does. If `max_lifetime`
+    /// is configured in `LoginConfig`, pass it here so the browser discards
+    /// the cookie around the time the session can no longer be valid.
+    #[must_use]
+    pub fn with_max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
     fn cookie_attrs(&self) -> String {
-        cookie_attrs(self.secure, &self.cookie_path)
+        format!(
+            "{}; Max-Age={}",
+            cookie_attrs(self.secure, &self.cookie_path),
+            self.max_age.as_secs()
+        )
     }
 }
 

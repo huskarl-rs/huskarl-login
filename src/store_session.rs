@@ -6,6 +6,8 @@
 //! creation and returns its own `Session` type, which may enrich the persisted
 //! state with domain-specific fields.
 
+use std::time::Duration;
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
 use huskarl::core::crypto::cipher::{
@@ -16,7 +18,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    cookie::{cookie_attrs, encode_kid, get_cookie, get_kid_cookie, kid_cookie_name},
+    cookie::{
+        DEFAULT_COOKIE_MAX_AGE, cookie_attrs, encode_kid, get_cookie, get_kid_cookie,
+        kid_cookie_name,
+    },
     session::{SessionDriver, SessionError, to_session_err},
     session_state::{Session, SessionState},
 };
@@ -191,6 +196,7 @@ pub struct StoreBackedSessionStore<E> {
     cookie_name: String,
     secure: bool,
     cookie_path: String,
+    max_age: Duration,
 }
 
 impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
@@ -215,11 +221,26 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             cookie_name: cookie_name.into(),
             secure,
             cookie_path: cookie_path.into(),
+            max_age: DEFAULT_COOKIE_MAX_AGE,
         }
     }
 
+    /// Sets the `Max-Age` for the pointer cookie.
+    ///
+    /// Defaults to 400 days. See [`CookieSessionStore::with_max_age`] for
+    /// the rationale; the same reasoning applies here.
+    #[must_use]
+    pub fn with_max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
     fn cookie_attrs(&self) -> String {
-        cookie_attrs(self.secure, &self.cookie_path)
+        format!(
+            "{}; Max-Age={}",
+            cookie_attrs(self.secure, &self.cookie_path),
+            self.max_age.as_secs()
+        )
     }
 
     /// Encrypt the pointer cookie and emit it alongside the kid sidecar.
