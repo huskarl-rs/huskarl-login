@@ -1,6 +1,6 @@
 [package]
 name = "huskarl-login"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.92"
 description = "OAuth2/OIDC login flow helpers for huskarl."
