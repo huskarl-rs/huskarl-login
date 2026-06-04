@@ -94,7 +94,7 @@ where
         {
             Ok(cl) => cl,
             Err(e) => {
-                log::error!("token exchange failed: {e}");
+                log::error!("token exchange failed: {}", error_chain(&e));
                 return self
                     .callback_error(
                         StatusCode::BAD_GATEWAY,

@@ -373,7 +373,7 @@ where
                 }
             }
             Err(e) => {
-                log::error!("token refresh failed: {e}");
+                log::error!("token refresh failed: {}", error_chain(&e));
                 let clear_cookies = self.delete_best_effort(&session, headers).await;
                 LoadedSession {
                     session: None,

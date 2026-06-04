@@ -55,7 +55,7 @@ where
         match self.session_store.load(headers).await {
             Ok(s) => s,
             Err(e) => {
-                log::warn!("failed to load session during logout: {e}");
+                log::warn!("failed to load session during logout: {}", error_chain(&e));
                 None
             }
         }
