@@ -17,6 +17,9 @@ use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::header;
+use huskarl::core::crypto::cipher::{
+    AeadUnsealer as _, AeadV1Unsealer, BoxedAeadCipher, CipherMatch,
+};
 use serde::{Serialize, de::DeserializeOwned};
 
 /// Default `Max-Age` for session cookies. 400 days is the practical ceiling
@@ -107,8 +110,35 @@ pub fn cookie_attrs(secure: bool, path: &str) -> String {
 ///
 /// The sidecar is not security-bearing: tampering or absence just degrades to
 /// trial-decrypt across all configured keys, which is the safe baseline. The
-/// AEAD seal remains the sole authenticity gate.
+/// AEAD seal remains the sole authenticity gate. The hint-not-filter property
+/// is enforced by [`unseal_with_kid_fallback`], because the underlying
+/// multi-key cipher treats an unmatched kid as a hard "no matching key"
+/// failure rather than falling back on its own.
 pub(crate) const KID_COOKIE_SUFFIX: &str = ".kid";
+
+/// Unseals `bundle`, treating the kid sidecar's `cipher_match` as a hint
+/// rather than a filter: if unsealing under the hint fails, retry once across
+/// all configured keys.
+///
+/// The sidecar is browser-held and unauthenticated, so it can be stale or
+/// tampered with independently of the (AEAD-sealed) payload it accompanies. A
+/// wrong hint must not lock out a session that one of the configured keys can
+/// authenticate — absence of the hint is the safe baseline, and a bad hint
+/// must degrade to exactly that. The happy path still pays only one unseal;
+/// the retry happens only on failure, where a second decrypt attempt is noise.
+pub(crate) async fn unseal_with_kid_fallback(
+    unsealer: &AeadV1Unsealer<BoxedAeadCipher>,
+    cipher_match: Option<&CipherMatch<'_>>,
+    bundle: &[u8],
+    aad: &[u8],
+) -> Option<Vec<u8>> {
+    if let Some(m) = cipher_match
+        && let Ok(plaintext) = unsealer.unseal(Some(m), bundle, aad).await
+    {
+        return Some(plaintext);
+    }
+    unsealer.unseal(None, bundle, aad).await.ok()
+}
 
 /// Returns the sidecar cookie name for the given session cookie base name.
 #[must_use]

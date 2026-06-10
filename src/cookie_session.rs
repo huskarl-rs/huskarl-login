@@ -11,8 +11,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
 use huskarl::core::{
     crypto::cipher::{
-        AeadEncryptor, AeadSealer, AeadUnsealer, AeadV1Sealer, AeadV1Unsealer, BoxedAeadCipher,
-        CipherMatch,
+        AeadEncryptor, AeadSealer, AeadV1Sealer, AeadV1Unsealer, BoxedAeadCipher, CipherMatch,
     },
     platform::MaybeSendSync,
 };
@@ -21,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cookie::{
         DEFAULT_COOKIE_MAX_AGE, cookie_attrs, decode_payload, encode_kid, encode_payload,
-        get_kid_cookie, kid_cookie_name,
+        get_kid_cookie, kid_cookie_name, unseal_with_kid_fallback,
     },
     grant::CompletedLogin,
     metrics::{DecryptResult, SessionCookieMetrics},
@@ -246,10 +245,9 @@ impl<C: CookieData> CookieSessionStore<C> {
         let cipher_match = kid
             .as_deref()
             .map(|k| CipherMatch::builder().kid(k).build());
-        let Ok(plaintext) = self
-            .unsealer
-            .unseal(cipher_match.as_ref(), &bundle, b"session")
-            .await
+        let Some(plaintext) =
+            unseal_with_kid_fallback(&self.unsealer, cipher_match.as_ref(), &bundle, b"session")
+                .await
         else {
             self.record_decrypt(kid.as_deref(), &DecryptResult::DecryptFailed);
             return None;
@@ -763,6 +761,135 @@ mod tests {
         let combined = format!("{}; huskarl_session.kid=!!!", stripped.join("; "));
         req_headers.insert(http::header::COOKIE, combined.parse().unwrap());
         assert!(store.load_session(&req_headers).await.is_some());
+    }
+
+    // ── kid sidecar as hint, not filter ───────────────────────────────────
+
+    use huskarl::core::crypto::cipher::{BoxedAeadDecryptor, MultiKeyCipher, MultiKeyDecryptor};
+
+    /// An AES-256 key with a stable identity, deterministic in `byte` so the
+    /// "same" key can be constructed twice (e.g. once for a decryptor set and
+    /// once as the encryptor).
+    async fn aes_key_with_kid(kid: &str, byte: u8) -> huskarl_crypto_native::aead::AesGcmKey {
+        let kid_owned = kid.to_owned();
+        AesGcmKey::from_secret(
+            AesGcmKeyType::Aes256,
+            TestSecret(SecretBytes::new(vec![byte; 32])),
+            move |_| Some(kid_owned.clone()),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A rotation-shaped cipher: seals under "v2", unseals under {"v1", "v2"}.
+    /// Unlike the single-key test ciphers (which ignore the `CipherMatch`
+    /// hint entirely), the multi-key decryptor takes an exact-kid match as
+    /// definitive and reports "no matching key" for unknown kids — the shape
+    /// that makes a wrong sidecar hint actually bite.
+    async fn multi_key_cipher() -> BoxedAeadCipher {
+        let decryptor = MultiKeyDecryptor::new(vec![
+            BoxedAeadDecryptor::new(aes_key_with_kid("v1", 1).await),
+            BoxedAeadDecryptor::new(aes_key_with_kid("v2", 2).await),
+        ]);
+        BoxedAeadCipher::new(MultiKeyCipher::new(
+            aes_key_with_kid("v2", 2).await,
+            decryptor,
+        ))
+    }
+
+    async fn multi_key_store() -> CookieSessionStore<CookieSession> {
+        CookieSessionStore::builder()
+            .cipher(multi_key_cipher().await)
+            .cookie_name("huskarl_session")
+            .secure(true)
+            .cookie_path("/")
+            .build()
+    }
+
+    /// Replaces the kid sidecar pair in the request's `Cookie` header with
+    /// `value`, leaving the session chunks untouched.
+    fn override_kid_cookie(req_headers: &mut HeaderMap, value: &str) {
+        let existing = req_headers
+            .get(http::header::COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let mut pairs: Vec<String> = existing
+            .split(';')
+            .map(str::trim)
+            .filter(|p| !p.starts_with("huskarl_session.kid="))
+            .map(str::to_owned)
+            .collect();
+        pairs.push(format!("huskarl_session.kid={value}"));
+        req_headers.insert(http::header::COOKIE, pairs.join("; ").parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn load_falls_back_when_kid_sidecar_names_wrong_configured_key() {
+        // The sidecar decodes cleanly but names "v1" while the payload was
+        // sealed under "v2". The multi-key decryptor treats an exact-kid match
+        // as definitive, so honoring the hint alone would fail the decrypt.
+        // The load path must degrade to trial-decrypt (hint, not filter) and
+        // still load the session.
+        let store = multi_key_store().await;
+        let set_cookies = store
+            .save_session(&CookieSession(test_state()), &HeaderMap::new())
+            .await
+            .unwrap();
+        let mut req = request_cookies_from_set_cookies(&set_cookies);
+        // Sanity: the save stamped the real sealing key's identity.
+        assert_eq!(
+            get_kid_cookie(&req, "huskarl_session").as_deref(),
+            Some("v2")
+        );
+        override_kid_cookie(&mut req, &encode_kid("v1"));
+        assert!(
+            store.load_session(&req).await.is_some(),
+            "wrong-but-configured kid hint must fall back to trial-decrypt"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_falls_back_when_kid_sidecar_names_unknown_key() {
+        // The sidecar names an identity no configured key has. Multi-key
+        // selection finds nothing ("no matching key") — the load path must
+        // retry across all keys instead of treating that as a dead session.
+        let store = multi_key_store().await;
+        let set_cookies = store
+            .save_session(&CookieSession(test_state()), &HeaderMap::new())
+            .await
+            .unwrap();
+        let mut req = request_cookies_from_set_cookies(&set_cookies);
+        override_kid_cookie(&mut req, &encode_kid("v9"));
+        assert!(
+            store.load_session(&req).await.is_some(),
+            "unknown kid hint must fall back to trial-decrypt"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_fallback_does_not_authenticate_foreign_bundles() {
+        // Negative control: the fallback widens the key search, not the
+        // authenticity gate. A bundle sealed under a key outside the
+        // configured set must still fail, whatever the sidecar claims.
+        let store = multi_key_store().await;
+        let foreign =
+            AeadV1Sealer::new(BoxedAeadCipher::new(aes_key_with_kid("v9", 9).await));
+        let payload = crate::cookie::encode_payload(&CookieSession(test_state())).unwrap();
+        let bundle = foreign.seal(&payload, b"session").await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            format!(
+                "huskarl_session.0={}; huskarl_session.kid={}",
+                URL_SAFE_NO_PAD.encode(&bundle),
+                encode_kid("v1"),
+            )
+            .parse()
+            .unwrap(),
+        );
+        assert!(store.load_session(&headers).await.is_none());
     }
 
     #[tokio::test]

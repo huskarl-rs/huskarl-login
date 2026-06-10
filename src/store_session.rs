@@ -12,8 +12,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
 use huskarl::core::{
     crypto::cipher::{
-        AeadEncryptor, AeadSealer, AeadUnsealer, AeadV1Sealer, AeadV1Unsealer, BoxedAeadCipher,
-        CipherMatch,
+        AeadEncryptor, AeadSealer, AeadV1Sealer, AeadV1Unsealer, BoxedAeadCipher, CipherMatch,
     },
     platform::{MaybeSend, MaybeSendSync},
 };
@@ -23,7 +22,7 @@ use uuid::Uuid;
 use crate::{
     cookie::{
         DEFAULT_COOKIE_MAX_AGE, cookie_attrs, encode_kid, get_cookie, get_kid_cookie,
-        kid_cookie_name,
+        kid_cookie_name, unseal_with_kid_fallback,
     },
     metrics::{DecryptResult, SessionCookieMetrics},
     session::{SessionDriver, SessionError, to_session_err},
@@ -298,10 +297,13 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         let cipher_match = kid
             .as_deref()
             .map(|k| CipherMatch::builder().kid(k).build());
-        let Ok(plaintext) = self
-            .unsealer
-            .unseal(cipher_match.as_ref(), &bundle, b"session_ptr")
-            .await
+        let Some(plaintext) = unseal_with_kid_fallback(
+            &self.unsealer,
+            cipher_match.as_ref(),
+            &bundle,
+            b"session_ptr",
+        )
+        .await
         else {
             self.record_decrypt(kid.as_deref(), &DecryptResult::DecryptFailed);
             return None;
@@ -651,6 +653,68 @@ mod tests {
             sidecar_set,
             "expected kid sidecar set to base64url(identity)"
         );
+    }
+
+    #[tokio::test]
+    async fn read_pointer_cookie_falls_back_when_kid_names_wrong_configured_key() {
+        use huskarl::core::crypto::cipher::{
+            BoxedAeadDecryptor, MultiKeyCipher, MultiKeyDecryptor,
+        };
+
+        // Rotation-shaped cipher: seals under "v2", unseals under {"v1","v2"}.
+        async fn aes_key_with_kid(kid: &str, byte: u8) -> AesGcmKey {
+            let kid_owned = kid.to_owned();
+            AesGcmKey::from_secret(
+                AesGcmKeyType::Aes256,
+                TestSecret(SecretBytes::new(vec![byte; 32])),
+                move |_| Some(kid_owned.clone()),
+            )
+            .await
+            .unwrap()
+        }
+        let decryptor = MultiKeyDecryptor::new(vec![
+            BoxedAeadDecryptor::new(aes_key_with_kid("v1", 1).await),
+            BoxedAeadDecryptor::new(aes_key_with_kid("v2", 2).await),
+        ]);
+        let cipher = BoxedAeadCipher::new(MultiKeyCipher::new(
+            aes_key_with_kid("v2", 2).await,
+            decryptor,
+        ));
+
+        let session = test_session();
+        let original_key = session.persisted.session_key;
+        let store = StoreBackedSessionStore::builder()
+            .external(MinimalExternalStore(session))
+            .cipher(cipher)
+            .cookie_name("session")
+            .secure(true)
+            .cookie_path("/")
+            .build();
+
+        let headers_out = store.pointer_cookie_headers(original_key).await.unwrap();
+        let pointer_value = headers_out
+            .iter()
+            .find_map(|h| {
+                let s = h.to_str().ok()?;
+                let pair = s.split(';').next()?;
+                let (name, value) = pair.split_once('=')?;
+                (name.trim() == "session" && !value.is_empty()).then(|| value.to_owned())
+            })
+            .expect("pointer cookie present");
+
+        // The sidecar names "v1" while the pointer was sealed under "v2" —
+        // the kid is a hint, not a filter, so the read must still succeed.
+        let mut req = http::HeaderMap::new();
+        req.insert(
+            http::header::COOKIE,
+            format!(
+                "session={pointer_value}; session.kid={}",
+                encode_kid("v1")
+            )
+            .parse()
+            .unwrap(),
+        );
+        assert_eq!(store.read_pointer_cookie(&req).await, Some(original_key));
     }
 
     #[tokio::test]
