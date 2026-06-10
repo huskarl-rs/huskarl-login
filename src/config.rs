@@ -17,13 +17,6 @@ pub enum ConfigError {
         /// Why the path was rejected.
         reason: &'static str,
     },
-    /// The `cookie_path` is invalid.
-    InvalidCookiePath {
-        /// The offending path.
-        path: String,
-        /// Why the path was rejected.
-        reason: &'static str,
-    },
     /// The `base_url` is invalid.
     InvalidBaseUrl {
         /// The offending URL.
@@ -52,9 +45,6 @@ impl std::fmt::Display for ConfigError {
         match self {
             Self::InvalidCallbackPath { path, reason } => {
                 write!(f, "invalid callback_path {path:?}: {reason}")
-            }
-            Self::InvalidCookiePath { path, reason } => {
-                write!(f, "invalid cookie_path {path:?}: {reason}")
             }
             Self::InvalidBaseUrl { url, reason } => {
                 write!(f, "invalid base_url {url:?}: {reason}")
@@ -122,8 +112,13 @@ fn compute_browser_callback_path(
 /// configured on the [`LoginGrant`](crate::LoginGrant) (i.e. [`AuthorizationCodeGrant`](huskarl::grant::authorization_code::AuthorizationCodeGrant))
 /// directly.
 ///
-/// Cookie naming for sessions is the responsibility of the [`SessionDriver`](crate::session::SessionDriver)
-/// implementation.
+/// Cookie naming and the `Path` attribute for session cookies are the
+/// responsibility of the [`SessionDriver`](crate::session::SessionDriver)
+/// implementation — see the `cookie_path` builder setting on
+/// [`CookieSessionStore`](crate::CookieSessionStore) and
+/// [`StoreBackedSessionStore`](crate::StoreBackedSessionStore). Login-state
+/// cookies are scoped automatically to
+/// [`browser_callback_path`](Self::browser_callback_path).
 #[derive(Debug)]
 pub struct LoginConfig {
     /// Path at which the callback endpoint is mounted (e.g. `"/callback"`).
@@ -178,15 +173,6 @@ pub struct LoginConfig {
     ///
     /// Defaults to 1 hour.
     pub touch_min_interval: Duration,
-    /// `Path` attribute for login-state cookies.
-    ///
-    /// Restricts the browser to sending login-state cookies only on requests
-    /// under this path. Defaults to `"/"`.
-    ///
-    /// When set to `"/"` and `secure` is `true`, the `__Host-` cookie name
-    /// prefix is used for the strongest security guarantees. For sub-paths with
-    /// `secure` enabled the `__Secure-` prefix is used instead.
-    pub cookie_path: String,
     /// Canonical client-facing base URL of this application
     /// (e.g. `"https://app.example.com"` or `"https://app.example.com/base"`).
     ///
@@ -272,9 +258,6 @@ impl LoginConfig {
         /// Minimum interval between activity touches. Defaults to 1 hour.
         #[builder(default = Duration::from_hours(1))]
         touch_min_interval: Duration,
-        /// `Path` attribute for login-state cookies. Defaults to `"/"`.
-        #[builder(default = "/".to_owned())]
-        cookie_path: String,
         /// Canonical client-facing base URL (e.g. `"https://app.example.com"`).
         base_url: http::Uri,
         /// Path prefix added by a front proxy to strip before constructing the original URL.
@@ -295,9 +278,6 @@ impl LoginConfig {
     ) -> Result<Self, ConfigError> {
         validate_path(&callback_path, |path, reason| {
             ConfigError::InvalidCallbackPath { path, reason }
-        })?;
-        validate_path(&cookie_path, |path, reason| {
-            ConfigError::InvalidCookiePath { path, reason }
         })?;
         if base_url.scheme().is_none() || base_url.authority().is_none() {
             return Err(ConfigError::InvalidBaseUrl {
@@ -330,7 +310,6 @@ impl LoginConfig {
             default_token_lifetime,
             login_state_ttl,
             touch_min_interval,
-            cookie_path,
             base_url,
             strip_prefix,
             logout_path,
@@ -463,48 +442,21 @@ mod tests {
     }
 
     #[test]
-    fn login_config_cookie_path_defaults_to_root() {
-        assert_eq!(default_policy_config().cookie_path, "/");
-    }
-
-    #[test]
-    fn login_config_cookie_path_must_start_with_slash() {
-        let err = LoginConfig::builder()
-            .callback_path("/callback".into())
-            .scopes(vec![])
-            .base_url("https://app.example.com".parse().unwrap())
-            .cookie_path("app".into())
-            .build()
-            .unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidCookiePath { .. }));
-    }
-
-    #[test]
-    fn login_config_cookie_path_must_not_contain_query_fragment_or_semicolon() {
-        for path in ["/app?foo=bar", "/app#section", "/app;Secure"] {
-            let err = LoginConfig::builder()
-                .callback_path("/callback".into())
-                .scopes(vec![])
-                .base_url("https://app.example.com".parse().unwrap())
-                .cookie_path(path.into())
-                .build()
-                .unwrap_err();
-            assert!(matches!(err, ConfigError::InvalidCookiePath { .. }));
-        }
-    }
-
-    #[test]
     fn login_config_paths_reject_control_characters() {
-        for path in ["/app\r\nSet-Cookie: x=y", "/app\0", "/app\n", "/app\t"] {
+        for path in [
+            "/callback\r\nSet-Cookie: x=y",
+            "/callback\0",
+            "/callback\n",
+            "/callback\t",
+        ] {
             let err = LoginConfig::builder()
-                .callback_path("/callback".into())
+                .callback_path(path.into())
                 .scopes(vec![])
                 .base_url("https://app.example.com".parse().unwrap())
-                .cookie_path(path.into())
                 .build()
                 .unwrap_err();
             assert!(
-                matches!(err, ConfigError::InvalidCookiePath { .. }),
+                matches!(err, ConfigError::InvalidCallbackPath { .. }),
                 "expected reject for {path:?}, got {err:?}"
             );
         }
@@ -650,15 +602,6 @@ mod tests {
         assert!(s.contains("callback_path"));
         assert!(s.contains("foo"));
         assert!(s.contains("must start with '/'"));
-    }
-
-    #[test]
-    fn config_error_display_cookie_path() {
-        let err = ConfigError::InvalidCookiePath {
-            path: "bar".into(),
-            reason: "reason",
-        };
-        assert!(err.to_string().contains("cookie_path"));
     }
 
     #[test]
