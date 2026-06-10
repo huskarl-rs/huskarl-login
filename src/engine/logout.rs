@@ -15,7 +15,7 @@ impl<G, SD, H> LoginEngine<G, SD, H>
 where
     G: LoginGrant,
     SD: SessionDriver,
-    H: HttpClient + Send + Sync,
+    H: HttpClient,
 {
     pub(super) async fn handle_logout(&self, headers: &HeaderMap) -> LoginResponse {
         // Logout is state-changing and session cookies are SameSite=Lax (sent

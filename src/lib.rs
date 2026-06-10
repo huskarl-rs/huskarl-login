@@ -14,6 +14,15 @@
 //! mutating methods (`save`, `touch`, `delete`). Framework crates that need a
 //! different interface (e.g. Pingora's `&mut ResponseHeader`) adapt with a
 //! small helper that appends the returned headers.
+//!
+//! # Platform support
+//!
+//! Trait bounds use `huskarl::core::platform`'s `MaybeSend` / `MaybeSendSync`
+//! markers rather than bare `Send` / `Sync`: on native targets they are
+//! equivalent to `Send + Sync`, while on `wasm32` (assumed single-threaded)
+//! the requirement disappears. Time and sleeping likewise go through
+//! `huskarl::core::platform`, so the crate compiles for
+//! `wasm32-unknown-unknown` and WASI targets.
 
 pub mod cookie;
 pub mod engine;

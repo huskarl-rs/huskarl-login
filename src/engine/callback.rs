@@ -20,7 +20,7 @@ impl<G, SD, H> LoginEngine<G, SD, H>
 where
     G: LoginGrant,
     SD: SessionDriver,
-    H: HttpClient + Send + Sync,
+    H: HttpClient,
 {
     pub(super) async fn handle_callback(&self, uri: &Uri, headers: &HeaderMap) -> LoginResponse {
         let (code, state, iss) = match parse_callback_params(uri.query().unwrap_or("")) {

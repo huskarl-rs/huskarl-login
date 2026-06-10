@@ -9,9 +9,12 @@ use std::{borrow::Cow, marker::PhantomData, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
-use huskarl::core::crypto::cipher::{
-    AeadEncryptor, AeadSealer, AeadUnsealer, AeadV1Sealer, AeadV1Unsealer, BoxedAeadCipher,
-    CipherMatch,
+use huskarl::core::{
+    crypto::cipher::{
+        AeadEncryptor, AeadSealer, AeadUnsealer, AeadV1Sealer, AeadV1Unsealer, BoxedAeadCipher,
+        CipherMatch,
+    },
+    platform::MaybeSendSync,
 };
 use serde::{Deserialize, Serialize};
 
@@ -92,10 +95,10 @@ const CHUNK_SIZE: usize = 3800;
 /// }
 /// ```
 pub trait CookieData:
-    Session + Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static
+    Session + Serialize + for<'de> Deserialize<'de> + MaybeSendSync + 'static
 {
     /// Error type returned by [`from_login`](Self::from_login).
-    type Error: std::error::Error + Send + Sync + 'static;
+    type Error: std::error::Error + MaybeSendSync + 'static;
 
     /// Build a cookie session payload from the framework-prepared `SessionState`
     /// and the completed login.

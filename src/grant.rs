@@ -10,6 +10,7 @@ use huskarl::{
     core::{
         BoxedError, client_auth::ClientAuthentication, dpop::AuthorizationServerDPoP,
         http::HttpClient,
+        platform::{MaybeSend, MaybeSendSync},
     },
     grant::{
         authorization_code::{
@@ -60,7 +61,7 @@ impl CompletedLogin {
 /// Implementations handle PAR, JAR, `DPoP`, PKCE, and state/nonce generation
 /// automatically. A blanket implementation is provided for
 /// [`AuthorizationCodeGrant`].
-pub trait LoginGrant: Send + Sync {
+pub trait LoginGrant: MaybeSendSync {
     /// Begin an Authorization Code flow: build the authorization URL and the
     /// per-flow `PendingState` (state, nonce, PKCE verifier) that must be
     /// stashed for the callback.
@@ -68,7 +69,7 @@ pub trait LoginGrant: Send + Sync {
         &self,
         http_client: &impl HttpClient,
         scopes: Vec<String>,
-    ) -> impl Future<Output = Result<StartOutput, BoxedError>> + Send;
+    ) -> impl Future<Output = Result<StartOutput, BoxedError>> + MaybeSend;
 
     /// Exchange an authorization `code` for tokens, validating `state` (and
     /// `iss` when present) against the stashed `PendingState`.
@@ -79,22 +80,22 @@ pub trait LoginGrant: Send + Sync {
         code: String,
         state: String,
         iss: Option<String>,
-    ) -> impl Future<Output = Result<CompletedLogin, BoxedError>> + Send;
+    ) -> impl Future<Output = Result<CompletedLogin, BoxedError>> + MaybeSend;
 
     /// Exchange a `refresh_token` for a fresh token response.
     fn refresh(
         &self,
         http_client: &impl HttpClient,
         refresh_token: &RefreshToken,
-    ) -> impl Future<Output = Result<TokenResponse, BoxedError>> + Send;
+    ) -> impl Future<Output = Result<TokenResponse, BoxedError>> + MaybeSend;
 }
 
 impl<Auth, D, J, Extra> LoginGrant for AuthorizationCodeGrant<Auth, D, J, Extra>
 where
-    Auth: ClientAuthentication + Clone + Send + Sync + 'static,
-    D: AuthorizationServerDPoP + Send + Sync + 'static,
-    J: Jar + Send + Sync + 'static,
-    Extra: Clone + Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
+    Auth: ClientAuthentication + Clone + MaybeSendSync + 'static,
+    D: AuthorizationServerDPoP + MaybeSendSync + 'static,
+    J: Jar + MaybeSendSync + 'static,
+    Extra: Clone + Serialize + for<'de> Deserialize<'de> + MaybeSendSync + 'static,
 {
     async fn start(
         &self,

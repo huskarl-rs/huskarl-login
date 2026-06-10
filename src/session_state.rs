@@ -15,10 +15,11 @@
 //! value, which is then set back via the trait. This matches the
 //! load->transform->save model required for distributed session stores.
 
-use std::time::{Duration, SystemTime};
-
 use huskarl::{
-    core::serde_utils::time::unix_secs,
+    core::{
+        platform::{Duration, SystemTime},
+        serde_utils::time::unix_secs,
+    },
     grant::core::TokenResponse,
     token::{IdToken, RefreshToken},
 };

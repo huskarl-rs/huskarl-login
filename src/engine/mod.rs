@@ -16,10 +16,7 @@
 //! Framework adapters (huskarl-axum, huskarl-pingora) compose these into
 //! middleware appropriate for the framework's routing model.
 
-use std::{
-    sync::{Arc, LazyLock},
-    time::{Duration, SystemTime},
-};
+use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
@@ -28,6 +25,7 @@ use huskarl::{
         BoxedError, Error as _,
         crypto::cipher::{AeadV1Sealer, AeadV1Unsealer, BoxedAeadCipher},
         http::HttpClient,
+        platform::{Duration, MaybeSendSync, SystemTime, sleep},
     },
     grant::{authorization_code::PendingState, core::TokenResponse},
     token::RefreshToken,
@@ -49,7 +47,7 @@ mod redirect;
 #[cfg(test)]
 mod tests;
 
-type EngineError = Box<dyn std::error::Error + Send + Sync>;
+type EngineError = SessionError;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -110,7 +108,7 @@ pub enum SessionPersistence {
 /// side effects (DB writes, queued jobs, etc.). Returning a replacement
 /// response will cause well-behaved clients to retry — design handlers
 /// accordingly.
-pub trait PersistFailurePolicy: Send + Sync + 'static {
+pub trait PersistFailurePolicy: MaybeSendSync + 'static {
     /// Decide what to do after a persist failure.
     ///
     /// Returning `Some(response)` replaces the inner handler's response; `None`
@@ -188,7 +186,7 @@ impl<G, SD, H> LoginEngine<G, SD, H>
 where
     G: LoginGrant,
     SD: SessionDriver,
-    H: HttpClient + Send + Sync,
+    H: HttpClient,
 {
     /// Creates a new `LoginEngine`.
     ///
@@ -241,7 +239,7 @@ impl<G, SD, H> LoginEngine<G, SD, H>
 where
     G: LoginGrant,
     SD: SessionDriver,
-    H: HttpClient + Send + Sync,
+    H: HttpClient,
 {
     /// If `path` is the configured callback or logout path, returns the
     /// corresponding response. Otherwise returns `None` and the framework
@@ -462,7 +460,7 @@ where
                     log::warn!(
                         "token refresh failed (attempt {attempt}/{REFRESH_MAX_ATTEMPTS}, retrying in {delay:?}): {e}"
                     );
-                    tokio::time::sleep(delay).await;
+                    sleep(delay).await;
                 }
                 Err(e) => return Err(e),
             }

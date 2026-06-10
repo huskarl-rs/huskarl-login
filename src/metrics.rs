@@ -9,6 +9,8 @@
 //! Absent cookies are always silent — the metric fires only when a
 //! session-cookie-shaped value was present in the request.
 
+use huskarl::core::platform::MaybeSendSync;
+
 /// Outcome of a session cookie decryption attempt.
 ///
 /// Passed to [`SessionCookieMetrics::record_decrypt`] to indicate why
@@ -49,7 +51,7 @@ impl DecryptResult {
 /// Absent cookies are always silent — [`record_decrypt`](Self::record_decrypt)
 /// fires only when a session-cookie-shaped value was actually present in the
 /// request.
-pub trait SessionCookieMetrics: Send + Sync + 'static {
+pub trait SessionCookieMetrics: MaybeSendSync + 'static {
     /// Record a decryption attempt on the session cookie.
     ///
     /// `cookie_name` is the base session cookie name (e.g. `huskarl_session`).
@@ -227,7 +229,7 @@ impl ActivityOutcome {
 /// Implement this trait to record login-flow metrics to a backend of your
 /// choice. Attach an implementation via the `metrics` builder setting on
 /// [`LoginEngine`](crate::engine::LoginEngine).
-pub trait LoginEngineMetrics: Send + Sync + 'static {
+pub trait LoginEngineMetrics: MaybeSendSync + 'static {
     /// Record a login redirect attempt (browser redirected to authorization server).
     fn record_login_start(&self, result: &LoginStartResult);
 

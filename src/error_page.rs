@@ -7,6 +7,7 @@
 
 use bytes::Bytes;
 use http::StatusCode;
+use huskarl::core::platform::MaybeSendSync;
 
 /// The rendered content of an error page.
 pub struct ErrorPageResponse {
@@ -21,7 +22,7 @@ pub struct ErrorPageResponse {
 /// The default implementation ([`DefaultErrorPage`]) produces minimal,
 /// self-contained HTML. Implement this trait to customise the look of error
 /// pages served during the login flow.
-pub trait ErrorPage: Send + Sync {
+pub trait ErrorPage: MaybeSendSync {
     /// Render an error page for the given HTTP status and human-readable
     /// message.
     fn render(&self, status: StatusCode, message: &str) -> ErrorPageResponse;

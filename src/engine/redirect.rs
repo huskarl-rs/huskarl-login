@@ -17,7 +17,7 @@ impl<G, SD, H> LoginEngine<G, SD, H>
 where
     G: LoginGrant,
     SD: SessionDriver,
-    H: HttpClient + Send + Sync,
+    H: HttpClient,
 {
     pub(super) async fn redirect_to_as(
         &self,

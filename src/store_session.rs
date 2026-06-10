@@ -10,9 +10,12 @@ use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
-use huskarl::core::crypto::cipher::{
-    AeadEncryptor, AeadSealer, AeadUnsealer, AeadV1Sealer, AeadV1Unsealer, BoxedAeadCipher,
-    CipherMatch,
+use huskarl::core::{
+    crypto::cipher::{
+        AeadEncryptor, AeadSealer, AeadUnsealer, AeadV1Sealer, AeadV1Unsealer, BoxedAeadCipher,
+        CipherMatch,
+    },
+    platform::{MaybeSend, MaybeSendSync},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -38,17 +41,17 @@ use crate::{
 /// directly. For enriched sessions (e.g. with user profile data), define a
 /// custom type that implements [`Session`] and [`PersistedSession`], embedding
 /// a `PersistedSessionState`.
-pub trait ExternalSessionStore: Send + Sync {
+pub trait ExternalSessionStore: MaybeSendSync {
     /// The session type returned by this store.
     ///
     /// Must implement [`Session`] so the middleware can inspect token expiry,
     /// refresh tokens, etc., and [`PersistedSession`] so the framework can
     /// reach the embedded [`PersistedSessionState`] (session key plus any
     /// future framework-managed fields).
-    type SessionType: Session + PersistedSession + Send + Sync + 'static;
+    type SessionType: Session + PersistedSession + MaybeSendSync + 'static;
 
     /// The error type returned by store operations.
-    type Error: std::error::Error + Send + Sync + 'static;
+    type Error: std::error::Error + MaybeSendSync + 'static;
 
     /// Create a new session from framework-prepared state.
     ///
@@ -63,7 +66,7 @@ pub trait ExternalSessionStore: Send + Sync {
         &self,
         persisted: PersistedSessionState,
         completed: &crate::grant::CompletedLogin,
-    ) -> impl Future<Output = Result<Self::SessionType, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Self::SessionType, Self::Error>> + MaybeSend;
 
     /// Load a session by its key. Returns `None` if the key does not exist.
     ///
@@ -73,14 +76,14 @@ pub trait ExternalSessionStore: Send + Sync {
     fn load(
         &self,
         session_key: Uuid,
-    ) -> impl Future<Output = Result<Option<Self::SessionType>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Option<Self::SessionType>, Self::Error>> + MaybeSend;
 
     /// Save a session. Called when the session has been mutated (e.g. after a
     /// token refresh).
     fn save(
         &self,
         session: &Self::SessionType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 
     /// Extend the TTL of a session without rewriting data.
     ///
@@ -89,13 +92,13 @@ pub trait ExternalSessionStore: Send + Sync {
     fn touch(
         &self,
         session: &Self::SessionType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 
     /// Delete a session.
     fn delete(
         &self,
         session: &Self::SessionType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 }
 
 /// Framework-managed session state carried by every store-backed session.
