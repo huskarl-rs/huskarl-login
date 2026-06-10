@@ -634,6 +634,8 @@ static SEC_FETCH_MODE: LazyLock<HeaderName> =
     LazyLock::new(|| HeaderName::from_static("sec-fetch-mode"));
 static SEC_FETCH_DEST: LazyLock<HeaderName> =
     LazyLock::new(|| HeaderName::from_static("sec-fetch-dest"));
+static SEC_FETCH_SITE: LazyLock<HeaderName> =
+    LazyLock::new(|| HeaderName::from_static("sec-fetch-site"));
 static X_REQUESTED_WITH: LazyLock<HeaderName> =
     LazyLock::new(|| HeaderName::from_static("x-requested-with"));
 
@@ -680,6 +682,22 @@ pub fn is_navigation_request(headers: &HeaderMap) -> bool {
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.contains("text/html") || v.contains("application/xhtml+xml"))
+}
+
+/// Returns `true` when fetch metadata identifies the request as cross-site.
+///
+/// Session cookies are `SameSite=Lax`, so they accompany cross-site top-level
+/// navigations — any page on the web can steer a user's browser at a
+/// state-changing endpoint (e.g. the logout path) with their session attached.
+/// All modern browsers send `Sec-Fetch-Site` on every request; rejecting
+/// `cross-site` blocks that forgery. Requests without the header (older
+/// clients, non-browser agents, direct navigation) are not considered
+/// cross-site.
+#[must_use]
+pub fn is_cross_site_request(headers: &HeaderMap) -> bool {
+    headers
+        .get(&*SEC_FETCH_SITE)
+        .is_some_and(|v| v.as_bytes() == b"cross-site")
 }
 
 /// Formats an error and its full source chain as a colon-separated string,

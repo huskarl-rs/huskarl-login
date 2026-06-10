@@ -23,7 +23,8 @@ use huskarl::{
 use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
 
 use super::{
-    LoginEngine, SessionPersistence, error_chain, is_cors_preflight, is_navigation_request,
+    LoginEngine, SessionPersistence, error_chain, is_cors_preflight, is_cross_site_request,
+    is_navigation_request,
 };
 use crate::{
     LoginConfig, LoginGrant, Session, SessionDriver, SessionError,
@@ -498,6 +499,46 @@ fn xhr_overrides_sec_fetch_navigate() {
 fn sec_fetch_mode_overrides_accept() {
     let h = headers(&[("sec-fetch-mode", "cors"), ("accept", "text/html")]);
     assert!(!is_navigation_request(&h));
+}
+
+// ── is_cross_site_request ─────────────────────────────────────────────────
+
+#[test]
+fn sec_fetch_site_cross_site_is_cross_site() {
+    assert!(is_cross_site_request(&headers(&[(
+        "sec-fetch-site",
+        "cross-site"
+    )])));
+}
+
+#[test]
+fn sec_fetch_site_same_origin_is_not_cross_site() {
+    assert!(!is_cross_site_request(&headers(&[(
+        "sec-fetch-site",
+        "same-origin"
+    )])));
+}
+
+#[test]
+fn sec_fetch_site_same_site_is_not_cross_site() {
+    assert!(!is_cross_site_request(&headers(&[(
+        "sec-fetch-site",
+        "same-site"
+    )])));
+}
+
+#[test]
+fn sec_fetch_site_none_is_not_cross_site() {
+    // "none" means user-initiated (typed URL, bookmark) — not a forgery.
+    assert!(!is_cross_site_request(&headers(&[(
+        "sec-fetch-site",
+        "none"
+    )])));
+}
+
+#[test]
+fn absent_sec_fetch_site_is_not_cross_site() {
+    assert!(!is_cross_site_request(&HeaderMap::new()));
 }
 
 // ── error_chain ───────────────────────────────────────────────────────────
@@ -1099,6 +1140,46 @@ async fn logout_redirects_to_configured_post_logout_uri() {
         .find(|(n, _)| *n == http::header::LOCATION)
         .map(|(_, v)| v.to_str().unwrap());
     assert_eq!(loc, Some("https://app.example.com/signed-out"));
+}
+
+#[tokio::test]
+async fn logout_rejects_cross_site_request_without_deleting_session() {
+    // A forged cross-site navigation (e.g. a link on an attacker's page) must
+    // not log the user out: 403, no redirect, session left intact.
+    let e = engine_with_config(
+        MockSessionStore::with_session(valid_session()),
+        config_with_logout(),
+    )
+    .await;
+    let uri = "/logout".parse().unwrap();
+    let h = headers(&[("sec-fetch-site", "cross-site")]);
+    let r = e
+        .try_handle_login_route("/logout", &Method::GET, &h, &uri)
+        .await
+        .expect("logout handled");
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert!(
+        !r.headers.iter().any(|(n, _)| *n == http::header::LOCATION),
+        "cross-site logout must not redirect"
+    );
+    assert!(!e.session_store().delete_called());
+}
+
+#[tokio::test]
+async fn logout_allows_same_origin_request() {
+    let e = engine_with_config(
+        MockSessionStore::with_session(valid_session()),
+        config_with_logout(),
+    )
+    .await;
+    let uri = "/logout".parse().unwrap();
+    let h = headers(&[("sec-fetch-site", "same-origin")]);
+    let r = e
+        .try_handle_login_route("/logout", &Method::GET, &h, &uri)
+        .await
+        .expect("logout handled");
+    assert_eq!(r.status, StatusCode::FOUND);
+    assert!(e.session_store().delete_called());
 }
 
 // ── Clock-skew handling ───────────────────────────────────────────────────

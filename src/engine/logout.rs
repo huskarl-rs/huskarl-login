@@ -5,7 +5,7 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use huskarl::core::http::HttpClient;
 
-use super::{LoginEngine, LoginResponse, error_chain};
+use super::{LoginEngine, LoginResponse, error_chain, is_cross_site_request};
 use crate::{
     LoginGrant, Session, SessionDriver,
     url::{build_end_session_url, default_post_logout_redirect},
@@ -18,6 +18,14 @@ where
     H: HttpClient + Send + Sync,
 {
     pub(super) async fn handle_logout(&self, headers: &HeaderMap) -> LoginResponse {
+        // Logout is state-changing and session cookies are SameSite=Lax (sent
+        // on cross-site top-level navigations), so reject forged cross-site
+        // requests before touching the session.
+        if is_cross_site_request(headers) {
+            return self
+                .build_error_response(StatusCode::FORBIDDEN, "cross-site logout request rejected");
+        }
+
         // A missing or unreadable session is not an error during logout.
         let loaded_session = self.load_session_for_logout(headers).await;
         let redirect_target = self.logout_redirect_target(loaded_session.as_ref());
