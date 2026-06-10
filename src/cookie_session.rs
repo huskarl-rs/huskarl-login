@@ -5,7 +5,7 @@
 //! payloads are automatically split across multiple cookies (`.0`, `.1`, ...)
 //! to stay within browser size limits.
 
-use std::{marker::PhantomData, time::Duration};
+use std::{borrow::Cow, marker::PhantomData, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
@@ -21,6 +21,7 @@ use crate::{
         get_kid_cookie, kid_cookie_name,
     },
     grant::CompletedLogin,
+    metrics::{DecryptResult, SessionCookieMetrics},
     session::{SessionDriver, SessionError, to_session_err},
     session_state::{Session, SessionState},
 };
@@ -167,6 +168,7 @@ pub struct CookieSessionStore<C = CookieSession> {
     secure: bool,
     cookie_path: String,
     max_age: Duration,
+    metrics: Option<Arc<dyn SessionCookieMetrics>>,
     _phantom: PhantomData<C>,
 }
 
@@ -185,6 +187,8 @@ impl<C> CookieSessionStore<C> {
         /// the cookie around the time the session can no longer be valid.
         #[builder(default = DEFAULT_COOKIE_MAX_AGE)]
         max_age: Duration,
+        /// Optional metrics observer for encrypt/decrypt events.
+        metrics: Option<Arc<dyn SessionCookieMetrics>>,
     ) -> Self {
         Self {
             sealer: AeadV1Sealer::new(cipher.clone()),
@@ -193,8 +197,20 @@ impl<C> CookieSessionStore<C> {
             secure,
             cookie_path,
             max_age,
+            metrics,
             _phantom: PhantomData,
         }
+    }
+
+    /// Returns the active sealer's key ID, if the key has an identity.
+    ///
+    /// Delegates to [`AeadEncryptor::key_id`]. Once reload support is added to
+    /// `AeadCipher`, this will reflect the key that will be used for the
+    /// **next** seal operation — suitable for updating an active-key gauge from
+    /// a reload callback.
+    #[must_use]
+    pub fn key_id(&self) -> Option<Cow<'_, str>> {
+        self.sealer.key_id()
     }
 
     fn base_cookie_attrs(&self) -> String {
@@ -216,17 +232,38 @@ impl<C: CookieData> CookieSessionStore<C> {
     pub(crate) async fn load_session(&self, headers: &http::HeaderMap) -> Option<C> {
         let chunks = self.collect_session_chunks(headers);
         let raw_encoded = reassemble_chunks(&chunks)?;
-        let bundle = URL_SAFE_NO_PAD.decode(&raw_encoded).ok()?;
+
+        // A session-cookie-shaped value is present — record the outcome.
         let kid = get_kid_cookie(headers, &self.cookie_name);
+
+        let Ok(bundle) = URL_SAFE_NO_PAD.decode(&raw_encoded) else {
+            self.record_decrypt(kid.as_deref(), &DecryptResult::BadEncoding);
+            return None;
+        };
         let cipher_match = kid
             .as_deref()
             .map(|k| CipherMatch::builder().kid(k).build());
-        let plaintext = self
+        let Ok(plaintext) = self
             .unsealer
             .unseal(cipher_match.as_ref(), &bundle, b"session")
             .await
-            .ok()?;
-        decode_payload(&plaintext).ok()
+        else {
+            self.record_decrypt(kid.as_deref(), &DecryptResult::DecryptFailed);
+            return None;
+        };
+        if let Ok(session) = decode_payload(&plaintext) {
+            self.record_decrypt(kid.as_deref(), &DecryptResult::Ok);
+            Some(session)
+        } else {
+            self.record_decrypt(kid.as_deref(), &DecryptResult::PayloadInvalid);
+            None
+        }
+    }
+
+    fn record_decrypt(&self, kid: Option<&str>, result: &DecryptResult) {
+        if let Some(m) = &self.metrics {
+            m.record_decrypt(&self.cookie_name, kid, result);
+        }
     }
 
     /// Scans request `Cookie` headers for `{cookie_name}.N` pairs, returning a
@@ -299,6 +336,9 @@ impl<C: CookieData> CookieSessionStore<C> {
         // a multi-key sealer that picks per-call, this should move to a
         // select-then-use pattern via `AeadCipherSelector`.
         let kid = self.sealer.key_id();
+        if let Some(m) = &self.metrics {
+            m.record_encrypt(&self.cookie_name, kid.as_deref());
+        }
         let cookie_value = URL_SAFE_NO_PAD.encode(&bundle);
         let chunks = split_into_chunks(&cookie_value);
         let num_chunks = chunks.len();
@@ -1002,5 +1042,195 @@ mod tests {
         let out = reassemble_chunks(&chunks).expect("contiguous chunks reassemble");
         assert!(out.starts_with("c0"));
         assert!(out.ends_with("c63"));
+    }
+
+    // ── SessionCookieMetrics ──────────────────────────────────────────────
+
+    use std::sync::{Arc, Mutex};
+
+    use crate::metrics::{DecryptResult, SessionCookieMetrics};
+
+    #[derive(Default)]
+    struct RecordingMetrics {
+        encrypts: Mutex<Vec<Option<String>>>,
+        decrypts: Mutex<Vec<(Option<String>, &'static str)>>,
+    }
+
+    impl SessionCookieMetrics for RecordingMetrics {
+        fn record_decrypt(&self, _: &str, kid: Option<&str>, result: &DecryptResult) {
+            self.decrypts
+                .lock()
+                .unwrap()
+                .push((kid.map(str::to_owned), result.as_str()));
+        }
+        fn record_encrypt(&self, _: &str, kid: Option<&str>) {
+            self.encrypts.lock().unwrap().push(kid.map(str::to_owned));
+        }
+    }
+
+    impl RecordingMetrics {
+        fn encrypts(&self) -> Vec<Option<String>> {
+            self.encrypts.lock().unwrap().clone()
+        }
+        fn decrypts(&self) -> Vec<(Option<String>, &'static str)> {
+            self.decrypts.lock().unwrap().clone()
+        }
+    }
+
+    async fn store_with_metrics() -> (CookieSessionStore<CookieSession>, Arc<RecordingMetrics>) {
+        let m = Arc::new(RecordingMetrics::default());
+        let s = CookieSessionStore::builder()
+            .cipher(test_cipher().await)
+            .cookie_name("huskarl_session")
+            .secure(true)
+            .cookie_path("/")
+            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
+            .build();
+        (s, m)
+    }
+
+    #[tokio::test]
+    async fn metrics_save_records_encrypt() {
+        let (store, m) = store_with_metrics().await;
+        store
+            .save_session(&CookieSession(test_state()), &HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(m.encrypts(), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn metrics_save_records_kid_when_cipher_has_identity() {
+        let m = Arc::new(RecordingMetrics::default());
+        let store = CookieSessionStore::<CookieSession>::builder()
+            .cipher(test_cipher_with_kid("v5").await)
+            .cookie_name("huskarl_session")
+            .secure(true)
+            .cookie_path("/")
+            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
+            .build();
+        store
+            .save_session(&CookieSession(test_state()), &HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(m.encrypts(), vec![Some("v5".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn metrics_load_absent_session_is_silent() {
+        let (store, m) = store_with_metrics().await;
+        store.load_session(&HeaderMap::new()).await;
+        assert!(m.decrypts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn metrics_load_bad_base64_records_bad_encoding() {
+        let (store, m) = store_with_metrics().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            "huskarl_session.0=not!!valid!!base64".parse().unwrap(),
+        );
+        store.load_session(&headers).await;
+        assert_eq!(m.decrypts(), vec![(None, "bad_encoding")]);
+    }
+
+    #[tokio::test]
+    async fn metrics_load_tampered_ciphertext_records_decrypt_failed() {
+        let (store, m) = store_with_metrics().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            "huskarl_session.0=AAAAAAAAAAAA".parse().unwrap(),
+        );
+        store.load_session(&headers).await;
+        assert_eq!(m.decrypts(), vec![(None, "decrypt_failed")]);
+    }
+
+    #[tokio::test]
+    async fn metrics_load_success_records_ok() {
+        let (store, m) = store_with_metrics().await;
+        let set_cookies = store
+            .save_session(&CookieSession(test_state()), &HeaderMap::new())
+            .await
+            .unwrap();
+        let req = request_cookies_from_set_cookies(&set_cookies);
+        store.load_session(&req).await;
+        // No kid sidecar (identity-less cipher), so kid=None.
+        assert_eq!(m.decrypts(), vec![(None, "ok")]);
+    }
+
+    #[tokio::test]
+    async fn metrics_load_records_kid_from_sidecar_cookie() {
+        let m = Arc::new(RecordingMetrics::default());
+        let store = CookieSessionStore::<CookieSession>::builder()
+            .cipher(test_cipher_with_kid("v5").await)
+            .cookie_name("huskarl_session")
+            .secure(true)
+            .cookie_path("/")
+            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
+            .build();
+        let set_cookies = store
+            .save_session(&CookieSession(test_state()), &HeaderMap::new())
+            .await
+            .unwrap();
+        let req = request_cookies_from_set_cookies(&set_cookies);
+        store.load_session(&req).await;
+        assert_eq!(m.decrypts(), vec![(Some("v5".to_owned()), "ok")]);
+    }
+
+    #[tokio::test]
+    async fn metrics_load_payload_invalid_when_plaintext_is_not_valid_session() {
+        let (store, m) = store_with_metrics().await;
+        // Seal garbage bytes under the session AAD — AEAD passes but CBOR
+        // deserialization of CookieSession fails, exercising PayloadInvalid.
+        let bundle = AeadV1Sealer::new(test_cipher().await)
+            .seal(b"not cbor", b"session")
+            .await
+            .unwrap();
+        let encoded = URL_SAFE_NO_PAD.encode(&bundle);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            format!("huskarl_session.0={encoded}").parse().unwrap(),
+        );
+        store.load_session(&headers).await;
+        assert_eq!(m.decrypts(), vec![(None, "payload_invalid")]);
+    }
+
+    #[tokio::test]
+    async fn metrics_load_without_kid_sidecar_records_none_kid() {
+        let m = Arc::new(RecordingMetrics::default());
+        let store = CookieSessionStore::<CookieSession>::builder()
+            .cipher(test_cipher_with_kid("v5").await)
+            .cookie_name("huskarl_session")
+            .secure(true)
+            .cookie_path("/")
+            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
+            .build();
+        let set_cookies = store
+            .save_session(&CookieSession(test_state()), &HeaderMap::new())
+            .await
+            .unwrap();
+        // Strip the kid sidecar from the simulated request so the unsealer
+        // falls back to trial-decrypt and the metric receives kid=None.
+        let mut req = HeaderMap::new();
+        let pairs: Vec<String> = request_cookies_from_set_cookies(&set_cookies)
+            .get_all(http::header::COOKIE)
+            .iter()
+            .flat_map(|v| {
+                v.to_str()
+                    .unwrap()
+                    .split(';')
+                    .map(str::trim)
+                    .map(str::to_owned)
+            })
+            .filter(|p| !p.starts_with("huskarl_session.kid="))
+            .collect();
+        if !pairs.is_empty() {
+            req.insert(http::header::COOKIE, pairs.join("; ").parse().unwrap());
+        }
+        store.load_session(&req).await;
+        assert_eq!(m.decrypts(), vec![(None, "ok")]);
     }
 }

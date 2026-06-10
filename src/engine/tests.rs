@@ -1,6 +1,6 @@
 use std::{
     convert::Infallible,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
@@ -26,7 +26,11 @@ use super::{
     LoginEngine, SessionPersistence, error_chain, is_cors_preflight, is_navigation_request,
 };
 use crate::{
-    LoginConfig, LoginGrant, Session, SessionDriver, SessionError, grant::CompletedLogin,
+    LoginConfig, LoginGrant, Session, SessionDriver, SessionError,
+    grant::CompletedLogin,
+    metrics::{
+        ActivityOutcome, LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult,
+    },
     session::sealed::Sealed,
 };
 
@@ -1144,4 +1148,290 @@ async fn future_last_active_clears_session() {
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     assert!(loaded.session.is_none());
     assert!(e.session_store().delete_called());
+}
+
+// ── Metrics test infrastructure ───────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MetricCall {
+    LoginStart {
+        result: &'static str,
+    },
+    LoginComplete {
+        result: &'static str,
+        as_error: Option<String>,
+    },
+    Refresh {
+        result: &'static str,
+    },
+    Activity {
+        outcome: &'static str,
+    },
+}
+
+#[derive(Default)]
+struct TestEngineMetrics {
+    calls: Mutex<Vec<MetricCall>>,
+}
+
+impl TestEngineMetrics {
+    fn calls(&self) -> Vec<MetricCall> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl LoginEngineMetrics for TestEngineMetrics {
+    fn record_login_start(&self, r: &LoginStartResult) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(MetricCall::LoginStart { result: r.as_str() });
+    }
+    fn record_login_complete(&self, r: &LoginCompleteResult, as_error: Option<&str>) {
+        self.calls.lock().unwrap().push(MetricCall::LoginComplete {
+            result: r.as_str(),
+            as_error: as_error.map(str::to_owned),
+        });
+    }
+    fn record_refresh(&self, r: &RefreshResult) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(MetricCall::Refresh { result: r.as_str() });
+    }
+    fn record_activity(&self, o: &ActivityOutcome) {
+        self.calls.lock().unwrap().push(MetricCall::Activity {
+            outcome: o.as_str(),
+        });
+    }
+}
+
+async fn engine_with_metrics(
+    store: MockSessionStore,
+) -> (
+    LoginEngine<MockGrant, MockSessionStore, MockHttpClient>,
+    Arc<TestEngineMetrics>,
+) {
+    let m = Arc::new(TestEngineMetrics::default());
+    let e = LoginEngine::builder()
+        .config(default_config())
+        .grant(MockGrant {
+            authorization_url: "https://auth.example.com/authorize",
+        })
+        .session_store(store)
+        .cipher(test_cipher().await)
+        .http_client(MockHttpClient)
+        .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
+        .build();
+    (e, m)
+}
+
+struct FailStartGrant;
+
+impl LoginGrant for FailStartGrant {
+    async fn start(&self, _: &impl HttpClient, _: Vec<String>) -> Result<StartOutput, BoxedError> {
+        Err(BoxedError::from_err("\0".parse::<http::Uri>().unwrap_err()))
+    }
+    async fn complete(
+        &self,
+        _: &impl HttpClient,
+        _: &PendingState,
+        _: String,
+        _: String,
+        _: Option<String>,
+    ) -> Result<CompletedLogin, BoxedError> {
+        unimplemented!()
+    }
+    async fn refresh(
+        &self,
+        _: &impl HttpClient,
+        _: &RefreshToken,
+    ) -> Result<TokenResponse, BoxedError> {
+        unimplemented!()
+    }
+}
+
+// ── Login start metrics ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn metrics_login_start_ok_on_nav_redirect() {
+    let (e, m) = engine_with_metrics(MockSessionStore::empty()).await;
+    e.redirect_to_login(&nav_headers(), &"/protected".parse().unwrap())
+        .await;
+    assert_eq!(m.calls(), vec![MetricCall::LoginStart { result: "ok" }]);
+}
+
+#[tokio::test]
+async fn metrics_no_login_start_on_api_401() {
+    // XHR/API 401s don't redirect to the AS — no login start is recorded.
+    let (e, m) = engine_with_metrics(MockSessionStore::empty()).await;
+    e.redirect_to_login(&api_headers(), &"/api".parse().unwrap())
+        .await;
+    assert!(m.calls().is_empty());
+}
+
+#[tokio::test]
+async fn metrics_login_start_error_when_grant_start_fails() {
+    let m = Arc::new(TestEngineMetrics::default());
+    let e = LoginEngine::builder()
+        .config(default_config())
+        .grant(FailStartGrant)
+        .session_store(MockSessionStore::empty())
+        .cipher(test_cipher().await)
+        .http_client(MockHttpClient)
+        .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
+        .build();
+    e.redirect_to_login(&nav_headers(), &"/protected".parse().unwrap())
+        .await;
+    assert_eq!(m.calls(), vec![MetricCall::LoginStart { result: "error" }]);
+}
+
+// ── Login complete metrics ────────────────────────────────────────────────
+//
+// Three outcomes cannot be tested here because constructing a successful
+// `CompletedLogin` or `TokenResponse` requires huskarl-internal APIs:
+//   - `LoginCompleteResult::Ok` (requires successful token exchange)
+//   - `LoginCompleteResult::SessionCreateFailed` (same prerequisite)
+//   - `RefreshResult::Ok` (requires a successful `TokenResponse`)
+
+#[tokio::test]
+async fn metrics_callback_invalid_request_on_missing_params() {
+    let (e, m) = engine_with_metrics(MockSessionStore::empty()).await;
+    let uri = "/callback".parse().unwrap();
+    e.try_handle_login_route("/callback", &Method::GET, &HeaderMap::new(), &uri)
+        .await;
+    assert_eq!(
+        m.calls(),
+        vec![MetricCall::LoginComplete {
+            result: "invalid_request",
+            as_error: None
+        }]
+    );
+}
+
+#[tokio::test]
+async fn metrics_callback_as_denied_carries_error_code() {
+    let (e, m) = engine_with_metrics(MockSessionStore::empty()).await;
+    let uri = "/callback?error=access_denied".parse().unwrap();
+    e.try_handle_login_route("/callback", &Method::GET, &HeaderMap::new(), &uri)
+        .await;
+    assert_eq!(
+        m.calls(),
+        vec![MetricCall::LoginComplete {
+            result: "as_denied",
+            as_error: Some("access_denied".to_owned()),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn metrics_callback_invalid_request_on_missing_state_cookie() {
+    let (e, m) = engine_with_metrics(MockSessionStore::empty()).await;
+    let uri = "/callback?code=authcode&state=mystate".parse().unwrap();
+    e.try_handle_login_route("/callback", &Method::GET, &HeaderMap::new(), &uri)
+        .await;
+    assert_eq!(
+        m.calls(),
+        vec![MetricCall::LoginComplete {
+            result: "invalid_request",
+            as_error: None
+        }]
+    );
+}
+
+#[tokio::test]
+async fn metrics_callback_state_invalid_on_tampered_bundle() {
+    let (e, m) = engine_with_metrics(MockSessionStore::empty()).await;
+    let state = "teststate";
+    let fake = URL_SAFE_NO_PAD.encode(b"not an AEAD bundle");
+    let h = headers_with_login_cookie(state, &fake);
+    let uri = format!("/callback?code=authcode&state={state}")
+        .parse()
+        .unwrap();
+    e.try_handle_login_route("/callback", &Method::GET, &h, &uri)
+        .await;
+    assert_eq!(
+        m.calls(),
+        vec![MetricCall::LoginComplete {
+            result: "state_invalid",
+            as_error: None
+        }]
+    );
+}
+
+#[tokio::test]
+async fn metrics_callback_token_exchange_failed_when_grant_complete_fails() {
+    // MockGrant.complete() always fails — verify token_exchange_failed is recorded.
+    let (e, m) = engine_with_metrics(MockSessionStore::empty()).await;
+    let state = "valid_state";
+    let sealed = seal_login_cookie(state, "https://app.example.com/").await;
+    let h = headers_with_login_cookie(state, &sealed);
+    let uri = format!("/callback?code=authcode&state={state}")
+        .parse()
+        .unwrap();
+    e.try_handle_login_route("/callback", &Method::GET, &h, &uri)
+        .await;
+    assert_eq!(
+        m.calls(),
+        vec![MetricCall::LoginComplete {
+            result: "token_exchange_failed",
+            as_error: None
+        }]
+    );
+}
+
+// ── Refresh metrics ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn metrics_refresh_no_refresh_token_when_none_available() {
+    let session = session_with(
+        SystemTime::now() - Duration::from_mins(1),
+        None,
+        SystemTime::now(),
+        SystemTime::now(),
+    );
+    let (e, m) = engine_with_metrics(MockSessionStore::with_session(session)).await;
+    e.load_session(&HeaderMap::new()).await.unwrap();
+    assert_eq!(
+        m.calls(),
+        vec![MetricCall::Refresh {
+            result: "no_refresh_token"
+        }]
+    );
+}
+
+#[tokio::test]
+async fn metrics_refresh_failed_when_grant_refresh_fails() {
+    use huskarl::core::secrets::SecretString;
+    let session = session_with(
+        SystemTime::now() - Duration::from_mins(1),
+        Some(RefreshToken::new(SecretString::new("test_refresh"), None)),
+        SystemTime::now(),
+        SystemTime::now(),
+    );
+    let (e, m) = engine_with_metrics(MockSessionStore::with_session(session)).await;
+    e.load_session(&HeaderMap::new()).await.unwrap();
+    assert_eq!(m.calls(), vec![MetricCall::Refresh { result: "failed" }]);
+}
+
+// ── Activity metrics ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn metrics_activity_skip_when_recently_active() {
+    let (e, m) = engine_with_metrics(MockSessionStore::with_session(valid_session())).await;
+    e.load_session(&HeaderMap::new()).await.unwrap();
+    assert_eq!(m.calls(), vec![MetricCall::Activity { outcome: "skip" }]);
+}
+
+#[tokio::test]
+async fn metrics_activity_touch_when_interval_elapsed() {
+    let session = session_with(
+        SystemTime::now() + Duration::from_hours(1),
+        None,
+        SystemTime::now() - Duration::from_hours(2),
+        SystemTime::now() - Duration::from_hours(2),
+    );
+    let (e, m) = engine_with_metrics(MockSessionStore::with_session(session)).await;
+    e.load_session(&HeaderMap::new()).await.unwrap();
+    assert_eq!(m.calls(), vec![MetricCall::Activity { outcome: "touch" }]);
 }

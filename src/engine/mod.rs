@@ -17,7 +17,7 @@
 //! middleware appropriate for the framework's routing model.
 
 use std::{
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
     time::{Duration, SystemTime},
 };
 
@@ -37,6 +37,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     DefaultErrorPage, ErrorPage, LoginConfig, LoginGrant, Session, SessionDriver, SessionError,
+    metrics::{
+        ActivityOutcome, LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult,
+    },
 };
 
 mod callback;
@@ -170,6 +173,7 @@ pub struct LoginEngine<G, SD, H> {
     unsealer: AeadV1Unsealer<BoxedAeadCipher>,
     http_client: H,
     error_page: Box<dyn ErrorPage>,
+    metrics: Option<Arc<dyn LoginEngineMetrics>>,
 }
 
 // ── Constructor ───────────────────────────────────────────────────────────────
@@ -196,6 +200,8 @@ where
         /// Custom error page renderer. Defaults to [`DefaultErrorPage`].
         #[builder(default = Box::new(DefaultErrorPage) as Box<dyn ErrorPage>)]
         error_page: Box<dyn ErrorPage>,
+        /// Optional metrics observer for login-flow events.
+        metrics: Option<Arc<dyn LoginEngineMetrics>>,
     ) -> Self {
         Self {
             config,
@@ -205,6 +211,7 @@ where
             unsealer: AeadV1Unsealer::new(cipher),
             http_client,
             error_page,
+            metrics,
         }
     }
 }
@@ -314,12 +321,16 @@ where
             return self.build_error_response(StatusCode::UNAUTHORIZED, "authentication required");
         }
         match self.redirect_to_as(headers, uri, None).await {
-            Ok(resp) => resp,
+            Ok(resp) => {
+                self.record_login_start(&LoginStartResult::Ok);
+                resp
+            }
             Err(e) => {
                 log::error!(
                     "failed to redirect to authorization server: {}",
                     error_chain(&*e)
                 );
+                self.record_login_start(&LoginStartResult::Error);
                 self.build_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "failed to start login",
@@ -359,6 +370,7 @@ where
     ) -> LoadedSession<SD::SessionType> {
         let Some(rt) = session.refresh_token().cloned() else {
             let clear_cookies = self.delete_best_effort(&session, headers).await;
+            self.record_refresh(&RefreshResult::NoRefreshToken);
             return LoadedSession {
                 session: None,
                 clear_cookies,
@@ -367,6 +379,7 @@ where
         match self.refresh_with_retry(&rt).await {
             Ok(token_response) => {
                 session.apply_refresh(&token_response, self.config.default_token_lifetime);
+                self.record_refresh(&RefreshResult::Ok);
                 LoadedSession {
                     session: Some((session, SessionPersistence::Save)),
                     clear_cookies: vec![],
@@ -375,6 +388,7 @@ where
             Err(e) => {
                 log::error!("token refresh failed: {}", error_chain(&e));
                 let clear_cookies = self.delete_best_effort(&session, headers).await;
+                self.record_refresh(&RefreshResult::Failed);
                 LoadedSession {
                     session: None,
                     clear_cookies,
@@ -432,9 +446,35 @@ where
     fn touch_or_skip(&self, session: &mut SD::SessionType, now: SystemTime) -> SessionPersistence {
         if elapsed_since(session.last_active(), now) >= self.config.touch_min_interval {
             session.record_activity();
+            self.record_activity(&ActivityOutcome::Touch);
             SessionPersistence::Touch
         } else {
+            self.record_activity(&ActivityOutcome::Skip);
             SessionPersistence::Skip
+        }
+    }
+
+    fn record_login_start(&self, result: &LoginStartResult) {
+        if let Some(m) = &self.metrics {
+            m.record_login_start(result);
+        }
+    }
+
+    fn record_login_complete(&self, result: &LoginCompleteResult, as_error: Option<&str>) {
+        if let Some(m) = &self.metrics {
+            m.record_login_complete(result, as_error);
+        }
+    }
+
+    fn record_refresh(&self, result: &RefreshResult) {
+        if let Some(m) = &self.metrics {
+            m.record_refresh(result);
+        }
+    }
+
+    fn record_activity(&self, outcome: &ActivityOutcome) {
+        if let Some(m) = &self.metrics {
+            m.record_activity(outcome);
         }
     }
 

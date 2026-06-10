@@ -17,6 +17,7 @@
 
 pub mod cookie;
 pub mod engine;
+pub mod metrics;
 pub mod session;
 pub mod url;
 
@@ -32,6 +33,10 @@ pub use cookie_session::{CookieData, CookieSession, CookieSessionStore};
 pub use engine::{DefaultPersistFailurePolicy, PersistFailurePolicy};
 pub use error_page::{DefaultErrorPage, ErrorPage, ErrorPageResponse};
 pub use grant::{CompletedLogin, LoginGrant};
+pub use metrics::{
+    ActivityOutcome, DecryptResult, LoginCompleteResult, LoginEngineMetrics, LoginStartResult,
+    RefreshResult, SessionCookieMetrics,
+};
 pub use session::{SessionDriver, SessionError};
 pub use session_state::{Session, SessionState};
 pub use store_session::{

@@ -13,6 +13,7 @@ use crate::{
     cookie::{
         cookie_attrs, decode_payload, get_cookie, is_valid_oauth_state, login_state_cookie_name,
     },
+    metrics::LoginCompleteResult,
 };
 
 impl<G, SD, H> LoginEngine<G, SD, H>
@@ -29,6 +30,7 @@ where
                     Some(desc) => format!("authorization denied: {desc}"),
                     None => format!("authorization denied ({error})"),
                 };
+                self.record_login_complete(&LoginCompleteResult::AsDenied, Some(&error));
                 return self
                     .build_error_response_with_delete(
                         StatusCode::FORBIDDEN,
@@ -39,6 +41,7 @@ where
                     .await;
             }
             CallbackParse::Missing => {
+                self.record_login_complete(&LoginCompleteResult::InvalidRequest, None);
                 return self
                     .build_error_response_with_delete(
                         StatusCode::BAD_REQUEST,
@@ -60,6 +63,7 @@ where
         let Some(cookie_encoded) = get_cookie(headers, &cookie_name).map(str::to_owned) else {
             // No cookie to clear — either none was set, or the browser sent a
             // cookie under a different `state` name (which we can't address).
+            self.record_login_complete(&LoginCompleteResult::InvalidRequest, None);
             return self
                 .build_error_response_with_delete(
                     StatusCode::BAD_REQUEST,
@@ -75,6 +79,7 @@ where
         let login_state = match self.decode_login_state(&cookie_encoded, &state).await {
             Ok(s) => s,
             Err((status, msg)) => {
+                self.record_login_complete(&LoginCompleteResult::StateInvalid, None);
                 return self
                     .callback_error(status, msg, headers, &cookie_name)
                     .await;
@@ -95,6 +100,7 @@ where
             Ok(cl) => cl,
             Err(e) => {
                 log::error!("token exchange failed: {}", error_chain(&e));
+                self.record_login_complete(&LoginCompleteResult::TokenExchangeFailed, None);
                 return self
                     .callback_error(
                         StatusCode::BAD_GATEWAY,
@@ -114,6 +120,7 @@ where
             Ok(c) => c,
             Err(e) => {
                 log::error!("failed to create session: {}", error_chain(&*e));
+                self.record_login_complete(&LoginCompleteResult::SessionCreateFailed, None);
                 return self
                     .callback_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -125,6 +132,7 @@ where
             }
         };
 
+        self.record_login_complete(&LoginCompleteResult::Ok, None);
         self.build_callback_redirect(&login_state.original_url, &cookie_name, session_cookies)
     }
 

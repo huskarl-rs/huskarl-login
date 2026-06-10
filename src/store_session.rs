@@ -6,7 +6,7 @@
 //! creation and returns its own `Session` type, which may enrich the persisted
 //! state with domain-specific fields.
 
-use std::time::Duration;
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
@@ -22,6 +22,7 @@ use crate::{
         DEFAULT_COOKIE_MAX_AGE, cookie_attrs, encode_kid, get_cookie, get_kid_cookie,
         kid_cookie_name,
     },
+    metrics::{DecryptResult, SessionCookieMetrics},
     session::{SessionDriver, SessionError, to_session_err},
     session_state::{Session, SessionState},
 };
@@ -177,6 +178,7 @@ pub struct StoreBackedSessionStore<E> {
     secure: bool,
     cookie_path: String,
     max_age: Duration,
+    metrics: Option<Arc<dyn SessionCookieMetrics>>,
 }
 
 #[bon::bon]
@@ -194,6 +196,8 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         /// no longer be valid.
         #[builder(default = DEFAULT_COOKIE_MAX_AGE)]
         max_age: Duration,
+        /// Optional metrics observer for encrypt/decrypt events.
+        metrics: Option<Arc<dyn SessionCookieMetrics>>,
     ) -> Self {
         Self {
             external,
@@ -203,7 +207,18 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             secure,
             cookie_path,
             max_age,
+            metrics,
         }
+    }
+
+    /// Returns the active sealer's key ID, if the key has an identity.
+    ///
+    /// Delegates to [`AeadEncryptor::key_id`]. Once reload support is added to
+    /// `AeadCipher`, this will reflect the key that will be used for the
+    /// **next** seal operation — suitable for updating an active-key gauge from
+    /// a reload callback.
+    pub fn key_id(&self) -> Option<Cow<'_, str>> {
+        self.sealer.key_id()
     }
 
     fn base_cookie_attrs(&self) -> String {
@@ -243,6 +258,9 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         // the same sealer that just sealed the bundle: stable for single-key
         // ciphers; if multi-key sealers land, switch to `AeadCipherSelector`.
         let kid = self.sealer.key_id();
+        if let Some(m) = &self.metrics {
+            m.record_encrypt(&self.cookie_name, kid.as_deref());
+        }
         let cookie_value = URL_SAFE_NO_PAD.encode(&bundle);
         let attrs = self.cookie_attrs();
         let pointer =
@@ -266,19 +284,39 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     /// Read and decrypt the pointer cookie to get the session key.
     async fn read_pointer_cookie(&self, headers: &http::HeaderMap) -> Option<Uuid> {
         let encoded = get_cookie(headers, &self.cookie_name)?;
-        let bundle = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+
+        // A pointer-cookie-shaped value is present — record the outcome.
         let kid = get_kid_cookie(headers, &self.cookie_name);
+
+        let Ok(bundle) = URL_SAFE_NO_PAD.decode(encoded) else {
+            self.record_decrypt(kid.as_deref(), &DecryptResult::BadEncoding);
+            return None;
+        };
         let cipher_match = kid
             .as_deref()
             .map(|k| CipherMatch::builder().kid(k).build());
-        let plaintext = self
+        let Ok(plaintext) = self
             .unsealer
             .unseal(cipher_match.as_ref(), &bundle, b"session_ptr")
             .await
-            .ok()?;
+        else {
+            self.record_decrypt(kid.as_deref(), &DecryptResult::DecryptFailed);
+            return None;
+        };
         // Must be exactly 16 bytes (UUID); anything else is a corrupted cookie.
-        let bytes: [u8; 16] = plaintext.try_into().ok()?;
-        Some(Uuid::from_bytes(bytes))
+        if let Ok(bytes) = <[u8; 16]>::try_from(plaintext) {
+            self.record_decrypt(kid.as_deref(), &DecryptResult::Ok);
+            Some(Uuid::from_bytes(bytes))
+        } else {
+            self.record_decrypt(kid.as_deref(), &DecryptResult::PayloadInvalid);
+            None
+        }
+    }
+
+    fn record_decrypt(&self, kid: Option<&str>, result: &DecryptResult) {
+        if let Some(m) = &self.metrics {
+            m.record_decrypt(&self.cookie_name, kid, result);
+        }
     }
 }
 
@@ -634,5 +672,202 @@ mod tests {
         });
         assert!(bare, "expected pointer cookie clear");
         assert!(kid, "expected kid sidecar clear");
+    }
+
+    // ── SessionCookieMetrics ──────────────────────────────────────────────
+
+    use std::sync::{Arc, Mutex};
+
+    use crate::metrics::{DecryptResult, SessionCookieMetrics};
+
+    #[derive(Default)]
+    struct RecordingMetrics {
+        encrypts: Mutex<Vec<Option<String>>>,
+        decrypts: Mutex<Vec<(Option<String>, &'static str)>>,
+    }
+
+    impl SessionCookieMetrics for RecordingMetrics {
+        fn record_decrypt(&self, _: &str, kid: Option<&str>, result: &DecryptResult) {
+            self.decrypts
+                .lock()
+                .unwrap()
+                .push((kid.map(str::to_owned), result.as_str()));
+        }
+        fn record_encrypt(&self, _: &str, kid: Option<&str>) {
+            self.encrypts.lock().unwrap().push(kid.map(str::to_owned));
+        }
+    }
+
+    impl RecordingMetrics {
+        fn encrypts(&self) -> Vec<Option<String>> {
+            self.encrypts.lock().unwrap().clone()
+        }
+        fn decrypts(&self) -> Vec<(Option<String>, &'static str)> {
+            self.decrypts.lock().unwrap().clone()
+        }
+    }
+
+    fn test_session_and_store() -> (MinimalSession, MinimalExternalStore) {
+        let s = test_session();
+        (s.clone(), MinimalExternalStore(s))
+    }
+
+    #[tokio::test]
+    async fn metrics_pointer_cookie_records_encrypt() {
+        let (session, external) = test_session_and_store();
+        let m = Arc::new(RecordingMetrics::default());
+        let store = StoreBackedSessionStore::builder()
+            .external(external)
+            .cipher(test_cipher().await)
+            .cookie_name("session")
+            .secure(true)
+            .cookie_path("/")
+            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
+            .build();
+        store
+            .pointer_cookie_headers(session.persisted.session_key)
+            .await
+            .unwrap();
+        assert_eq!(m.encrypts(), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn metrics_pointer_cookie_records_kid_when_cipher_has_identity() {
+        let (session, external) = test_session_and_store();
+        let m = Arc::new(RecordingMetrics::default());
+        let store = StoreBackedSessionStore::builder()
+            .external(external)
+            .cipher(test_cipher_with_kid("v5").await)
+            .cookie_name("session")
+            .secure(true)
+            .cookie_path("/")
+            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
+            .build();
+        store
+            .pointer_cookie_headers(session.persisted.session_key)
+            .await
+            .unwrap();
+        assert_eq!(m.encrypts(), vec![Some("v5".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn metrics_read_pointer_cookie_absent_is_silent() {
+        let (_, external) = test_session_and_store();
+        let m = Arc::new(RecordingMetrics::default());
+        let store = StoreBackedSessionStore::builder()
+            .external(external)
+            .cipher(test_cipher().await)
+            .cookie_name("session")
+            .secure(true)
+            .cookie_path("/")
+            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
+            .build();
+        store.read_pointer_cookie(&http::HeaderMap::new()).await;
+        assert!(m.decrypts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn metrics_read_pointer_cookie_bad_encoding() {
+        let (_, external) = test_session_and_store();
+        let m = Arc::new(RecordingMetrics::default());
+        let store = StoreBackedSessionStore::builder()
+            .external(external)
+            .cipher(test_cipher().await)
+            .cookie_name("session")
+            .secure(true)
+            .cookie_path("/")
+            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
+            .build();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            "session=not!!valid!!base64".parse().unwrap(),
+        );
+        store.read_pointer_cookie(&headers).await;
+        assert_eq!(m.decrypts(), vec![(None, "bad_encoding")]);
+    }
+
+    #[tokio::test]
+    async fn metrics_read_pointer_cookie_tampered_records_decrypt_failed() {
+        let (_, external) = test_session_and_store();
+        let m = Arc::new(RecordingMetrics::default());
+        let store = StoreBackedSessionStore::builder()
+            .external(external)
+            .cipher(test_cipher().await)
+            .cookie_name("session")
+            .secure(true)
+            .cookie_path("/")
+            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
+            .build();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            "session=AAAAAAAAAAAA".parse().unwrap(),
+        );
+        store.read_pointer_cookie(&headers).await;
+        assert_eq!(m.decrypts(), vec![(None, "decrypt_failed")]);
+    }
+
+    #[tokio::test]
+    async fn metrics_read_pointer_cookie_payload_invalid_when_not_16_bytes() {
+        let (_, external) = test_session_and_store();
+        let m = Arc::new(RecordingMetrics::default());
+        let store = StoreBackedSessionStore::builder()
+            .external(external)
+            .cipher(test_cipher().await)
+            .cookie_name("session")
+            .secure(true)
+            .cookie_path("/")
+            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
+            .build();
+        // Seal 17 bytes under session_ptr AAD — AEAD passes but the UUID
+        // conversion ([u8; 16]) fails, exercising PayloadInvalid.
+        let bundle = AeadV1Sealer::new(test_cipher().await)
+            .seal(&[0u8; 17], b"session_ptr")
+            .await
+            .unwrap();
+        let encoded = URL_SAFE_NO_PAD.encode(&bundle);
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            format!("session={encoded}").parse().unwrap(),
+        );
+        store.read_pointer_cookie(&headers).await;
+        assert_eq!(m.decrypts(), vec![(None, "payload_invalid")]);
+    }
+
+    #[tokio::test]
+    async fn metrics_read_pointer_cookie_success_records_ok_with_kid() {
+        let (session, external) = test_session_and_store();
+        let m = Arc::new(RecordingMetrics::default());
+        let store = StoreBackedSessionStore::builder()
+            .external(external)
+            .cipher(test_cipher_with_kid("v5").await)
+            .cookie_name("session")
+            .secure(true)
+            .cookie_path("/")
+            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
+            .build();
+        let headers_out = store
+            .pointer_cookie_headers(session.persisted.session_key)
+            .await
+            .unwrap();
+        // Simulate the browser sending back both the pointer cookie and the kid sidecar.
+        let pairs: String = headers_out
+            .iter()
+            .filter_map(|h| {
+                let s = h.to_str().ok()?;
+                let pair = s.split(';').next()?;
+                let (_, v) = pair.split_once('=')?;
+                (!v.is_empty()).then(|| pair.to_owned())
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut req = http::HeaderMap::new();
+        if !pairs.is_empty() {
+            req.insert(http::header::COOKIE, pairs.parse().unwrap());
+        }
+        store.read_pointer_cookie(&req).await;
+        assert_eq!(m.decrypts(), vec![(Some("v5".to_owned()), "ok")]);
     }
 }
