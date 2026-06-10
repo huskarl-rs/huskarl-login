@@ -1406,6 +1406,26 @@ async fn metrics_callback_as_denied_carries_error_code() {
 }
 
 #[tokio::test]
+async fn metrics_callback_as_denied_normalizes_unknown_error_code() {
+    // The `error` parameter is attacker-suppliable; anything outside the
+    // registered RFC 6749 / OIDC codes must reach the metrics sink as
+    // "other" so it can't blow up label cardinality.
+    let (e, m) = engine_with_metrics(MockSessionStore::empty()).await;
+    let uri = "/callback?error=attacker_chosen_garbage_12345"
+        .parse()
+        .unwrap();
+    e.try_handle_login_route("/callback", &Method::GET, &HeaderMap::new(), &uri)
+        .await;
+    assert_eq!(
+        m.calls(),
+        vec![MetricCall::LoginComplete {
+            result: "as_denied",
+            as_error: Some("other".to_owned()),
+        }]
+    );
+}
+
+#[tokio::test]
 async fn metrics_callback_invalid_request_on_missing_state_cookie() {
     let (e, m) = engine_with_metrics(MockSessionStore::empty()).await;
     let uri = "/callback?code=authcode&state=mystate".parse().unwrap();

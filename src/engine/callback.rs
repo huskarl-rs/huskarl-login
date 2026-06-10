@@ -13,7 +13,7 @@ use crate::{
     cookie::{
         cookie_attrs, decode_payload, get_cookie, is_valid_oauth_state, login_state_cookie_name,
     },
-    metrics::LoginCompleteResult,
+    metrics::{LoginCompleteResult, normalize_as_error},
 };
 
 impl<G, SD, H> LoginEngine<G, SD, H>
@@ -26,18 +26,8 @@ where
         let (code, state, iss) = match parse_callback_params(uri.query().unwrap_or("")) {
             CallbackParse::Valid { code, state, iss } => (code, state, iss),
             CallbackParse::AuthServerError { error, description } => {
-                let message = match description {
-                    Some(desc) => format!("authorization denied: {desc}"),
-                    None => format!("authorization denied ({error})"),
-                };
-                self.record_login_complete(&LoginCompleteResult::AsDenied, Some(&error));
                 return self
-                    .build_error_response_with_delete(
-                        StatusCode::FORBIDDEN,
-                        &message,
-                        headers,
-                        None,
-                    )
+                    .handle_as_error(&error, description.as_deref(), headers)
                     .await;
             }
             CallbackParse::Missing => {
@@ -134,6 +124,29 @@ where
 
         self.record_login_complete(&LoginCompleteResult::Ok, None);
         self.build_callback_redirect(&login_state.original_url, &cookie_name, session_cookies)
+    }
+
+    /// Handles an RFC 6749 §4.1.2.1 error response from the authorization
+    /// server: records the metric (with the error code normalized to a closed
+    /// set — the parameter is attacker-suppliable) and renders a 403. The
+    /// raw `description` reaches the error page, which is responsible for
+    /// escaping it.
+    async fn handle_as_error(
+        &self,
+        error: &str,
+        description: Option<&str>,
+        headers: &HeaderMap,
+    ) -> LoginResponse {
+        let message = match description {
+            Some(desc) => format!("authorization denied: {desc}"),
+            None => format!("authorization denied ({error})"),
+        };
+        self.record_login_complete(
+            &LoginCompleteResult::AsDenied,
+            Some(normalize_as_error(error)),
+        );
+        self.build_error_response_with_delete(StatusCode::FORBIDDEN, &message, headers, None)
+            .await
     }
 
     /// Assembles the 302 response that sends the user back to their original

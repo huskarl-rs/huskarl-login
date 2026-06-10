@@ -35,7 +35,7 @@ pub use error_page::{DefaultErrorPage, ErrorPage, ErrorPageResponse};
 pub use grant::{CompletedLogin, LoginGrant};
 pub use metrics::{
     ActivityOutcome, DecryptResult, LoginCompleteResult, LoginEngineMetrics, LoginStartResult,
-    RefreshResult, SessionCookieMetrics,
+    RefreshResult, SessionCookieMetrics, normalize_as_error,
 };
 pub use session::{SessionDriver, SessionError};
 pub use session_state::{Session, SessionState};

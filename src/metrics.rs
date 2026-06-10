@@ -126,6 +126,46 @@ impl LoginCompleteResult {
     }
 }
 
+/// OAuth 2.0 / OIDC authorization error codes recognized by
+/// [`normalize_as_error`]: RFC 6749 §4.1.2.1 plus the OIDC Core §3.1.2.6
+/// additions.
+const KNOWN_AS_ERROR_CODES: &[&str] = &[
+    // RFC 6749 §4.1.2.1
+    "invalid_request",
+    "unauthorized_client",
+    "access_denied",
+    "unsupported_response_type",
+    "invalid_scope",
+    "server_error",
+    "temporarily_unavailable",
+    // OIDC Core §3.1.2.6
+    "interaction_required",
+    "login_required",
+    "account_selection_required",
+    "consent_required",
+    "invalid_request_uri",
+    "invalid_request_object",
+    "request_not_supported",
+    "request_uri_not_supported",
+    "registration_not_supported",
+];
+
+/// Normalizes an authorization server `error` code to a closed set of values.
+///
+/// The callback's `error` query parameter is attacker-suppliable — anyone can
+/// request `/callback?error=<arbitrary bytes>` — so it must not flow into a
+/// metrics label unbounded (label-cardinality explosion). Known RFC 6749 /
+/// OIDC Core error codes are returned as their `&'static str` equivalent;
+/// anything else maps to `"other"`.
+#[must_use]
+pub fn normalize_as_error(error: &str) -> &'static str {
+    KNOWN_AS_ERROR_CODES
+        .iter()
+        .find(|code| **code == error)
+        .copied()
+        .unwrap_or("other")
+}
+
 /// Outcome of a token refresh attempt.
 ///
 /// Passed to [`LoginEngineMetrics::record_refresh`].
@@ -191,6 +231,11 @@ pub trait LoginEngineMetrics: Send + Sync + 'static {
     /// when `result` is [`LoginCompleteResult::AsDenied`], and is `None`
     /// for all other outcomes. Useful for distinguishing user-initiated
     /// denials from AS-side errors.
+    ///
+    /// The value is normalized via [`normalize_as_error`] before reaching
+    /// this method: it is always one of the known RFC 6749 / OIDC Core error
+    /// codes or the literal `"other"`, never raw attacker-suppliable input —
+    /// safe to use directly as a metrics label.
     fn record_login_complete(&self, result: &LoginCompleteResult, as_error: Option<&str>);
 
     /// Record the outcome of a token refresh attempt.
@@ -205,4 +250,36 @@ pub trait LoginEngineMetrics: Send + Sync + 'static {
     /// [`Touch`](ActivityOutcome::Touch) to [`Skip`](ActivityOutcome::Skip)
     /// outcomes reflects the effective touch rate.
     fn record_activity(&self, outcome: &ActivityOutcome);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_as_error_passes_known_codes_through() {
+        for code in KNOWN_AS_ERROR_CODES {
+            assert_eq!(normalize_as_error(code), *code);
+        }
+    }
+
+    #[test]
+    fn normalize_as_error_maps_unknown_to_other() {
+        for input in [
+            "",
+            "not_a_real_code",
+            "ACCESS_DENIED", // case-sensitive: not the registered code
+            "access_denied ",
+            "access_denied\n",
+            "a]b{c}", // label-syntax metacharacters
+        ] {
+            assert_eq!(normalize_as_error(input), "other", "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_as_error_rejects_oversized_input() {
+        let long = "a".repeat(64 * 1024);
+        assert_eq!(normalize_as_error(&long), "other");
+    }
 }
