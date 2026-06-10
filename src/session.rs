@@ -66,11 +66,12 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
 
     /// Create a new session from a completed login.
     ///
-    /// Persists the session via this driver's backing store (cookie or
-    /// external) and returns both the session and the `Set-Cookie` header
-    /// values the framework should attach to the callback response (the
-    /// session cookies for cookie-backed stores, the pointer cookie for
-    /// store-backed sessions).
+    /// The driver's attached [`SessionEnricher`](crate::SessionEnricher)
+    /// builds the session from the framework-prepared seed, then the driver
+    /// persists it via its backing store (cookie or external) and returns
+    /// both the session and the `Set-Cookie` header values the framework
+    /// should attach to the callback response (the session cookies for
+    /// cookie-backed stores, the pointer cookie for store-backed sessions).
     ///
     /// `default_lifetime` is the assumed access-token lifetime when the
     /// authorization server's token response omits `expires_in`.

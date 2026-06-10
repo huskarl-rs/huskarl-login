@@ -26,8 +26,6 @@ serde_html_form = "0.4"
 serde_json = { version = "1", default-features = false }
 uuid = { version = "1", features = ["v7", "serde"] }
 
-### Dependencies for browser WASM (wasm32-unknown-unknown): uuid needs a JS
-### randomness source there. Mirrors huskarl-core's getrandom configuration.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 uuid = { version = "1", features = ["v7", "serde", "js"] }
 

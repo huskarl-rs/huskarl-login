@@ -2,9 +2,10 @@
 //!
 //! [`StoreBackedSessionStore`] keeps an encrypted pointer cookie in the browser
 //! and delegates actual session data to an [`ExternalSessionStore`] (Redis, a
-//! database, etc.). The external store receives [`PersistedSessionState`] on
-//! creation and returns its own `Session` type, which may enrich the persisted
-//! state with domain-specific fields.
+//! database, etc.). After a login, the attached
+//! [`SessionEnricher`](crate::SessionEnricher) builds the store's `Session`
+//! type from the framework-prepared [`PersistedSessionState`] seed; the
+//! external store then persists it.
 
 use std::{borrow::Cow, sync::Arc, time::Duration};
 
@@ -24,6 +25,7 @@ use crate::{
         DEFAULT_COOKIE_MAX_AGE, cookie_attrs, encode_kid, get_cookie, get_kid_cookie,
         kid_cookie_name, unseal_with_kid_fallback,
     },
+    enrich::{NoEnrichment, SessionEnricher},
     metrics::{DecryptResult, SessionCookieMetrics},
     session::{SessionDriver, SessionError, to_session_err},
     session_state::{Session, SessionState},
@@ -31,15 +33,18 @@ use crate::{
 
 /// Trait for external session data stores (Redis, database, etc.).
 ///
-/// This is the only trait users need to implement to use store-backed sessions.
-/// The cookie mechanics (pointer cookie encryption, session key generation) are
-/// handled by [`StoreBackedSessionStore`].
+/// This trait is **pure storage**: insert, load, save, touch, delete. The
+/// cookie mechanics (pointer cookie encryption, session key generation) are
+/// handled by [`StoreBackedSessionStore`], and session *construction* from a
+/// completed login is handled by the
+/// [`SessionEnricher`](crate::SessionEnricher) attached to the store — the
+/// same hook cookie sessions use.
 ///
 /// The associated [`Session`](Self::SessionType) type is what the middleware works
 /// with after login. For the simplest case, use [`PersistedSessionState`]
 /// directly. For enriched sessions (e.g. with user profile data), define a
 /// custom type that implements [`Session`] and [`PersistedSession`], embedding
-/// a `PersistedSessionState`.
+/// a `PersistedSessionState`, and build it with a `SessionEnricher`.
 pub trait ExternalSessionStore: MaybeSendSync {
     /// The session type returned by this store.
     ///
@@ -52,20 +57,17 @@ pub trait ExternalSessionStore: MaybeSendSync {
     /// The error type returned by store operations.
     type Error: std::error::Error + MaybeSendSync + 'static;
 
-    /// Create a new session from framework-prepared state.
+    /// Persist a newly created session.
     ///
-    /// Called after a successful OAuth callback. The store should persist the
-    /// session and return its (possibly enriched) session type.
-    ///
-    /// `completed` is provided so the store can read ID token claims (e.g.
-    /// `email`, `name`, non-standard `extra` fields) when denormalizing into
-    /// a user record. Standard `sub`/`sid` are already extracted into
-    /// `persisted.state` and don't need to be re-parsed.
-    fn create(
+    /// Called once per login, after the
+    /// [`SessionEnricher`](crate::SessionEnricher) has built the session.
+    /// Everything the store needs to persist should be carried on the session
+    /// type itself — claim mapping and `UserInfo` lookups belong in the
+    /// enricher, not here.
+    fn insert(
         &self,
-        persisted: PersistedSessionState,
-        completed: &crate::grant::CompletedLogin,
-    ) -> impl Future<Output = Result<Self::SessionType, Self::Error>> + MaybeSend;
+        session: &Self::SessionType,
+    ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 
     /// Load a session by its key. Returns `None` if the key does not exist.
     ///
@@ -104,8 +106,8 @@ pub trait ExternalSessionStore: MaybeSendSync {
 ///
 /// Contains the session key, session state, and any future framework-managed
 /// fields (e.g. step-up auth timestamp, MFA assertions, revocation versions).
-/// Built by the framework and passed to [`ExternalSessionStore::create`] after
-/// a successful login.
+/// Built by the framework and passed as the *seed* to the
+/// [`SessionEnricher`](crate::SessionEnricher) after a successful login.
 ///
 /// The struct is `#[non_exhaustive]` so new framework-managed fields can be
 /// added in a minor release without breaking store implementations.
@@ -144,6 +146,18 @@ impl Session for PersistedSessionState {
 /// The default implementation on `PersistedSessionState` itself is trivial;
 /// enriched session types implement this by forwarding to their embedded
 /// `PersistedSessionState` field.
+///
+/// # Accessor style
+///
+/// This trait deliberately differs from [`Session`]'s accessors. [`Session`]
+/// uses `state()`/`set_state(value)` — whole-value replacement — because its
+/// callers model application-visible *events* (refresh, activity) that
+/// produce a new [`SessionState`], matching the load→transform→save flow
+/// distributed stores need. `PersistedSession` instead provides
+/// `persisted()`/`persisted_mut()` — structural access — because it is
+/// framework plumbing: the framework reads and updates individual fields of
+/// its own struct (the session key today; step-up/MFA fields later) without
+/// every session type having to mirror per-field setters.
 pub trait PersistedSession {
     /// Returns a shared reference to the embedded [`PersistedSessionState`].
     fn persisted(&self) -> &PersistedSessionState;
@@ -170,10 +184,18 @@ fn generate_session_key() -> Uuid {
 /// stores session data in an external [`ExternalSessionStore`].
 ///
 /// The pointer cookie contains the encrypted session key (a random string).
-/// The actual session data is stored via the external store, which receives
-/// [`PersistedSessionState`] on creation and returns its own session type.
-pub struct StoreBackedSessionStore<E> {
+/// The actual session data is stored via the external store.
+///
+/// The type parameter `F` is the [`SessionEnricher`] that builds the session
+/// from the framework-prepared [`PersistedSessionState`] seed after a
+/// completed login. The default, [`NoEnrichment`], converts the seed via
+/// `From` — covering `SessionType = PersistedSessionState` (and any session
+/// type implementing `From<PersistedSessionState>`). For sessions needing
+/// claims or I/O, attach an enricher with
+/// [`with_enricher`](Self::with_enricher).
+pub struct StoreBackedSessionStore<E, F = NoEnrichment> {
     external: E,
+    enricher: F,
     sealer: AeadV1Sealer<BoxedAeadCipher>,
     unsealer: AeadV1Unsealer<BoxedAeadCipher>,
     cookie_name: String,
@@ -185,7 +207,9 @@ pub struct StoreBackedSessionStore<E> {
 
 #[bon::bon]
 impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
-    /// Creates a new store-backed session store.
+    /// Creates a new store-backed session store (with [`NoEnrichment`] —
+    /// chain [`with_enricher`](Self::with_enricher) on the built store to
+    /// attach an async [`SessionEnricher`]).
     #[builder]
     pub fn new(
         external: E,
@@ -203,6 +227,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     ) -> Self {
         Self {
             external,
+            enricher: NoEnrichment,
             sealer: AeadV1Sealer::new(cipher.clone()),
             unsealer: AeadV1Unsealer::new(cipher),
             cookie_name,
@@ -210,6 +235,28 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             cookie_path,
             max_age,
             metrics,
+        }
+    }
+}
+
+impl<E: ExternalSessionStore, F> StoreBackedSessionStore<E, F> {
+    /// Replaces the session enricher, e.g. with one that calls the OIDC
+    /// `UserInfo` endpoint after login. See [`SessionEnricher`] for an example
+    /// (the seed type here is [`PersistedSessionState`]).
+    pub fn with_enricher<F2: SessionEnricher<PersistedSessionState, E::SessionType>>(
+        self,
+        enricher: F2,
+    ) -> StoreBackedSessionStore<E, F2> {
+        StoreBackedSessionStore {
+            external: self.external,
+            enricher,
+            sealer: self.sealer,
+            unsealer: self.unsealer,
+            cookie_name: self.cookie_name,
+            secure: self.secure,
+            cookie_path: self.cookie_path,
+            max_age: self.max_age,
+            metrics: self.metrics,
         }
     }
 
@@ -327,20 +374,28 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
 
 // -- Internal methods --
 
-impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
+impl<E, F> StoreBackedSessionStore<E, F>
+where
+    E: ExternalSessionStore,
+    F: SessionEnricher<PersistedSessionState, E::SessionType>,
+{
     pub(crate) async fn create_session(
         &self,
         completed: &crate::grant::CompletedLogin,
         default_lifetime: std::time::Duration,
     ) -> Result<(E::SessionType, Vec<HeaderValue>), SessionError> {
-        let persisted = PersistedSessionState {
+        let seed = PersistedSessionState {
             session_key: generate_session_key(),
             state: SessionState::from_completed(completed, default_lifetime),
         };
 
         let session = self
-            .external
-            .create(persisted, completed)
+            .enricher
+            .build_session(seed, completed)
+            .await
+            .map_err(to_session_err)?;
+        self.external
+            .insert(&session)
             .await
             .map_err(to_session_err)?;
         let cookies = self
@@ -348,7 +403,9 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             .await?;
         Ok((session, cookies))
     }
+}
 
+impl<E: ExternalSessionStore, F> StoreBackedSessionStore<E, F> {
     pub(crate) async fn load_session(
         &self,
         headers: &http::HeaderMap,
@@ -401,9 +458,18 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     }
 }
 
-impl<E: ExternalSessionStore> crate::session::sealed::Sealed for StoreBackedSessionStore<E> {}
+impl<E, F> crate::session::sealed::Sealed for StoreBackedSessionStore<E, F>
+where
+    E: ExternalSessionStore,
+    F: SessionEnricher<PersistedSessionState, E::SessionType>,
+{
+}
 
-impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
+impl<E, F> SessionDriver for StoreBackedSessionStore<E, F>
+where
+    E: ExternalSessionStore,
+    F: SessionEnricher<PersistedSessionState, E::SessionType>,
+{
     type SessionType = E::SessionType;
     type LoadError = E::Error;
 
@@ -512,12 +578,8 @@ mod tests {
         type SessionType = MinimalSession;
         type Error = Infallible;
 
-        async fn create(
-            &self,
-            _: PersistedSessionState,
-            _: &crate::grant::CompletedLogin,
-        ) -> Result<MinimalSession, Infallible> {
-            Ok(self.0.clone())
+        async fn insert(&self, _: &MinimalSession) -> Result<(), Infallible> {
+            Ok(())
         }
 
         async fn load(&self, _: Uuid) -> Result<Option<MinimalSession>, Infallible> {
@@ -549,6 +611,42 @@ mod tests {
                     .build(),
             },
         }
+    }
+
+    /// Builds `MinimalSession` (a wrapper around the seed) from the
+    /// framework-prepared `PersistedSessionState` — the store-backed analogue
+    /// of a cookie-session enricher.
+    struct MinimalEnricher;
+
+    impl SessionEnricher<PersistedSessionState, MinimalSession> for MinimalEnricher {
+        type Error = Infallible;
+
+        async fn build_session(
+            &self,
+            seed: PersistedSessionState,
+            _completed: &crate::grant::CompletedLogin,
+        ) -> Result<MinimalSession, Infallible> {
+            Ok(MinimalSession { persisted: seed })
+        }
+    }
+
+    fn assert_session_driver<T: SessionDriver>(_: &T) {}
+
+    #[tokio::test]
+    async fn enriched_store_satisfies_session_driver() {
+        // MinimalSession is not PersistedSessionState, so the store only
+        // implements SessionDriver once an enricher that builds it is
+        // attached — the same composition rule as cookie sessions.
+        let session = test_session();
+        let store = StoreBackedSessionStore::builder()
+            .external(MinimalExternalStore(session))
+            .cipher(test_cipher().await)
+            .cookie_name("session")
+            .secure(true)
+            .cookie_path("/")
+            .build()
+            .with_enricher(MinimalEnricher);
+        assert_session_driver(&store);
     }
 
     #[tokio::test]
@@ -707,12 +805,9 @@ mod tests {
         let mut req = http::HeaderMap::new();
         req.insert(
             http::header::COOKIE,
-            format!(
-                "session={pointer_value}; session.kid={}",
-                encode_kid("v1")
-            )
-            .parse()
-            .unwrap(),
+            format!("session={pointer_value}; session.kid={}", encode_kid("v1"))
+                .parse()
+                .unwrap(),
         );
         assert_eq!(store.read_pointer_cookie(&req).await, Some(original_key));
     }

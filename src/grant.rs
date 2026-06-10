@@ -8,7 +8,9 @@
 
 use huskarl::{
     core::{
-        BoxedError, client_auth::ClientAuthentication, dpop::AuthorizationServerDPoP,
+        BoxedError,
+        client_auth::ClientAuthentication,
+        dpop::AuthorizationServerDPoP,
         http::HttpClient,
         platform::{MaybeSend, MaybeSendSync},
     },

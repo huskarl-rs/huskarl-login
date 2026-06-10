@@ -8,7 +8,27 @@
 //!
 //! This crate contains the framework-agnostic login logic shared by
 //! `huskarl-axum` and `huskarl-pingora`: configuration, session drivers,
-//! cookie helpers, URL helpers, grant abstraction, and session store traits.
+//! session enrichment, cookie helpers, URL helpers, grant abstraction, and
+//! session store traits.
+//!
+//! # Session model
+//!
+//! Session creation follows one model regardless of where sessions live: the
+//! framework prepares a *seed* ([`SessionState`], plus the session key for
+//! store-backed sessions), a [`SessionEnricher`] builds the application's
+//! session type from the seed and the [`CompletedLogin`] (mapping ID token
+//! claims, calling the OIDC `UserInfo` endpoint, …), and the chosen backend
+//! stores it:
+//!
+//! - [`CookieSessionStore`] seals the session into chunked, AEAD-encrypted
+//!   browser cookies — no server-side storage.
+//! - [`StoreBackedSessionStore`] keeps an encrypted pointer cookie and
+//!   persists the session via an [`ExternalSessionStore`] (Redis, a
+//!   database, …).
+//!
+//! The default enricher, [`NoEnrichment`], converts the seed straight into
+//! the session type via `From`; attach a custom one with the stores'
+//! `with_enricher` method.
 //!
 //! The canonical [`SessionDriver`] interface returns `Vec<HeaderValue>` from
 //! mutating methods (`save`, `touch`, `delete`). Framework crates that need a
@@ -32,14 +52,16 @@ pub mod url;
 
 mod config;
 mod cookie_session;
+mod enrich;
 mod error_page;
 mod grant;
 mod session_state;
 mod store_session;
 
 pub use config::{ConfigError, LoginConfig};
-pub use cookie_session::{CookieData, CookieSession, CookieSessionStore};
+pub use cookie_session::{CookiePayload, CookieSession, CookieSessionStore};
 pub use engine::{DefaultPersistFailurePolicy, PersistFailurePolicy};
+pub use enrich::{NoEnrichment, SessionEnricher};
 pub use error_page::{DefaultErrorPage, ErrorPage, ErrorPageResponse};
 pub use grant::{CompletedLogin, LoginGrant};
 pub use metrics::{

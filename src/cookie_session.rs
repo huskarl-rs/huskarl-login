@@ -22,6 +22,7 @@ use crate::{
         DEFAULT_COOKIE_MAX_AGE, cookie_attrs, decode_payload, encode_kid, encode_payload,
         get_kid_cookie, kid_cookie_name, unseal_with_kid_fallback,
     },
+    enrich::{NoEnrichment, SessionEnricher},
     grant::CompletedLogin,
     metrics::{DecryptResult, SessionCookieMetrics},
     session::{SessionDriver, SessionError, to_session_err},
@@ -30,43 +31,14 @@ use crate::{
 
 const CHUNK_SIZE: usize = 3800;
 
-/// Trait for cookie session payload types.
+/// Bound alias for any type that can be sealed into (and unsealed from) the
+/// session cookie: a [`Session`] that round-trips through serde.
 ///
-/// Implement this to store only the fields your application needs in the
-/// browser cookie, rather than the full [`SessionState`].
-///
-/// The type must also implement [`Session`] so the middleware can enforce
-/// session policies (lifetime, idle timeout, token refresh).
-///
-/// # Storing user info from the ID token
-///
-/// The default [`CookieSession`] does not carry the raw `id_token` JWT or any
-/// of its claims (beyond `sub` and `sid` which are needed for logout). To
-/// expose user info in handlers, define a custom type that captures just the
-/// fields you use:
-///
-/// ```ignore
-/// #[derive(Serialize, Deserialize)]
-/// struct MySession {
-///     state: SessionState,
-///     email: Option<String>,
-///     name: Option<String>,
-/// }
-///
-/// impl CookieData for MySession {
-///     type Error = std::convert::Infallible;
-///     fn from_login(state: SessionState, completed: &CompletedLogin) -> Result<Self, Self::Error> {
-///         let claims = completed.id_token_claims();
-///         Ok(Self {
-///             state,
-///             email: claims.and_then(|c| c.email.clone()),
-///             name: claims.and_then(|c| c.name.clone()),
-///         })
-///     }
-/// }
-/// ```
-///
-/// For non-standard claims, use `claims.extra.get("name").and_then(|v| v.as_str())`.
+/// Blanket-implemented — never implement it directly. Define a custom payload
+/// type to store only the fields your application needs in the browser cookie
+/// rather than the full [`SessionState`], and build it with a
+/// [`SessionEnricher`] (attached via [`CookieSessionStore::with_enricher`]) —
+/// see [`SessionEnricher`] for claim-mapping and `UserInfo` examples.
 ///
 /// # Storing the `id_token` for RP-initiated logout
 ///
@@ -93,25 +65,14 @@ const CHUNK_SIZE: usize = 3800;
 ///     // update your own fields from token_response here
 /// }
 /// ```
-pub trait CookieData:
+pub trait CookiePayload:
     Session + Serialize + for<'de> Deserialize<'de> + MaybeSendSync + 'static
 {
-    /// Error type returned by [`from_login`](Self::from_login).
-    type Error: std::error::Error + MaybeSendSync + 'static;
+}
 
-    /// Build a cookie session payload from the framework-prepared `SessionState`
-    /// and the completed login.
-    ///
-    /// `state` already carries the standard token/timing fields (including
-    /// `sub`/`sid` extracted from the ID token). Embed it in the returned
-    /// type and add any additional fields read from `completed.id_token_claims()`
-    /// or `completed.token_response()`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Self::Error`] if the implementation can't construct a session
-    /// from the available data (e.g. a required claim is missing).
-    fn from_login(state: SessionState, completed: &CompletedLogin) -> Result<Self, Self::Error>;
+impl<T: Session + Serialize + for<'de> Deserialize<'de> + MaybeSendSync + 'static> CookiePayload
+    for T
+{
 }
 
 /// A session that stores token state encrypted in browser cookies.
@@ -120,8 +81,9 @@ pub trait CookieData:
 /// transparent newtype over [`SessionState`], so existing encrypted cookies
 /// deserialize correctly.
 ///
-/// For a smaller cookie, define a custom type implementing [`CookieData`] and
-/// use `CookieSessionStore<MyType>`.
+/// It carries no ID token claims beyond the `sub`/`sid` baked into
+/// [`SessionState`]. For a payload with user info (or a smaller one), define
+/// a custom type and build it with a [`SessionEnricher`].
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CookieSession(SessionState);
@@ -135,11 +97,10 @@ impl Session for CookieSession {
     }
 }
 
-impl CookieData for CookieSession {
-    type Error = std::convert::Infallible;
-
-    fn from_login(state: SessionState, _completed: &CompletedLogin) -> Result<Self, Self::Error> {
-        Ok(CookieSession(state))
+/// Lets [`NoEnrichment`] build the default session directly from the seed.
+impl From<SessionState> for CookieSession {
+    fn from(state: SessionState) -> Self {
+        CookieSession(state)
     }
 }
 
@@ -150,8 +111,14 @@ impl CookieData for CookieSession {
 /// treated as "no session" rather than an error.
 ///
 /// The type parameter `C` controls what is stored in the cookie. The default
-/// is [`CookieSession`], which stores the full [`SessionState`]. For a smaller
-/// cookie, supply a custom type that implements [`CookieData`].
+/// is [`CookieSession`], which stores the full [`SessionState`]. For a custom
+/// payload, supply any [`CookiePayload`] type.
+///
+/// The type parameter `F` is the [`SessionEnricher`] that builds the session
+/// payload after a completed login. The default, [`NoEnrichment`], converts
+/// the [`SessionState`] seed via `From`; attach a custom enricher (e.g. one
+/// that maps ID token claims or calls the OIDC `UserInfo` endpoint) with
+/// [`with_enricher`](Self::with_enricher).
 ///
 /// # Cookie format
 ///
@@ -163,7 +130,7 @@ impl CookieData for CookieSession {
 /// an index is missing. Truncation or stale leftover chunks just produce a
 /// payload the AEAD layer can't authenticate, which surfaces as "no session"
 /// and triggers a fresh login.
-pub struct CookieSessionStore<C = CookieSession> {
+pub struct CookieSessionStore<C = CookieSession, F = NoEnrichment> {
     sealer: AeadV1Sealer<BoxedAeadCipher>,
     unsealer: AeadV1Unsealer<BoxedAeadCipher>,
     cookie_name: String,
@@ -171,12 +138,15 @@ pub struct CookieSessionStore<C = CookieSession> {
     cookie_path: String,
     max_age: Duration,
     metrics: Option<Arc<dyn SessionCookieMetrics>>,
+    enricher: F,
     _phantom: PhantomData<C>,
 }
 
 #[bon::bon]
 impl<C> CookieSessionStore<C> {
-    /// Creates a new cookie session store.
+    /// Creates a new cookie session store (with [`NoEnrichment`] — chain
+    /// [`with_enricher`](Self::with_enricher) on the built store to attach an
+    /// async [`SessionEnricher`]).
     #[builder]
     pub fn new(
         cipher: BoxedAeadCipher,
@@ -200,6 +170,28 @@ impl<C> CookieSessionStore<C> {
             cookie_path,
             max_age,
             metrics,
+            enricher: NoEnrichment,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<C, F> CookieSessionStore<C, F> {
+    /// Replaces the session enricher, e.g. with one that calls the OIDC
+    /// `UserInfo` endpoint after login. See [`SessionEnricher`] for an example.
+    pub fn with_enricher<F2: SessionEnricher<SessionState, C>>(
+        self,
+        enricher: F2,
+    ) -> CookieSessionStore<C, F2> {
+        CookieSessionStore {
+            sealer: self.sealer,
+            unsealer: self.unsealer,
+            cookie_name: self.cookie_name,
+            secure: self.secure,
+            cookie_path: self.cookie_path,
+            max_age: self.max_age,
+            metrics: self.metrics,
+            enricher,
             _phantom: PhantomData,
         }
     }
@@ -230,7 +222,7 @@ impl<C> CookieSessionStore<C> {
 
 // -- Internal methods --
 
-impl<C: CookieData> CookieSessionStore<C> {
+impl<C: CookiePayload, F> CookieSessionStore<C, F> {
     pub(crate) async fn load_session(&self, headers: &http::HeaderMap) -> Option<C> {
         let chunks = self.collect_session_chunks(headers);
         let raw_encoded = reassemble_chunks(&chunks)?;
@@ -426,9 +418,14 @@ impl<C: CookieData> CookieSessionStore<C> {
     }
 }
 
-impl<C: CookieData> crate::session::sealed::Sealed for CookieSessionStore<C> {}
+impl<C: CookiePayload, F: SessionEnricher<SessionState, C>> crate::session::sealed::Sealed
+    for CookieSessionStore<C, F>
+{
+}
 
-impl<C: CookieData> SessionDriver for CookieSessionStore<C> {
+impl<C: CookiePayload, F: SessionEnricher<SessionState, C>> SessionDriver
+    for CookieSessionStore<C, F>
+{
     type SessionType = C;
     type LoadError = std::convert::Infallible;
 
@@ -439,7 +436,11 @@ impl<C: CookieData> SessionDriver for CookieSessionStore<C> {
         headers: &http::HeaderMap,
     ) -> Result<(C, Vec<HeaderValue>), SessionError> {
         let state = SessionState::from_completed(&completed, default_lifetime);
-        let session = C::from_login(state, &completed).map_err(to_session_err)?;
+        let session = self
+            .enricher
+            .build_session(state, &completed)
+            .await
+            .map_err(to_session_err)?;
         let cookies = self.save_session(&session, headers).await?;
         Ok((session, cookies))
     }
@@ -874,8 +875,7 @@ mod tests {
         // authenticity gate. A bundle sealed under a key outside the
         // configured set must still fail, whatever the sidecar claims.
         let store = multi_key_store().await;
-        let foreign =
-            AeadV1Sealer::new(BoxedAeadCipher::new(aes_key_with_kid("v9", 9).await));
+        let foreign = AeadV1Sealer::new(BoxedAeadCipher::new(aes_key_with_kid("v9", 9).await));
         let payload = crate::cookie::encode_payload(&CookieSession(test_state())).unwrap();
         let bundle = foreign.seal(&payload, b"session").await.unwrap();
         let mut headers = HeaderMap::new();
@@ -1002,6 +1002,83 @@ mod tests {
             secs(loaded.state().last_active),
             secs(original_state.last_active)
         );
+    }
+
+    // ── SessionEnricher / CookiePayload ───────────────────────────────────
+
+    /// An enrichment-built session type: `email` is *required*, so the type
+    /// can't be built from the seed alone (no `From<SessionState>`). It
+    /// implements only `Session` + serde (`CookiePayload` is
+    /// blanket-implemented) and is constructed by an enricher.
+    #[derive(Serialize, Deserialize)]
+    struct EnrichedSession {
+        state: SessionState,
+        email: String,
+    }
+
+    impl Session for EnrichedSession {
+        fn state(&self) -> &SessionState {
+            &self.state
+        }
+        fn set_state(&mut self, s: SessionState) {
+            self.state = s;
+        }
+    }
+
+    /// Stands in for an enricher that owns its own clients (e.g. a
+    /// `UserInfoClient`) and awaits them while building the session.
+    struct TestEnricher;
+
+    impl SessionEnricher<SessionState, EnrichedSession> for TestEnricher {
+        type Error = Infallible;
+
+        async fn build_session(
+            &self,
+            state: SessionState,
+            _completed: &CompletedLogin,
+        ) -> Result<EnrichedSession, Infallible> {
+            Ok(EnrichedSession {
+                state,
+                email: "user@example.com".to_owned(),
+            })
+        }
+    }
+
+    fn assert_session_driver<T: SessionDriver>(_: &T) {}
+
+    #[tokio::test]
+    async fn enriched_store_roundtrips_enrichment_only_payload() {
+        let store = CookieSessionStore::<EnrichedSession>::builder()
+            .cipher(test_cipher().await)
+            .cookie_name("huskarl_session")
+            .secure(true)
+            .cookie_path("/")
+            .build()
+            .with_enricher(TestEnricher);
+        // The enriched store still satisfies SessionDriver, so the engine can
+        // drive it. (Without the enricher it would not: EnrichedSession has no
+        // From<SessionState>, so NoEnrichment can't build it.)
+        assert_session_driver(&store);
+
+        let session = EnrichedSession {
+            state: test_state(),
+            email: "user@example.com".to_owned(),
+        };
+        let set_cookies = store
+            .save_session(&session, &HeaderMap::new())
+            .await
+            .unwrap();
+        let req = request_cookies_from_set_cookies(&set_cookies);
+        let loaded = store.load_session(&req).await.expect("session loads");
+        assert_eq!(loaded.email, "user@example.com");
+    }
+
+    #[tokio::test]
+    async fn default_store_still_satisfies_session_driver() {
+        // Regression guard: adding the enricher type parameter must not cost
+        // the plain (NoEnrichment) store its SessionDriver impl.
+        let store = test_store().await;
+        assert_session_driver(&store);
     }
 
     #[tokio::test]
