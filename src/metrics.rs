@@ -175,8 +175,14 @@ pub enum RefreshResult {
     NoRefreshToken,
     /// The refresh token was exchanged successfully for new tokens.
     Ok,
-    /// The token refresh request failed — session was cleared.
+    /// The token refresh request failed conclusively — session was cleared.
     Failed,
+    /// The refresh failed with a retryable (transient) error while the access
+    /// token was still valid — the session was retained and the refresh will
+    /// be re-attempted on a later request. A sustained elevated rate here
+    /// signals authorization-server trouble *before* users start getting
+    /// logged out.
+    FailedRetained,
 }
 
 impl RefreshResult {
@@ -187,6 +193,7 @@ impl RefreshResult {
             Self::NoRefreshToken => "no_refresh_token",
             Self::Ok => "ok",
             Self::Failed => "failed",
+            Self::FailedRetained => "failed_retained",
         }
     }
 }

@@ -72,8 +72,13 @@ pub struct LoadedSession<S> {
     /// inner handler returns.
     ///
     /// `None` when no cookie was present, the session was expired, or token
-    /// refresh failed. In those cases [`clear_cookies`](Self::clear_cookies)
-    /// may carry headers to drop the now-stale session cookie.
+    /// refresh failed conclusively. In those cases
+    /// [`clear_cookies`](Self::clear_cookies) may carry headers to drop the
+    /// now-stale session cookie.
+    ///
+    /// A *transient* refresh failure while the access token is still valid
+    /// does not clear the session — it is returned as usual and the refresh
+    /// is retried on a later request.
     pub session: Option<(S, SessionPersistence)>,
     /// `Set-Cookie` headers (always cookie clears) the framework adapter
     /// must append to the final response. Empty in the happy path.
@@ -363,6 +368,14 @@ where
 
     /// Token (or refresh window) elapsed — exchange the refresh token, or
     /// emit cookie clears if refresh is unavailable / fails.
+    ///
+    /// One failure mode is softened: a *transient* refresh failure while the
+    /// access token is still valid (we entered the refresh window early)
+    /// retains the session instead of tearing it down — a brief AS blip
+    /// shouldn't log users out while their token still works. A later request
+    /// re-enters the refresh window and retries. Conclusive failures (the AS
+    /// rejected the refresh token, e.g. `invalid_grant`) and failures after
+    /// actual token expiry still tear the session down.
     async fn refresh_or_clear(
         &self,
         mut session: SD::SessionType,
@@ -382,6 +395,21 @@ where
                 self.record_refresh(&RefreshResult::Ok);
                 LoadedSession {
                     session: Some((session, SessionPersistence::Save)),
+                    clear_cookies: vec![],
+                }
+            }
+            // Re-read the clock: the retry loop slept, and the token may have
+            // expired while we were waiting.
+            Err(e) if e.is_retryable() && SystemTime::now() < session.token_expiry() => {
+                log::warn!(
+                    "token refresh failed transiently; retaining session while access token \
+                     is still valid: {}",
+                    error_chain(&e)
+                );
+                self.record_refresh(&RefreshResult::FailedRetained);
+                let persistence = self.touch_or_skip(&mut session, SystemTime::now());
+                LoadedSession {
+                    session: Some((session, persistence)),
                     clear_cookies: vec![],
                 }
             }

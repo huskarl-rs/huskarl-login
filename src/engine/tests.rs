@@ -893,16 +893,31 @@ impl LoginGrant for RetryGrant {
     }
 }
 
-async fn engine_with_retry_grant(
-    grant: RetryGrant,
-) -> LoginEngine<RetryGrant, MockSessionStore, MockHttpClient> {
+fn retry_grant(retryable: bool) -> RetryGrant {
+    RetryGrant {
+        refresh_calls: std::sync::atomic::AtomicU32::new(0),
+        fail_first_n: u32::MAX,
+        retryable,
+    }
+}
+
+/// A session whose access token expires at `token_expiry` and that holds a
+/// refresh token — i.e. one that enters the refresh path on load whenever
+/// `token_expiry` is within the refresh margin.
+fn refreshable_session(token_expiry: SystemTime) -> MockSession {
     use huskarl::core::secrets::SecretString;
-    let session = session_with(
-        SystemTime::now() - Duration::from_mins(1),
+    session_with(
+        token_expiry,
         Some(RefreshToken::new(SecretString::new("test_refresh"), None)),
         SystemTime::now(),
         SystemTime::now(),
-    );
+    )
+}
+
+async fn engine_with_retry_grant_and_session(
+    grant: RetryGrant,
+    session: MockSession,
+) -> LoginEngine<RetryGrant, MockSessionStore, MockHttpClient> {
     LoginEngine::builder()
         .config(default_config())
         .grant(grant)
@@ -910,6 +925,14 @@ async fn engine_with_retry_grant(
         .cipher(test_cipher().await)
         .http_client(MockHttpClient)
         .build()
+}
+
+async fn engine_with_retry_grant(
+    grant: RetryGrant,
+) -> LoginEngine<RetryGrant, MockSessionStore, MockHttpClient> {
+    // Token expired a minute ago — the refresh outcome is decisive.
+    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    engine_with_retry_grant_and_session(grant, session).await
 }
 
 #[tokio::test]
@@ -937,6 +960,47 @@ async fn refresh_does_not_retry_when_error_is_non_retryable() {
     // Non-retryable AS rejection (e.g. invalid_grant) must short-circuit at
     // the first attempt — retrying would just amplify load.
     assert_eq!(e.grant.refresh_count(), 1);
+}
+
+// ── Transient refresh failure inside the early-refresh window ─────────────
+
+#[tokio::test]
+async fn transient_refresh_failure_with_valid_token_retains_session() {
+    // Token expires 15s from now — inside the 30s refresh margin but still
+    // valid. A transient refresh failure must not log the user out.
+    let session = refreshable_session(SystemTime::now() + Duration::from_secs(15));
+    let e = engine_with_retry_grant_and_session(retry_grant(true), session).await;
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    let (_, persistence) = loaded.session.expect("session retained");
+    // last_active is fresh, so the throttled activity update skips.
+    assert_eq!(persistence, SessionPersistence::Skip);
+    assert!(loaded.clear_cookies.is_empty());
+    assert!(!e.session_store().delete_called());
+    // The full retry budget was spent before falling back to retention.
+    assert_eq!(e.grant.refresh_count(), super::REFRESH_MAX_ATTEMPTS);
+}
+
+#[tokio::test]
+async fn non_retryable_refresh_failure_clears_session_even_with_valid_token() {
+    // The AS conclusively rejected the refresh token (e.g. invalid_grant —
+    // possibly reuse-detection revocation). Retention would serve a session
+    // the AS just disowned; tear it down even though the token has 15s left.
+    let session = refreshable_session(SystemTime::now() + Duration::from_secs(15));
+    let e = engine_with_retry_grant_and_session(retry_grant(false), session).await;
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    assert!(loaded.session.is_none());
+    assert!(e.session_store().delete_called());
+}
+
+#[tokio::test]
+async fn transient_refresh_failure_with_expired_token_clears_session() {
+    // Past actual expiry there is no valid token to keep serving — transient
+    // or not, the session is torn down.
+    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    let e = engine_with_retry_grant_and_session(retry_grant(true), session).await;
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    assert!(loaded.session.is_none());
+    assert!(e.session_store().delete_called());
 }
 
 #[tokio::test]
@@ -1513,6 +1577,32 @@ async fn metrics_refresh_failed_when_grant_refresh_fails() {
     let (e, m) = engine_with_metrics(MockSessionStore::with_session(session)).await;
     e.load_session(&HeaderMap::new()).await.unwrap();
     assert_eq!(m.calls(), vec![MetricCall::Refresh { result: "failed" }]);
+}
+
+#[tokio::test]
+async fn metrics_refresh_failed_retained_on_transient_failure_with_valid_token() {
+    let m = Arc::new(TestEngineMetrics::default());
+    let session = refreshable_session(SystemTime::now() + Duration::from_secs(15));
+    let e = LoginEngine::builder()
+        .config(default_config())
+        .grant(retry_grant(true))
+        .session_store(MockSessionStore::with_session(session))
+        .cipher(test_cipher().await)
+        .http_client(MockHttpClient)
+        .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
+        .build();
+    e.load_session(&HeaderMap::new()).await.unwrap();
+    // The retained session goes through the normal activity path, so a
+    // (throttled) activity outcome follows the refresh outcome.
+    assert_eq!(
+        m.calls(),
+        vec![
+            MetricCall::Refresh {
+                result: "failed_retained"
+            },
+            MetricCall::Activity { outcome: "skip" },
+        ]
+    );
 }
 
 // ── Activity metrics ──────────────────────────────────────────────────────
