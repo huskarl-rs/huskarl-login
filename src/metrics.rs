@@ -2,9 +2,9 @@
 //!
 //! [`SessionCookieMetrics`] is a zero-dependency sink that session stores call
 //! when they encrypt or decrypt a session cookie. Wire in a Prometheus (or
-//! other backend) implementation at construction time via
-//! [`CookieSessionStore::with_metrics`] or
-//! [`StoreBackedSessionStore::with_metrics`].
+//! other backend) implementation at construction time via the `metrics`
+//! builder setting on [`CookieSessionStore`](crate::CookieSessionStore) or
+//! [`StoreBackedSessionStore`](crate::StoreBackedSessionStore).
 //!
 //! Absent cookies are always silent — the metric fires only when a
 //! session-cookie-shaped value was present in the request.
@@ -225,8 +225,8 @@ impl ActivityOutcome {
 /// Observer for [`LoginEngine`](crate::engine::LoginEngine) events.
 ///
 /// Implement this trait to record login-flow metrics to a backend of your
-/// choice. Attach an implementation via
-/// [`LoginEngine::with_metrics`](crate::engine::LoginEngine::with_metrics).
+/// choice. Attach an implementation via the `metrics` builder setting on
+/// [`LoginEngine`](crate::engine::LoginEngine).
 pub trait LoginEngineMetrics: Send + Sync + 'static {
     /// Record a login redirect attempt (browser redirected to authorization server).
     fn record_login_start(&self, result: &LoginStartResult);
