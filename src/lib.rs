@@ -61,11 +61,11 @@ mod session_state;
 mod store_session;
 
 pub use completed_login::CompletedLogin;
-pub use config::{ConfigError, LoginConfig};
+pub use config::{ConfigError, LoginConfig, LogoutConfig};
 pub use cookie_session::{
     CookiePayload, CookieSession, CookieSessionStore, CookieSessionStoreBuilder,
 };
-pub use engine::{DefaultPersistFailurePolicy, PersistFailurePolicy};
+pub use engine::{DefaultPersistFailurePolicy, PersistFailurePolicy, TeardownReason};
 pub use enrich::{NoEnrichment, SessionEnricher};
 pub use error_page::{DefaultErrorPage, ErrorPage, ErrorPageResponse};
 pub use metrics::{

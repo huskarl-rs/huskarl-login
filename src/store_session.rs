@@ -84,10 +84,24 @@ pub trait ExternalSessionStore: MaybeSendSync {
         session: &Self::SessionType,
     ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 
-    /// Extend the TTL of a session without rewriting data.
+    /// Persist the session's updated `last_active` timestamp and (where
+    /// applicable) extend the storage TTL.
     ///
-    /// Called on every authenticated request that doesn't trigger a full save.
-    /// Implementations may choose to no-op or throttle this.
+    /// The engine throttles these calls via
+    /// [`touch_min_interval`](crate::LoginConfig::touch_min_interval): a
+    /// request only triggers a touch once that much time has passed since
+    /// the last persisted activity, so steady traffic costs one backend
+    /// write per interval — not one per request. Implementations should not
+    /// need to throttle further.
+    ///
+    /// The persisted `last_active` is what
+    /// [`idle_timeout`](crate::LoginConfig::idle_timeout) is enforced
+    /// against, so idle expiry is accurate to `touch_min_interval`. An
+    /// implementation that extends the TTL without persisting `last_active`
+    /// degrades that accuracy: the timestamp then only advances on
+    /// [`save`](Self::save) (login and token refresh), and the engine may
+    /// tear down a continuously active session once `idle_timeout` elapses
+    /// after the last refresh.
     fn touch(
         &self,
         session: &Self::SessionType,
@@ -192,17 +206,28 @@ fn generate_session_key() -> Uuid {
 /// claims or I/O, supply an enricher via the `build_with_enricher(…)`
 /// finisher.
 ///
-/// When `secure` is set and `cookie_path` is `"/"`, the configured cookie
+/// The `Secure` attribute and cookie-name prefix follow the deployment's
+/// browser-facing scheme, which the engine derives from
+/// [`LoginConfig::base_url`](crate::LoginConfig::base_url) and stamps onto the
+/// store at construction (see
+/// [`SessionDriver::apply_cookie_secure`](crate::SessionDriver::apply_cookie_secure)).
+/// This store therefore takes no `secure` setting of its own. When that
+/// derived value is secure and `cookie_path` is `"/"`, the configured cookie
 /// name is automatically given the `__Host-` prefix (unless it already
 /// starts with `__Host-` or `__Secure-`). The prefix makes the browser
 /// reject the cookie if set by a sibling subdomain or over plain HTTP,
-/// blocking session fixation by cookie tossing. Note that enabling this on
-/// an existing deployment renames the cookie: in-flight sessions under the
-/// old name are ignored and users re-login on their next navigation.
+/// blocking session fixation by cookie tossing. Note that switching a
+/// deployment from `http` to `https` renames the cookie: in-flight sessions
+/// under the old name are ignored and users re-login on their next navigation.
 pub struct StoreBackedSessionStore<E: ExternalSessionStore> {
     external: E,
     enricher: Box<dyn SessionEnricher<PersistedSessionState, E::SessionType>>,
     cipher: SessionCipher,
+    /// The configured cookie name, before any security prefix is applied.
+    /// Retained so [`apply_cookie_secure`](SessionDriver::apply_cookie_secure)
+    /// can recompute `cookie_name` once the engine supplies the deployment's
+    /// `secure` flag.
+    raw_cookie_name: String,
     cookie_name: String,
     secure: bool,
     cookie_path: String,
@@ -225,7 +250,6 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         #[builder(with = |cipher: impl AeadCipher + 'static| Arc::new(cipher) as Arc<dyn AeadCipher>)]
         cipher: Arc<dyn AeadCipher>,
         #[builder(into)] cookie_name: String,
-        secure: bool,
         #[builder(into)] cookie_path: String,
         /// Defaults to 400 days. If `max_lifetime` is configured in `LoginConfig`,
         /// pass it here so the browser discards the cookie when the session can
@@ -235,11 +259,18 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         /// Optional metrics observer for encrypt/decrypt events.
         metrics: Option<Arc<dyn SessionCookieMetrics>>,
     ) -> Self {
-        let cookie_name = session_cookie_name(cookie_name, secure, &cookie_path);
+        // `secure` is supplied by the engine via `apply_cookie_secure` once it
+        // knows the deployment's `base_url` scheme. Until then default to the
+        // safe choice (secure, `__Host-` prefix); the engine re-derives the
+        // cookie name when it stamps the real value.
+        let secure = true;
+        let raw_cookie_name = cookie_name;
+        let cookie_name = session_cookie_name(raw_cookie_name.clone(), secure, &cookie_path);
         Self {
             external,
             enricher,
             cipher: AeadV1Cipher::new(cipher),
+            raw_cookie_name,
             cookie_name,
             secure,
             cookie_path,
@@ -465,6 +496,11 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
     type SessionType = E::SessionType;
     type LoadError = E::Error;
 
+    fn apply_cookie_secure(&mut self, secure: bool) {
+        self.secure = secure;
+        self.cookie_name = session_cookie_name(self.raw_cookie_name.clone(), secure, &self.cookie_path);
+    }
+
     async fn create(
         &self,
         completed: crate::CompletedLogin,
@@ -642,7 +678,6 @@ mod tests {
             .external(MinimalExternalStore(session))
             .cipher(test_cipher().await)
             .cookie_name("session")
-            .secure(true)
             .cookie_path("/")
             .build_with_enricher(MinimalEnricher);
         assert_session_driver(&store);
@@ -655,7 +690,6 @@ mod tests {
             .external(MinimalExternalStore(session.clone()))
             .cipher(test_cipher().await)
             .cookie_name("session")
-            .secure(true)
             .cookie_path("/")
             .build();
 
@@ -675,7 +709,6 @@ mod tests {
             .external(MinimalExternalStore(session.clone()))
             .cipher(test_cipher().await)
             .cookie_name("session")
-            .secure(true)
             .cookie_path("/")
             .build();
 
@@ -732,7 +765,6 @@ mod tests {
             .external(MinimalExternalStore(session.clone()))
             .cipher(test_cipher_with_kid("kid-7").await)
             .cookie_name("session")
-            .secure(true)
             .cookie_path("/")
             .build();
 
@@ -778,7 +810,6 @@ mod tests {
             .external(MinimalExternalStore(session))
             .cipher(cipher)
             .cookie_name("session")
-            .secure(true)
             .cookie_path("/")
             .build();
 
@@ -815,7 +846,6 @@ mod tests {
             .external(MinimalExternalStore(session.clone()))
             .cipher(test_cipher().await)
             .cookie_name("session")
-            .secure(true)
             .cookie_path("/")
             .build();
 
@@ -878,7 +908,6 @@ mod tests {
             .external(external)
             .cipher(test_cipher().await)
             .cookie_name("session")
-            .secure(true)
             .cookie_path("/")
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
@@ -897,7 +926,6 @@ mod tests {
             .external(external)
             .cipher(test_cipher_with_kid("v5").await)
             .cookie_name("session")
-            .secure(true)
             .cookie_path("/")
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
@@ -916,7 +944,6 @@ mod tests {
             .external(external)
             .cipher(test_cipher().await)
             .cookie_name("session")
-            .secure(true)
             .cookie_path("/")
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
@@ -932,7 +959,6 @@ mod tests {
             .external(external)
             .cipher(test_cipher().await)
             .cookie_name("session")
-            .secure(true)
             .cookie_path("/")
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
@@ -953,7 +979,6 @@ mod tests {
             .external(external)
             .cipher(test_cipher().await)
             .cookie_name("session")
-            .secure(true)
             .cookie_path("/")
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
@@ -974,7 +999,6 @@ mod tests {
             .external(external)
             .cipher(test_cipher().await)
             .cookie_name("session")
-            .secure(true)
             .cookie_path("/")
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
@@ -1002,7 +1026,6 @@ mod tests {
             .external(external)
             .cipher(test_cipher_with_kid("v5").await)
             .cookie_name("session")
-            .secure(true)
             .cookie_path("/")
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();

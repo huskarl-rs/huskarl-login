@@ -58,47 +58,221 @@ type EngineError = SessionError;
 
 /// A framework-neutral HTTP response produced by the login engine.
 ///
-/// Framework adapters convert this into their native response type.
-pub struct LoginResponse {
-    /// HTTP status code.
-    pub status: StatusCode,
-    /// Response headers (may contain multiple values for the same name,
-    /// e.g. multiple `Set-Cookie` headers).
-    pub headers: Vec<(HeaderName, HeaderValue)>,
-    /// Response body (empty for redirects).
-    pub body: Bytes,
+/// Modelled as a sum type so the two response shapes the engine actually
+/// produces can't be mixed up: a [`Redirect`](Self::Redirect) *always* carries
+/// a `Location` (a 302 without one is unrepresentable), and a
+/// [`Rendered`](Self::Rendered) response *always* carries its own status and
+/// body. Framework adapters lower this into their native response type via
+/// [`into_parts`](Self::into_parts) at the response boundary.
+#[must_use]
+pub enum LoginResponse {
+    /// A `302 Found` redirect. The `Location` is typed, so the engine cannot
+    /// emit a redirect without one. `set_cookies` are the session/login-state
+    /// `Set-Cookie` values that ride along; the boundary also emits
+    /// `Cache-Control: no-store`, since these redirects carry session-bearing
+    /// cookies (RFC 6749 §5.1).
+    Redirect {
+        /// The `Location` to redirect to.
+        location: HeaderValue,
+        /// `Set-Cookie` values to emit alongside the redirect.
+        set_cookies: Vec<HeaderValue>,
+    },
+    /// A response rendered with an explicit status, header set, and body —
+    /// error pages, `401`, `403`, `405`, and `5xx`.
+    Rendered {
+        /// HTTP status code.
+        status: StatusCode,
+        /// Response headers (may repeat a name, e.g. multiple `Set-Cookie`).
+        headers: Vec<(HeaderName, HeaderValue)>,
+        /// Response body.
+        body: Bytes,
+    },
 }
 
-/// The result of [`LoginEngine::load_session`].
-pub struct LoadedSession<S> {
-    /// The loaded session and how the adapter should persist it after the
-    /// inner handler returns.
-    ///
-    /// `None` when no cookie was present, the session was expired, or token
-    /// refresh failed conclusively. In those cases
-    /// [`clear_cookies`](Self::clear_cookies) may carry headers to drop the
-    /// now-stale session cookie.
-    ///
-    /// A *transient* refresh failure while the access token is still valid
-    /// does not clear the session — it is returned as usual and the refresh
-    /// is retried on a later request.
-    pub session: Option<(S, SessionPersistence)>,
-    /// `Set-Cookie` headers (always cookie clears) the framework adapter
-    /// must append to the final response. Empty in the happy path.
-    pub clear_cookies: Vec<HeaderValue>,
+impl LoginResponse {
+    /// The status code this response is served with.
+    #[must_use]
+    pub fn status(&self) -> StatusCode {
+        match self {
+            Self::Redirect { .. } => StatusCode::FOUND,
+            Self::Rendered { status, .. } => *status,
+        }
+    }
+
+    /// Lowers this semantic response into concrete HTTP parts: status code,
+    /// the full header list, and body. For a [`Redirect`](Self::Redirect) the
+    /// `Location`, `Cache-Control: no-store`, and `Set-Cookie` headers are
+    /// materialized here. Framework adapters call this at the response
+    /// boundary; the typed variants guarantee the parts are always coherent
+    /// (a redirect can never be lowered without a `Location`).
+    #[must_use]
+    pub fn into_parts(self) -> (StatusCode, Vec<(HeaderName, HeaderValue)>, Bytes) {
+        match self {
+            Self::Redirect {
+                location,
+                set_cookies,
+            } => {
+                let mut headers = Vec::with_capacity(set_cookies.len() + 2);
+                headers.push((header::LOCATION, location));
+                headers.push((header::CACHE_CONTROL, HeaderValue::from_static("no-store")));
+                for c in set_cookies {
+                    headers.push((header::SET_COOKIE, c));
+                }
+                (StatusCode::FOUND, headers, Bytes::new())
+            }
+            Self::Rendered {
+                status,
+                headers,
+                body,
+            } => (status, headers, body),
+        }
+    }
+
+    /// The full header list this response is served with, materialized
+    /// (cloning) — including a redirect's synthesized `Location`,
+    /// `Cache-Control: no-store`, and `Set-Cookie`s. Convenience for
+    /// inspection; the response boundary should prefer
+    /// [`into_parts`](Self::into_parts), which avoids the clone.
+    #[must_use]
+    pub fn headers(&self) -> Vec<(HeaderName, HeaderValue)> {
+        match self {
+            Self::Redirect {
+                location,
+                set_cookies,
+            } => {
+                let mut headers = Vec::with_capacity(set_cookies.len() + 2);
+                headers.push((header::LOCATION, location.clone()));
+                headers.push((header::CACHE_CONTROL, HeaderValue::from_static("no-store")));
+                for c in set_cookies {
+                    headers.push((header::SET_COOKIE, c.clone()));
+                }
+                headers
+            }
+            Self::Rendered { headers, .. } => headers.clone(),
+        }
+    }
+
+    /// Appends a header to a [`Rendered`](Self::Rendered) response. Used by the
+    /// error-path builders, which always operate on `Rendered`; a no-op on
+    /// `Redirect`, whose header set is fixed and materialized at the boundary.
+    fn push_rendered_header(&mut self, name: HeaderName, value: HeaderValue) {
+        if let Self::Rendered { headers, .. } = self {
+            headers.push((name, value));
+        }
+    }
 }
 
-/// How to persist the session after the inner service responds.
+/// The result of [`LoginEngine::load_session`] — one variant per session
+/// state the adapter can observe.
+///
+/// A *transient* refresh failure while the access token is still valid does
+/// not clear the session — it surfaces as [`Active`](Self::Active) or
+/// [`ActivePending`](Self::ActivePending) and the refresh is retried on a
+/// later request.
+///
+/// This enum is deliberately **not** `#[non_exhaustive]`: an adapter must
+/// handle every session state, so a future state should be a compile error
+/// at every call site rather than fall through a wildcard arm.
+#[must_use]
+pub enum LoadedSession<S> {
+    /// The request carried no session cookie.
+    Missing,
+    /// A session was presented but torn down — expired, or token refresh
+    /// failed conclusively. `clears` must reach the final response to drop
+    /// the now-stale session cookies.
+    Cleared {
+        /// Why the session was torn down.
+        reason: TeardownReason,
+        /// `Set-Cookie` clears for the stale session cookies.
+        clears: Vec<HeaderValue>,
+    },
+    /// Authenticated and fully persisted — nothing is owed after the inner
+    /// handler responds.
+    Active {
+        /// The loaded session.
+        session: S,
+        /// `Set-Cookie` headers that must reach the final response: the
+        /// re-sealed session cookies when a token refresh was persisted
+        /// eagerly, empty otherwise.
+        set_cookies: Vec<HeaderValue>,
+    },
+    /// Authenticated, with persistence owed after the inner handler responds
+    /// — pass `persistence` to [`LoginEngine::persist_session`].
+    ///
+    /// Never carries cookies: a pending save produces its cookies when it
+    /// runs.
+    ActivePending {
+        /// The loaded session.
+        session: S,
+        /// The owed operation: an activity touch, or the retry of a failed
+        /// eager refresh persist.
+        persistence: SessionPersistence,
+    },
+}
+
+impl<S> LoadedSession<S> {
+    /// Convenience accessor: the session, when the request is authenticated.
+    pub fn session(&self) -> Option<&S> {
+        match self {
+            Self::Missing | Self::Cleared { .. } => None,
+            Self::Active { session, .. } | Self::ActivePending { session, .. } => Some(session),
+        }
+    }
+}
+
+/// Why [`LoginEngine::load_session`] tore down a presented session.
+///
+/// Carried on [`LoadedSession::Cleared`] and reported to
+/// [`LoginEngineMetrics::record_teardown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TeardownReason {
+    /// [`LoginConfig::max_lifetime`](crate::LoginConfig::max_lifetime) exceeded.
+    MaxLifetime,
+    /// [`LoginConfig::idle_timeout`](crate::LoginConfig::idle_timeout) exceeded.
+    IdleTimeout,
+    /// Session timestamps too far in the future — corrupt or forged.
+    ClockSkew,
+    /// The authorization server conclusively rejected the refresh token
+    /// (e.g. `invalid_grant`).
+    RefreshRejected,
+    /// Token refresh failed transiently, but the access token had already
+    /// expired — there is nothing valid left to serve.
+    RefreshUnavailable,
+    /// The access token expired and the session holds no refresh token.
+    NoRefreshToken,
+}
+
+impl TeardownReason {
+    /// Returns a `&'static str` suitable for use as a Prometheus label value.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MaxLifetime => "max_lifetime",
+            Self::IdleTimeout => "idle_timeout",
+            Self::ClockSkew => "clock_skew",
+            Self::RefreshRejected => "refresh_rejected",
+            Self::RefreshUnavailable => "refresh_unavailable",
+            Self::NoRefreshToken => "no_refresh_token",
+        }
+    }
+}
+
+/// Persistence owed to the session store after the inner service responds.
+///
+/// The steady state owes nothing — that is [`LoadedSession::Active`] — so
+/// this only appears on [`LoadedSession::ActivePending`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionPersistence {
-    /// The token was refreshed — call save.
+    /// The session has unpersisted changes — call save.
+    ///
+    /// The engine persists refreshed sessions eagerly inside
+    /// [`LoginEngine::load_session`], so `Save` only appears when that
+    /// eager persist failed: the post-response persist call (and its
+    /// [`PersistFailurePolicy`]) serves as the retry.
     Save,
-    /// Just record activity — call touch.
+    /// Record activity — call touch.
     Touch,
-    /// No persistence needed for this request — the activity update was
-    /// throttled by [`LoginConfig::touch_min_interval`]. The framework adapter
-    /// can skip the post-response persist call.
-    Skip,
 }
 
 /// Decides how a framework adapter should react when persisting the session
@@ -118,7 +292,7 @@ pub trait PersistFailurePolicy: MaybeSendSync + 'static {
     ///
     /// Returning `Some(response)` replaces the inner handler's response; `None`
     /// lets it pass through unchanged. `persistence` indicates which operation
-    /// failed (save/touch/skip); `error` is the underlying store error.
+    /// failed (save/touch); `error` is the underlying store error.
     fn handle(
         &self,
         persistence: SessionPersistence,
@@ -127,11 +301,12 @@ pub trait PersistFailurePolicy: MaybeSendSync + 'static {
 }
 
 /// Default policy: fail closed on [`SessionPersistence::Save`] (token refresh)
-/// and fail open on [`SessionPersistence::Touch`] / [`SessionPersistence::Skip`].
+/// and fail open on [`SessionPersistence::Touch`].
 ///
-/// `Save` is the path where the engine refreshed the access token; if the
-/// handler response is allowed through without persisting the new tokens the
-/// client is stranded on stale state — and with refresh-token rotation, often
+/// `Save` is the path where the engine refreshed the access token but the
+/// eager persist inside [`LoginEngine::load_session`] failed; if the handler
+/// response is allowed through without persisting the new tokens the client
+/// is stranded on stale state — and with refresh-token rotation, often
 /// locked out entirely. A 503 forces a clean retry.
 ///
 /// `Touch` only updates the session's last-active timestamp. Losing one is
@@ -145,12 +320,12 @@ impl PersistFailurePolicy for DefaultPersistFailurePolicy {
         _error: &dyn std::error::Error,
     ) -> Option<LoginResponse> {
         match persistence {
-            SessionPersistence::Save => Some(LoginResponse {
+            SessionPersistence::Save => Some(LoginResponse::Rendered {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 headers: Vec::new(),
                 body: Bytes::new(),
             }),
-            SessionPersistence::Touch | SessionPersistence::Skip => None,
+            SessionPersistence::Touch => None,
         }
     }
 }
@@ -187,10 +362,13 @@ fn unix_epoch() -> SystemTime {
 ///
 /// See the [module documentation](self) for the set of primitives this
 /// engine exposes; framework adapters compose them into middleware.
+#[non_exhaustive]
 pub struct LoginEngine<SD> {
-    config: LoginConfig,
+    /// The login configuration.
+    pub config: LoginConfig,
     grant: AuthorizationCodeGrant,
-    session_store: SD,
+    /// The session store.
+    pub session_store: SD,
     cipher: SessionCipher,
     error_page: Box<dyn ErrorPage>,
     metrics: Option<Arc<dyn LoginEngineMetrics>>,
@@ -225,6 +403,11 @@ where
         /// Optional metrics observer for login-flow events.
         metrics: Option<Arc<dyn LoginEngineMetrics>>,
     ) -> Self {
+        // Single source of truth for cookie security: stamp the store with the
+        // value derived from `base_url`, so session cookies and login-state
+        // cookies share one `secure`/`__Host-` policy.
+        let mut session_store = session_store;
+        session_store.apply_cookie_secure(config.secure);
         Self {
             config,
             grant,
@@ -236,29 +419,18 @@ where
     }
 }
 
-// ── Accessors (no trait bounds needed) ────────────────────────────────────────
-
-impl<SD> LoginEngine<SD> {
-    /// Returns a reference to the login configuration.
-    pub fn config(&self) -> &LoginConfig {
-        &self.config
-    }
-
-    /// Returns a reference to the session store.
-    pub fn session_store(&self) -> &SD {
-        &self.session_store
-    }
-}
-
 // ── Core logic ────────────────────────────────────────────────────────────────
 
 impl<SD> LoginEngine<SD>
 where
     SD: SessionDriver,
 {
-    /// If `path` is the configured callback or logout path, returns the
-    /// corresponding response. Otherwise returns `None` and the framework
-    /// adapter should fall through to the next layer.
+    /// If the request URI's path is the configured callback or logout path,
+    /// returns the corresponding response. Otherwise returns `None` and the
+    /// framework adapter should fall through to the next layer.
+    ///
+    /// The path is taken from `uri` — pass the same engine-side URI the
+    /// request arrived with (including any front-proxy `strip_prefix`).
     ///
     /// The callback only accepts `GET` — the authorization server delivers the
     /// response as a query-string redirect (top-level navigation). Logout
@@ -267,27 +439,24 @@ where
     /// falling through, since the paths are reserved for the engine.
     pub async fn try_handle_login_route(
         &self,
-        path: &str,
         method: &Method,
         headers: &HeaderMap,
         uri: &Uri,
     ) -> Option<LoginResponse> {
+        let path = uri.path();
         if path == self.config.callback_path {
             if *method != Method::GET {
                 return Some(self.method_not_allowed("GET"));
             }
             return Some(self.handle_callback(uri, headers).await);
         }
-        if self
-            .config
-            .logout_path
-            .as_deref()
-            .is_some_and(|p| path == p)
+        if let Some(logout) = &self.config.logout
+            && path == logout.path
         {
             if *method != Method::GET && *method != Method::POST {
                 return Some(self.method_not_allowed("GET, POST"));
             }
-            return Some(self.handle_logout(headers).await);
+            return Some(self.handle_logout(logout, headers).await);
         }
         None
     }
@@ -297,8 +466,7 @@ where
     fn method_not_allowed(&self, allow: &'static str) -> LoginResponse {
         let mut resp =
             self.build_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
-        resp.headers
-            .push((header::ALLOW, HeaderValue::from_static(allow)));
+        resp.push_rendered_header(header::ALLOW, HeaderValue::from_static(allow));
         resp
     }
 
@@ -309,6 +477,20 @@ where
     /// decides what to do when no session is present (a downstream gate may
     /// call [`redirect_to_login`](Self::redirect_to_login), or the request
     /// may simply proceed unauthenticated).
+    ///
+    /// # Eager persistence after refresh
+    ///
+    /// A successful token refresh is persisted *here*, before this method
+    /// returns, rather than deferred to the adapter's post-response
+    /// [`persist_session`](Self::persist_session) call — with refresh-token
+    /// rotation, a deferred save that never runs (the adapter skips the
+    /// persist phase, the connection drops, the handler panics) would strand
+    /// the rotated token and lock the session out. The session is then
+    /// returned as [`LoadedSession::Active`] with the re-sealed session
+    /// cookies in its `set_cookies`. If the eager persist fails, the session
+    /// is returned as [`LoadedSession::ActivePending`] with
+    /// [`SessionPersistence::Save`] so the post-response persist (and its
+    /// [`PersistFailurePolicy`]) acts as the retry.
     ///
     /// # Concurrent refresh and refresh-token rotation
     ///
@@ -328,11 +510,12 @@ where
     ///   family and log the user out).
     ///
     /// The race window is the length of the read → exchange → save-back
-    /// workflow. Note that the save-back happens via
-    /// [`persist_session`](Self::persist_session) *after* the inner handler
-    /// has responded, so the window includes the handler's own latency — size
-    /// the grace period against the slowest endpoints behind the session
-    /// middleware, not the token-exchange round trip.
+    /// workflow. The save-back happens eagerly inside this method (see
+    /// above), so the window is roughly the token-exchange round trip plus
+    /// the store write — the inner handler's latency is not part of it.
+    /// Only when the eager persist fails does the save-back fall to
+    /// [`persist_session`](Self::persist_session) after the handler has
+    /// responded.
     ///
     /// Without both, occasional concurrent refreshes will lose the race and
     /// surface as [`RefreshResult::Failed`] teardowns — most visibly with
@@ -351,32 +534,23 @@ where
         &self,
         headers: &HeaderMap,
     ) -> Result<LoadedSession<SD::SessionType>, SessionError> {
-        let Some(mut session) = self.session_store.load(headers).await? else {
-            return Ok(LoadedSession {
-                session: None,
-                clear_cookies: vec![],
-            });
+        let Some(session) = self.session_store.load(headers).await? else {
+            return Ok(LoadedSession::Missing);
         };
 
         let now = SystemTime::now();
 
-        if self.session_is_expired(&session, now) {
-            let clear_cookies = self.delete_best_effort(&session, headers).await;
-            return Ok(LoadedSession {
-                session: None,
-                clear_cookies,
-            });
+        if let Some(reason) = self.session_teardown_reason(&session, now) {
+            let clears = self.delete_best_effort(&session, headers).await;
+            self.record_teardown(reason);
+            return Ok(LoadedSession::Cleared { reason, clears });
         }
 
         if now + self.config.token_refresh_margin >= session.token_expiry() {
             return Ok(self.refresh_or_clear(session, headers).await);
         }
 
-        let persistence = self.touch_or_skip(&mut session, now);
-        Ok(LoadedSession {
-            session: Some((session, persistence)),
-            clear_cookies: vec![],
-        })
+        Ok(self.touch_or_skip(session, now))
     }
 
     /// Produces a response that asks the client to authenticate.
@@ -408,26 +582,31 @@ where
         }
     }
 
-    /// Returns `true` when the session should be torn down rather than served:
-    /// clock-skew corruption, absolute lifetime exceeded, or idle past timeout.
-    fn session_is_expired(&self, session: &SD::SessionType, now: SystemTime) -> bool {
+    /// Returns the reason the session should be torn down rather than served
+    /// — clock-skew corruption, absolute lifetime exceeded, or idle past
+    /// timeout — or `None` when the session is still good.
+    fn session_teardown_reason(
+        &self,
+        session: &SD::SessionType,
+        now: SystemTime,
+    ) -> Option<TeardownReason> {
         if is_too_far_future(session.created_at(), now)
             || is_too_far_future(session.last_active(), now)
         {
             log::warn!("session timestamps are too far in the future — treating as expired");
-            return true;
+            return Some(TeardownReason::ClockSkew);
         }
         if let Some(max_lifetime) = self.config.max_lifetime
             && elapsed_since(session.created_at(), now) > max_lifetime
         {
-            return true;
+            return Some(TeardownReason::MaxLifetime);
         }
         if let Some(idle_timeout) = self.config.idle_timeout
             && elapsed_since(session.last_active(), now) > idle_timeout
         {
-            return true;
+            return Some(TeardownReason::IdleTimeout);
         }
-        false
+        None
     }
 
     /// Token (or refresh window) elapsed — exchange the refresh token, or
@@ -446,20 +625,38 @@ where
         headers: &HeaderMap,
     ) -> LoadedSession<SD::SessionType> {
         let Some(rt) = session.refresh_token().cloned() else {
-            let clear_cookies = self.delete_best_effort(&session, headers).await;
+            let clears = self.delete_best_effort(&session, headers).await;
             self.record_refresh(&RefreshResult::NoRefreshToken);
-            return LoadedSession {
-                session: None,
-                clear_cookies,
-            };
+            let reason = TeardownReason::NoRefreshToken;
+            self.record_teardown(reason);
+            return LoadedSession::Cleared { reason, clears };
         };
         match self.refresh_with_retry(&rt).await {
             Ok(token_response) => {
                 session.apply_refresh(&token_response, self.config.default_token_lifetime);
                 self.record_refresh(&RefreshResult::Ok);
-                LoadedSession {
-                    session: Some((session, SessionPersistence::Save)),
-                    clear_cookies: vec![],
+                // Persist eagerly rather than waiting for the adapter's
+                // post-response phase: with refresh-token rotation, a later
+                // phase that is skipped or fails would strand the rotated
+                // token and lock the session out. On failure, fall back to
+                // a pending `Save` so the adapter's persist step (and its
+                // `PersistFailurePolicy`) gets a second attempt.
+                match self.session_store.save(&session, headers).await {
+                    Ok(set_cookies) => LoadedSession::Active {
+                        session,
+                        set_cookies,
+                    },
+                    Err(e) => {
+                        log::warn!(
+                            "failed to eagerly persist refreshed session; deferring to \
+                             post-response persist: {}",
+                            error_chain(&*e)
+                        );
+                        LoadedSession::ActivePending {
+                            session,
+                            persistence: SessionPersistence::Save,
+                        }
+                    }
                 }
             }
             // Re-read the clock: the retry loop slept, and the token may have
@@ -471,20 +668,19 @@ where
                     error_chain(&e)
                 );
                 self.record_refresh(&RefreshResult::FailedRetained);
-                let persistence = self.touch_or_skip(&mut session, SystemTime::now());
-                LoadedSession {
-                    session: Some((session, persistence)),
-                    clear_cookies: vec![],
-                }
+                self.touch_or_skip(session, SystemTime::now())
             }
             Err(e) => {
                 log::error!("token refresh failed: {}", error_chain(&e));
-                let clear_cookies = self.delete_best_effort(&session, headers).await;
+                let reason = if e.is_retryable() {
+                    TeardownReason::RefreshUnavailable
+                } else {
+                    TeardownReason::RefreshRejected
+                };
+                let clears = self.delete_best_effort(&session, headers).await;
                 self.record_refresh(&RefreshResult::Failed);
-                LoadedSession {
-                    session: None,
-                    clear_cookies,
-                }
+                self.record_teardown(reason);
+                LoadedSession::Cleared { reason, clears }
             }
         }
     }
@@ -537,16 +733,27 @@ where
         }
     }
 
-    /// Decides whether this request should record activity (subject to
-    /// `touch_min_interval` throttling) or skip persistence entirely.
-    fn touch_or_skip(&self, session: &mut SD::SessionType, now: SystemTime) -> SessionPersistence {
+    /// Records activity (subject to `touch_min_interval` throttling) and
+    /// wraps the session in the matching state: an elapsed interval owes the
+    /// store a touch, a throttled request owes nothing.
+    fn touch_or_skip(
+        &self,
+        mut session: SD::SessionType,
+        now: SystemTime,
+    ) -> LoadedSession<SD::SessionType> {
         if elapsed_since(session.last_active(), now) >= self.config.touch_min_interval {
             session.record_activity();
             self.record_activity(&ActivityOutcome::Touch);
-            SessionPersistence::Touch
+            LoadedSession::ActivePending {
+                session,
+                persistence: SessionPersistence::Touch,
+            }
         } else {
             self.record_activity(&ActivityOutcome::Skip);
-            SessionPersistence::Skip
+            LoadedSession::Active {
+                session,
+                set_cookies: vec![],
+            }
         }
     }
 
@@ -574,7 +781,14 @@ where
         }
     }
 
-    /// Persists a session after the inner service has responded.
+    fn record_teardown(&self, reason: TeardownReason) {
+        if let Some(m) = &self.metrics {
+            m.record_teardown(&reason);
+        }
+    }
+
+    /// Settles the persistence owed by a [`LoadedSession::ActivePending`]
+    /// after the inner service has responded.
     ///
     /// Returns `Set-Cookie` header values to append to the response.
     ///
@@ -595,7 +809,6 @@ where
         match persistence {
             SessionPersistence::Save => self.session_store.save(session, request_headers).await,
             SessionPersistence::Touch => self.session_store.touch(session, request_headers).await,
-            SessionPersistence::Skip => Ok(vec![]),
         }
     }
 
@@ -656,7 +869,7 @@ where
 
     fn build_error_response(&self, status: StatusCode, message: &str) -> LoginResponse {
         let rendered = self.error_page.render(status, message);
-        LoginResponse {
+        LoginResponse::Rendered {
             status,
             headers: vec![
                 (

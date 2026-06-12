@@ -2,8 +2,7 @@
 //! the session.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
+use http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use huskarl::{
     core::{crypto::cipher::AeadUnsealer as _, platform::SystemTime},
     grant::authorization_code::CompleteInput,
@@ -17,6 +16,7 @@ use crate::{
         cookie_attrs, decode_payload, get_cookie, is_valid_oauth_state, login_state_cookie_name,
     },
     metrics::{LoginCompleteResult, normalize_as_error},
+    url::base_url_as_string,
 };
 
 impl<SD> LoginEngine<SD>
@@ -126,29 +126,28 @@ where
     /// Assembles the 302 response that sends the user back to their original
     /// URL: `Location`, the login-state cookie clear, and the session cookies
     /// the driver minted on `create`.
+    ///
+    /// `original_url` was reconstructed from `base_url` plus the request path
+    /// and resealed in our own login-state cookie, so it is virtually always a
+    /// valid header value; should it somehow not be, the redirect falls back
+    /// to `base_url` rather than emitting a `Location`-less 302.
     fn build_callback_redirect(
         &self,
         original_url: &str,
         cookie_name: &str,
         session_cookies: Vec<HeaderValue>,
     ) -> LoginResponse {
-        let mut resp_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
-        if let Ok(v) = HeaderValue::from_str(original_url) {
-            resp_headers.push((header::LOCATION, v));
-        }
-        // The 302 carries session-bearing Set-Cookie headers; tell upstream
-        // caches not to retain it (RFC 6749 §5.1).
-        resp_headers.push((header::CACHE_CONTROL, HeaderValue::from_static("no-store")));
+        let location = HeaderValue::from_str(original_url)
+            .or_else(|_| HeaderValue::from_str(&base_url_as_string(&self.config)))
+            .unwrap_or_else(|_| HeaderValue::from_static("/"));
+        let mut set_cookies = Vec::with_capacity(session_cookies.len() + 1);
         if let Some(v) = self.clear_login_state_cookie(cookie_name) {
-            resp_headers.push((header::SET_COOKIE, v));
+            set_cookies.push(v);
         }
-        for c in session_cookies {
-            resp_headers.push((header::SET_COOKIE, c));
-        }
-        LoginResponse {
-            status: StatusCode::FOUND,
-            headers: resp_headers,
-            body: Bytes::new(),
+        set_cookies.extend(session_cookies);
+        LoginResponse::Redirect {
+            location,
+            set_cookies,
         }
     }
 
@@ -198,7 +197,7 @@ where
     fn callback_error(&self, status: StatusCode, message: &str, cookie_name: &str) -> LoginResponse {
         let mut resp = self.build_error_response(status, message);
         if let Some(v) = self.clear_login_state_cookie(cookie_name) {
-            resp.headers.push((header::SET_COOKIE, v));
+            resp.push_rendered_header(header::SET_COOKIE, v);
         }
         resp
     }

@@ -64,6 +64,19 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// The error type returned by [`load`](Self::load).
     type LoadError: std::error::Error + MaybeSendSync + 'static;
 
+    /// Stamp the deployment's cookie-security policy onto this driver.
+    ///
+    /// Called once by [`LoginEngine`](crate::engine::LoginEngine) at
+    /// construction, with the value derived from
+    /// [`LoginConfig::base_url`](crate::LoginConfig::base_url) (`true` for an
+    /// `https` scheme). The built-in cookie stores use it to finalize their
+    /// session-cookie naming (`__Host-`/`__Secure-` prefix) and the `Secure`
+    /// attribute, so the session cookies match the login-state cookies the
+    /// engine issues — there is no separate `secure` knob to keep in sync.
+    ///
+    /// Sealed: implemented only by this crate's built-in stores.
+    fn apply_cookie_secure(&mut self, secure: bool);
+
     /// Create a new session from a completed login.
     ///
     /// The driver's attached [`SessionEnricher`](crate::SessionEnricher)

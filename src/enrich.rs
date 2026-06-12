@@ -145,7 +145,6 @@ use crate::{completed_login::CompletedLogin, session::SessionError};
 /// let store = CookieSessionStore::<MySession>::builder()
 ///     .cipher(cipher)
 ///     .cookie_name("session")
-///     .secure(true)
 ///     .cookie_path("/")
 ///     .build_with_enricher(UserInfoEnricher {
 ///         http_client,

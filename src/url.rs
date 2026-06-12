@@ -128,7 +128,7 @@ mod tests {
 
     fn make_config_with_strip(base_url: &str, strip: &str) -> LoginConfig {
         LoginConfig::builder()
-            .callback_path("/callback".into())
+            .callback_path(format!("{strip}/callback"))
             .scopes(vec![])
             .base_url(base_url.parse().unwrap())
             .strip_prefix(strip)

@@ -144,12 +144,19 @@ impl From<SessionState> for CookieSession {
 /// - Chunk value: raw base64 of the sealed payload, split across chunks
 /// - Attributes: `HttpOnly; SameSite=Lax; Path={path}` plus optional `Secure`
 ///
-/// When `secure` is set and `cookie_path` is `"/"`, the configured name is
+/// The `Secure` attribute and cookie-name prefix follow the deployment's
+/// browser-facing scheme, which the engine derives from
+/// [`LoginConfig::base_url`](crate::LoginConfig::base_url) and stamps onto the
+/// store at construction (see
+/// [`SessionDriver::apply_cookie_secure`](crate::SessionDriver::apply_cookie_secure)).
+/// This store therefore takes no `secure` setting of its own — it cannot
+/// disagree with the login-state cookies the engine issues. When that derived
+/// value is secure and `cookie_path` is `"/"`, the configured name is
 /// automatically given the `__Host-` prefix (unless it already starts with
 /// `__Host-` or `__Secure-`). The prefix makes the browser reject the cookie
 /// if set by a sibling subdomain or over plain HTTP, blocking session
-/// fixation by cookie tossing. Note that enabling this on an existing
-/// deployment renames the cookie: in-flight sessions under the old name are
+/// fixation by cookie tossing. Note that switching a deployment from `http` to
+/// `https` renames the cookie: in-flight sessions under the old name are
 /// ignored and users re-login on their next navigation.
 ///
 /// On read, chunks are concatenated by walking `{name}.0`, `{name}.1`, … until
@@ -158,6 +165,11 @@ impl From<SessionState> for CookieSession {
 /// and triggers a fresh login.
 pub struct CookieSessionStore<C = CookieSession> {
     cipher: SessionCipher,
+    /// The configured cookie name, before any security prefix is applied.
+    /// Retained so [`apply_cookie_secure`](SessionDriver::apply_cookie_secure)
+    /// can recompute `cookie_name` once the engine supplies the deployment's
+    /// `secure` flag.
+    raw_cookie_name: String,
     cookie_name: String,
     secure: bool,
     cookie_path: String,
@@ -177,7 +189,6 @@ impl<C> CookieSessionStore<C> {
         #[builder(with = |cipher: impl AeadCipher + 'static| Arc::new(cipher) as Arc<dyn AeadCipher>)]
         cipher: Arc<dyn AeadCipher>,
         #[builder(into)] cookie_name: String,
-        secure: bool,
         #[builder(into)] cookie_path: String,
         /// Defaults to 400 days — finite but generous enough that the cookie
         /// never expires before the server-side session does. If `max_lifetime`
@@ -188,9 +199,16 @@ impl<C> CookieSessionStore<C> {
         /// Optional metrics observer for encrypt/decrypt events.
         metrics: Option<Arc<dyn SessionCookieMetrics>>,
     ) -> Self {
-        let cookie_name = session_cookie_name(cookie_name, secure, &cookie_path);
+        // `secure` is supplied by the engine via `apply_cookie_secure` once it
+        // knows the deployment's `base_url` scheme. Until then default to the
+        // safe choice (secure, `__Host-` prefix); the engine re-derives the
+        // cookie name when it stamps the real value.
+        let secure = true;
+        let raw_cookie_name = cookie_name;
+        let cookie_name = session_cookie_name(raw_cookie_name.clone(), secure, &cookie_path);
         Self {
             cipher: AeadV1Cipher::new(cipher),
+            raw_cookie_name,
             cookie_name,
             secure,
             cookie_path,
@@ -454,6 +472,11 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
     type SessionType = C;
     type LoadError = std::convert::Infallible;
 
+    fn apply_cookie_secure(&mut self, secure: bool) {
+        self.secure = secure;
+        self.cookie_name = session_cookie_name(self.raw_cookie_name.clone(), secure, &self.cookie_path);
+    }
+
     async fn create(
         &self,
         completed: CompletedLogin,
@@ -590,7 +613,6 @@ mod tests {
         CookieSessionStore::builder()
             .cipher(test_cipher().await)
             .cookie_name("huskarl_session")
-            .secure(true)
             .cookie_path("/")
             .build()
     }
@@ -709,7 +731,6 @@ mod tests {
         let store = CookieSessionStore::<CookieSession>::builder()
             .cipher(test_cipher_with_kid("arn:aws:kms:us-east-1:111:key/abc").await)
             .cookie_name("huskarl_session")
-            .secure(true)
             .cookie_path("/")
             .build();
         let session = CookieSession(test_state());
@@ -730,7 +751,6 @@ mod tests {
         let store = CookieSessionStore::<CookieSession>::builder()
             .cipher(test_cipher_with_kid("test-kid").await)
             .cookie_name("huskarl_session")
-            .secure(true)
             .cookie_path("/")
             .build();
         let session = CookieSession(test_state());
@@ -759,7 +779,6 @@ mod tests {
         let store = CookieSessionStore::<CookieSession>::builder()
             .cipher(test_cipher_with_kid("test-kid").await)
             .cookie_name("huskarl_session")
-            .secure(true)
             .cookie_path("/")
             .build();
         let session = CookieSession(test_state());
@@ -821,7 +840,6 @@ mod tests {
         CookieSessionStore::builder()
             .cipher(multi_key_cipher().await)
             .cookie_name("huskarl_session")
-            .secure(true)
             .cookie_path("/")
             .build()
     }
@@ -1072,7 +1090,6 @@ mod tests {
         let store = CookieSessionStore::<EnrichedSession>::builder()
             .cipher(test_cipher().await)
             .cookie_name("huskarl_session")
-            .secure(true)
             .cookie_path("/")
             .build_with_enricher(TestEnricher);
         assert_session_driver(&store);
@@ -1306,7 +1323,6 @@ mod tests {
         let s = CookieSessionStore::builder()
             .cipher(test_cipher().await)
             .cookie_name("huskarl_session")
-            .secure(true)
             .cookie_path("/")
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
@@ -1329,7 +1345,6 @@ mod tests {
         let store = CookieSessionStore::<CookieSession>::builder()
             .cipher(test_cipher_with_kid("v5").await)
             .cookie_name("huskarl_session")
-            .secure(true)
             .cookie_path("/")
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
@@ -1390,7 +1405,6 @@ mod tests {
         let store = CookieSessionStore::<CookieSession>::builder()
             .cipher(test_cipher_with_kid("v5").await)
             .cookie_name("huskarl_session")
-            .secure(true)
             .cookie_path("/")
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
@@ -1428,7 +1442,6 @@ mod tests {
         let store = CookieSessionStore::<CookieSession>::builder()
             .cipher(test_cipher_with_kid("v5").await)
             .cookie_name("huskarl_session")
-            .secure(true)
             .cookie_path("/")
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();

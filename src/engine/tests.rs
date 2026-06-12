@@ -25,11 +25,11 @@ use huskarl::{
 use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
 
 use super::{
-    LoginEngine, SessionPersistence, error_chain, is_cors_preflight, is_cross_site_request,
-    is_navigation_request,
+    LoadedSession, LoginEngine, SessionPersistence, TeardownReason, error_chain, is_cors_preflight,
+    is_cross_site_request, is_navigation_request,
 };
 use crate::{
-    CompletedLogin, LoginConfig, Session, SessionDriver, SessionError, SessionState,
+    CompletedLogin, LoginConfig, LogoutConfig, Session, SessionDriver, SessionError, SessionState,
     metrics::{
         ActivityOutcome, LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult,
     },
@@ -216,6 +216,48 @@ fn valid_session() -> MockSession {
     )
 }
 
+// ── LoadedSession assertion helpers ───────────────────────────────────────
+
+/// A short tag for failure messages in the `expect_*` helpers below.
+fn variant_name(loaded: &LoadedSession<MockSession>) -> &'static str {
+    match loaded {
+        LoadedSession::Missing => "Missing",
+        LoadedSession::Cleared { .. } => "Cleared",
+        LoadedSession::Active { .. } => "Active",
+        LoadedSession::ActivePending { .. } => "ActivePending",
+    }
+}
+
+/// Unwraps [`LoadedSession::Active`] into the session and its cookies.
+fn expect_active(loaded: LoadedSession<MockSession>) -> (MockSession, Vec<HeaderValue>) {
+    match loaded {
+        LoadedSession::Active {
+            session,
+            set_cookies,
+        } => (session, set_cookies),
+        other => unreachable!("expected Active, got {}", variant_name(&other)),
+    }
+}
+
+/// Unwraps [`LoadedSession::ActivePending`] into the session and owed persistence.
+fn expect_pending(loaded: LoadedSession<MockSession>) -> (MockSession, SessionPersistence) {
+    match loaded {
+        LoadedSession::ActivePending {
+            session,
+            persistence,
+        } => (session, persistence),
+        other => unreachable!("expected ActivePending, got {}", variant_name(&other)),
+    }
+}
+
+/// Unwraps [`LoadedSession::Cleared`] into the teardown reason and clears.
+fn expect_cleared(loaded: LoadedSession<MockSession>) -> (TeardownReason, Vec<HeaderValue>) {
+    match loaded {
+        LoadedSession::Cleared { reason, clears } => (reason, clears),
+        other => unreachable!("expected Cleared, got {}", variant_name(&other)),
+    }
+}
+
 // ── MockSessionStore ──────────────────────────────────────────────────────
 
 struct MockSessionStore {
@@ -223,7 +265,16 @@ struct MockSessionStore {
     save_called: Mutex<bool>,
     touch_called: Mutex<bool>,
     delete_called: Mutex<bool>,
+    fail_save: bool,
+    /// Records the value the engine stamps via
+    /// [`SessionDriver::apply_cookie_secure`], so a test can assert the
+    /// deployment cookie-security policy reaches the store.
+    applied_secure: Mutex<Option<bool>>,
 }
+
+/// The `Set-Cookie` value [`MockSessionStore::save`] returns, so tests can
+/// assert that save's cookies propagate to the response.
+const MOCK_SAVE_COOKIE: &str = "mock-save=1";
 
 impl MockSessionStore {
     fn with_session(s: MockSession) -> Self {
@@ -232,6 +283,14 @@ impl MockSessionStore {
             save_called: Mutex::new(false),
             touch_called: Mutex::new(false),
             delete_called: Mutex::new(false),
+            fail_save: false,
+            applied_secure: Mutex::new(None),
+        }
+    }
+    fn with_session_failing_save(s: MockSession) -> Self {
+        Self {
+            fail_save: true,
+            ..Self::with_session(s)
         }
     }
     fn empty() -> Self {
@@ -240,6 +299,8 @@ impl MockSessionStore {
             save_called: Mutex::new(false),
             touch_called: Mutex::new(false),
             delete_called: Mutex::new(false),
+            fail_save: false,
+            applied_secure: Mutex::new(None),
         }
     }
     fn save_called(&self) -> bool {
@@ -251,6 +312,9 @@ impl MockSessionStore {
     fn delete_called(&self) -> bool {
         *self.delete_called.lock().unwrap()
     }
+    fn applied_secure(&self) -> Option<bool> {
+        *self.applied_secure.lock().unwrap()
+    }
 }
 
 impl Sealed for MockSessionStore {}
@@ -258,6 +322,10 @@ impl Sealed for MockSessionStore {}
 impl SessionDriver for MockSessionStore {
     type SessionType = MockSession;
     type LoadError = Infallible;
+
+    fn apply_cookie_secure(&mut self, secure: bool) {
+        *self.applied_secure.lock().unwrap() = Some(secure);
+    }
 
     async fn create(
         &self,
@@ -276,8 +344,11 @@ impl SessionDriver for MockSessionStore {
         Ok(self.session.lock().unwrap().take())
     }
     async fn save(&self, _: &MockSession, _: &HeaderMap) -> Result<Vec<HeaderValue>, SessionError> {
+        if self.fail_save {
+            return Err(Box::new(StoreSaveError));
+        }
         *self.save_called.lock().unwrap() = true;
-        Ok(vec![])
+        Ok(vec![HeaderValue::from_static(MOCK_SAVE_COOKIE)])
     }
     async fn touch(
         &self,
@@ -297,6 +368,17 @@ impl SessionDriver for MockSessionStore {
     }
 }
 
+/// Error returned by [`MockSessionStore::save`] when constructed via
+/// [`MockSessionStore::with_session_failing_save`].
+#[derive(Debug)]
+struct StoreSaveError;
+impl std::fmt::Display for StoreSaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("store save error")
+    }
+}
+impl std::error::Error for StoreSaveError {}
+
 // ── ErrorSessionStore — load always fails ─────────────────────────────────
 
 #[derive(Debug)]
@@ -313,6 +395,8 @@ impl Sealed for ErrorSessionStore {}
 impl SessionDriver for ErrorSessionStore {
     type SessionType = MockSession;
     type LoadError = StoreLoadError;
+
+    fn apply_cookie_secure(&mut self, _secure: bool) {}
 
     async fn create(
         &self,
@@ -360,7 +444,7 @@ fn config_with_logout() -> LoginConfig {
         .callback_path("/callback".to_owned())
         .scopes(vec![])
         .base_url("https://app.example.com".parse().unwrap())
-        .logout_path("/logout".to_owned())
+        .logout(LogoutConfig::builder().path("/logout").build())
         .build()
         .unwrap()
 }
@@ -379,6 +463,26 @@ async fn engine_with_config(
         .session_store(store)
         .cipher(test_cipher().await)
         .build()
+}
+
+#[tokio::test]
+async fn engine_stamps_store_secure_from_https_base_url() {
+    // default_config uses an https base_url, so the engine must stamp the
+    // store with the secure policy at construction.
+    let e = engine(MockSessionStore::empty()).await;
+    assert_eq!(e.session_store.applied_secure(), Some(true));
+}
+
+#[tokio::test]
+async fn engine_stamps_store_insecure_from_http_base_url() {
+    let http_config = LoginConfig::builder()
+        .callback_path("/callback".to_owned())
+        .scopes(vec![])
+        .base_url("http://localhost:6188".parse().unwrap())
+        .build()
+        .unwrap();
+    let e = engine_with_config(MockSessionStore::empty(), http_config).await;
+    assert_eq!(e.session_store.applied_secure(), Some(false));
 }
 
 // ── Header / URI helpers ──────────────────────────────────────────────────
@@ -603,7 +707,7 @@ async fn callback_path_is_handled() {
     let e = engine(MockSessionStore::empty()).await;
     let uri = "/callback".parse().unwrap();
     let resp = e
-        .try_handle_login_route("/callback", &Method::GET, &HeaderMap::new(), &uri)
+        .try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
         .await;
     assert!(resp.is_some());
 }
@@ -613,7 +717,7 @@ async fn logout_path_is_handled_when_configured() {
     let e = engine_with_config(MockSessionStore::empty(), config_with_logout()).await;
     let uri = "/logout".parse().unwrap();
     let resp = e
-        .try_handle_login_route("/logout", &Method::GET, &HeaderMap::new(), &uri)
+        .try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
         .await;
     assert!(resp.is_some());
 }
@@ -624,12 +728,12 @@ async fn callback_rejects_non_get_methods() {
     let uri = "/callback".parse().unwrap();
     for method in [Method::POST, Method::PUT, Method::DELETE, Method::HEAD] {
         let resp = e
-            .try_handle_login_route("/callback", &method, &HeaderMap::new(), &uri)
+            .try_handle_login_route(&method, &HeaderMap::new(), &uri)
             .await
             .expect("reserved path must not fall through");
-        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
-        let allow = resp
-            .headers
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        let hdrs = resp.headers();
+        let allow = hdrs
             .iter()
             .find(|(n, _)| *n == http::header::ALLOW)
             .map(|(_, v)| v.to_str().unwrap());
@@ -642,10 +746,10 @@ async fn logout_accepts_post() {
     let e = engine_with_config(MockSessionStore::empty(), config_with_logout()).await;
     let uri = "/logout".parse().unwrap();
     let resp = e
-        .try_handle_login_route("/logout", &Method::POST, &HeaderMap::new(), &uri)
+        .try_handle_login_route(&Method::POST, &HeaderMap::new(), &uri)
         .await
         .expect("logout handles POST");
-    assert_eq!(resp.status, StatusCode::FOUND);
+    assert_eq!(resp.status(), StatusCode::FOUND);
 }
 
 #[tokio::test]
@@ -654,12 +758,12 @@ async fn logout_rejects_other_methods() {
     let uri = "/logout".parse().unwrap();
     for method in [Method::PUT, Method::DELETE, Method::HEAD] {
         let resp = e
-            .try_handle_login_route("/logout", &method, &HeaderMap::new(), &uri)
+            .try_handle_login_route(&method, &HeaderMap::new(), &uri)
             .await
             .expect("reserved path must not fall through");
-        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
-        let allow = resp
-            .headers
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        let hdrs = resp.headers();
+        let allow = hdrs
             .iter()
             .find(|(n, _)| *n == http::header::ALLOW)
             .map(|(_, v)| v.to_str().unwrap());
@@ -672,7 +776,7 @@ async fn logout_path_returns_none_when_unconfigured() {
     let e = engine(MockSessionStore::empty()).await;
     let uri = "/logout".parse().unwrap();
     let resp = e
-        .try_handle_login_route("/logout", &Method::GET, &HeaderMap::new(), &uri)
+        .try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
         .await;
     assert!(resp.is_none());
 }
@@ -695,9 +799,9 @@ async fn redirect_to_login_navigation_returns_302() {
     let e = engine(MockSessionStore::empty()).await;
     let uri = "/protected".parse().unwrap();
     let r = e.redirect_to_login(&nav_headers(), &uri).await;
-    assert_eq!(r.status, StatusCode::FOUND);
-    let loc = r
-        .headers
+    assert_eq!(r.status(), StatusCode::FOUND);
+    let hdrs = r.headers();
+    let loc = hdrs
         .iter()
         .find(|(n, _)| *n == http::header::LOCATION)
         .map(|(_, v)| v.to_str().unwrap())
@@ -714,10 +818,25 @@ async fn redirect_to_login_navigation_sets_login_state_cookie() {
     let e = engine(MockSessionStore::empty()).await;
     let uri = "/protected".parse().unwrap();
     let r = e.redirect_to_login(&nav_headers(), &uri).await;
-    let has_login_cookie = r.headers.iter().any(|(n, v)| {
+    let has_login_cookie = r.headers().iter().any(|(n, v)| {
         *n == http::header::SET_COOKIE && v.to_str().unwrap().contains("huskarl_login_")
     });
     assert!(has_login_cookie);
+}
+
+#[tokio::test]
+async fn redirect_to_login_navigation_is_no_store() {
+    // The redirect carries a session-bearing login-state cookie, so the
+    // boundary materializes `Cache-Control: no-store` for every redirect.
+    let e = engine(MockSessionStore::empty()).await;
+    let uri = "/protected".parse().unwrap();
+    let r = e.redirect_to_login(&nav_headers(), &uri).await;
+    let hdrs = r.headers();
+    let cache = hdrs
+        .iter()
+        .find(|(n, _)| *n == http::header::CACHE_CONTROL)
+        .map(|(_, v)| v.to_str().unwrap());
+    assert_eq!(cache, Some("no-store"));
 }
 
 #[tokio::test]
@@ -725,25 +844,24 @@ async fn redirect_to_login_api_returns_401() {
     let e = engine(MockSessionStore::empty()).await;
     let uri = "/api/data".parse().unwrap();
     let r = e.redirect_to_login(&api_headers(), &uri).await;
-    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
-async fn load_session_empty_store_returns_none() {
+async fn load_session_empty_store_returns_missing() {
     let e = engine(MockSessionStore::empty()).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    assert!(loaded.session.is_none());
-    assert!(loaded.clear_cookies.is_empty());
+    assert!(matches!(loaded, LoadedSession::Missing));
 }
 
 #[tokio::test]
-async fn load_session_valid_returns_skip_when_recently_active() {
-    // last_active is "now" — well within the default 1h touch_min_interval.
+async fn load_session_valid_returns_active_when_recently_active() {
+    // last_active is "now" — well within the default 1h touch_min_interval,
+    // so nothing is owed post-response.
     let e = engine(MockSessionStore::with_session(valid_session())).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (_session, persistence) = loaded.session.expect("session present");
-    assert!(matches!(persistence, SessionPersistence::Skip));
-    assert!(loaded.clear_cookies.is_empty());
+    let (_session, set_cookies) = expect_active(loaded);
+    assert!(set_cookies.is_empty());
 }
 
 #[tokio::test]
@@ -757,9 +875,8 @@ async fn load_session_valid_returns_touch_when_interval_elapsed() {
     );
     let e = engine(MockSessionStore::with_session(session)).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (_session, persistence) = loaded.session.expect("session present");
+    let (_session, persistence) = expect_pending(loaded);
     assert!(matches!(persistence, SessionPersistence::Touch));
-    assert!(loaded.clear_cookies.is_empty());
 }
 
 #[tokio::test]
@@ -774,8 +891,7 @@ async fn touch_min_interval_skips_recent_activity() {
         .unwrap();
     let e = engine_with_config(MockSessionStore::with_session(valid_session()), config).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (_, persistence) = loaded.session.expect("session present");
-    assert!(matches!(persistence, SessionPersistence::Skip));
+    assert!(matches!(loaded, LoadedSession::Active { .. }));
 }
 
 #[tokio::test]
@@ -796,12 +912,14 @@ async fn touch_min_interval_touches_after_interval_elapsed() {
         .unwrap();
     let e = engine_with_config(MockSessionStore::with_session(session), config).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (_, persistence) = loaded.session.expect("session present");
+    let (_, persistence) = expect_pending(loaded);
     assert!(matches!(persistence, SessionPersistence::Touch));
 }
 
 #[tokio::test]
-async fn persist_skip_calls_neither_save_nor_touch() {
+async fn active_session_owes_no_persistence() {
+    // A throttled activity update surfaces as `Active` — there is no persist
+    // call for the adapter to make, and the store saw no write during load.
     let config = LoginConfig::builder()
         .callback_path("/callback".to_owned())
         .scopes(vec![])
@@ -811,15 +929,10 @@ async fn persist_skip_calls_neither_save_nor_touch() {
         .unwrap();
     let e = engine_with_config(MockSessionStore::with_session(valid_session()), config).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (session, persistence) = loaded.session.expect("session present");
-    assert!(matches!(persistence, SessionPersistence::Skip));
-    let headers = e
-        .persist_session(&session, persistence, &api_headers())
-        .await
-        .unwrap();
-    assert!(headers.is_empty());
-    assert!(!e.session_store().save_called());
-    assert!(!e.session_store().touch_called());
+    let (_session, set_cookies) = expect_active(loaded);
+    assert!(set_cookies.is_empty());
+    assert!(!e.session_store.save_called());
+    assert!(!e.session_store.touch_called());
 }
 
 #[tokio::test]
@@ -834,8 +947,8 @@ async fn login_state_cookie_uses_configured_ttl() {
     let e = engine_with_config(MockSessionStore::empty(), config).await;
     let uri = "/protected".parse().unwrap();
     let r = e.redirect_to_login(&nav_headers(), &uri).await;
-    let cookie = r
-        .headers
+    let hdrs = r.headers();
+    let cookie = hdrs
         .iter()
         .find(|(n, v)| {
             *n == http::header::SET_COOKIE && v.to_str().unwrap().contains("huskarl_login_")
@@ -867,7 +980,7 @@ fn nav_headers_with_login_cookies(cookies: &[(String, String)]) -> HeaderMap {
 
 /// Names of the login-state cookies the response clears via `Max-Age=0`.
 fn cleared_login_cookies(r: &super::LoginResponse) -> Vec<String> {
-    r.headers
+    r.headers()
         .iter()
         .filter(|(n, _)| *n == http::header::SET_COOKIE)
         .filter_map(|(_, v)| {
@@ -894,7 +1007,7 @@ async fn redirect_under_cap_clears_no_login_cookies() {
     let r = e
         .redirect_to_login(&nav_headers_with_login_cookies(&cookies), &uri)
         .await;
-    assert_eq!(r.status, StatusCode::FOUND);
+    assert_eq!(r.status(), StatusCode::FOUND);
     assert!(cleared_login_cookies(&r).is_empty());
 }
 
@@ -916,7 +1029,7 @@ async fn redirect_over_cap_evicts_oldest_flow() {
     let r = e
         .redirect_to_login(&nav_headers_with_login_cookies(&cookies), &uri)
         .await;
-    assert_eq!(r.status, StatusCode::FOUND);
+    assert_eq!(r.status(), StatusCode::FOUND);
     assert_eq!(cleared_login_cookies(&r), vec![login_cookie_name("s1")]);
 }
 
@@ -954,11 +1067,21 @@ async fn redirect_respects_configured_cap() {
     let cookies = vec![
         (
             login_cookie_name("old"),
-            seal_login_cookie_at("old", "https://app.example.com/a", now - Duration::from_mins(2)).await,
+            seal_login_cookie_at(
+                "old",
+                "https://app.example.com/a",
+                now - Duration::from_mins(2),
+            )
+            .await,
         ),
         (
             login_cookie_name("new"),
-            seal_login_cookie_at("new", "https://app.example.com/b", now - Duration::from_mins(1)).await,
+            seal_login_cookie_at(
+                "new",
+                "https://app.example.com/b",
+                now - Duration::from_mins(1),
+            )
+            .await,
         ),
     ];
     let uri = "/protected".parse().unwrap();
@@ -980,11 +1103,11 @@ async fn callback_expired_login_state_returns_400_and_clears_cookie() {
     let h = headers_with_login_cookie(state, &value);
     let uri = format!("/callback?code=abc&state={state}").parse().unwrap();
     let r = e
-        .try_handle_login_route("/callback", &Method::GET, &h, &uri)
+        .try_handle_login_route(&Method::GET, &h, &uri)
         .await
         .expect("callback handled");
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
-    let cleared = r.headers.iter().any(|(n, v)| {
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let cleared = r.headers().iter().any(|(n, v)| {
         *n == http::header::SET_COOKIE && {
             let s = v.to_str().unwrap();
             s.starts_with(&format!("{}=;", login_cookie_name(state))) && s.contains("Max-Age=0")
@@ -1024,10 +1147,10 @@ async fn callback_pre_created_at_format_treated_as_expired() {
     let h = headers_with_login_cookie(state, &value);
     let uri = format!("/callback?code=abc&state={state}").parse().unwrap();
     let r = e
-        .try_handle_login_route("/callback", &Method::GET, &h, &uri)
+        .try_handle_login_route(&Method::GET, &h, &uri)
         .await
         .expect("callback handled");
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1047,8 +1170,9 @@ async fn max_lifetime_expired_clears_session() {
         .unwrap();
     let e = engine_with_config(MockSessionStore::with_session(session), config).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    assert!(loaded.session.is_none());
-    assert!(e.session_store().delete_called());
+    let (reason, _) = expect_cleared(loaded);
+    assert_eq!(reason, TeardownReason::MaxLifetime);
+    assert!(e.session_store.delete_called());
 }
 
 #[tokio::test]
@@ -1069,8 +1193,9 @@ async fn idle_timeout_expired_clears_session() {
     let store = MockSessionStore::with_session(session);
     let e = engine_with_config(store, config).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    assert!(loaded.session.is_none());
-    assert!(e.session_store().delete_called());
+    let (reason, _) = expect_cleared(loaded);
+    assert_eq!(reason, TeardownReason::IdleTimeout);
+    assert!(e.session_store.delete_called());
 }
 
 #[tokio::test]
@@ -1084,8 +1209,9 @@ async fn token_expired_no_refresh_token_clears_session() {
     let store = MockSessionStore::with_session(session);
     let e = engine(store).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    assert!(loaded.session.is_none());
-    assert!(e.session_store().delete_called());
+    let (reason, _) = expect_cleared(loaded);
+    assert_eq!(reason, TeardownReason::NoRefreshToken);
+    assert!(e.session_store.delete_called());
 }
 
 #[tokio::test]
@@ -1100,8 +1226,12 @@ async fn token_expired_refresh_fails_clears_session() {
     let store = MockSessionStore::with_session(session);
     let e = engine(store).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    assert!(loaded.session.is_none());
-    assert!(e.session_store().delete_called());
+    let (reason, _) = expect_cleared(loaded);
+    assert!(matches!(
+        reason,
+        TeardownReason::RefreshRejected | TeardownReason::RefreshUnavailable
+    ));
+    assert!(e.session_store.delete_called());
 }
 
 // ── Refresh retry ─────────────────────────────────────────────────────────
@@ -1156,7 +1286,7 @@ async fn refresh_does_not_retry_when_error_is_non_retryable() {
 }
 
 #[tokio::test]
-async fn refresh_success_returns_save_persistence() {
+async fn refresh_success_persists_eagerly() {
     let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
     let e = LoginEngine::builder()
         .config(default_config())
@@ -1165,11 +1295,36 @@ async fn refresh_success_returns_save_persistence() {
         .cipher(test_cipher().await)
         .build();
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (session, persistence) = loaded.session.expect("session refreshed");
-    assert_eq!(persistence, SessionPersistence::Save);
+    // The refreshed session was saved inside load_session — `Active`, with
+    // nothing left for the post-response persist phase.
+    let (session, set_cookies) = expect_active(loaded);
+    assert!(e.session_store.save_called());
     // The refresh response carried expires_in=3600 — expiry moved well past now.
     assert!(session.token_expiry() > SystemTime::now() + Duration::from_mins(30));
-    assert!(loaded.clear_cookies.is_empty());
+    // The eager save's Set-Cookie headers ride back on the loaded result.
+    assert_eq!(
+        set_cookies,
+        vec![HeaderValue::from_static(MOCK_SAVE_COOKIE)]
+    );
+}
+
+#[tokio::test]
+async fn refresh_success_with_failing_save_defers_persistence() {
+    // The refresh succeeded but the eager save didn't — the session (holding
+    // the rotated refresh token) must survive with `Save` persistence so the
+    // adapter's post-response persist acts as the retry.
+    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    let e = LoginEngine::builder()
+        .config(default_config())
+        .grant(test_grant(TokenHttp).await)
+        .session_store(MockSessionStore::with_session_failing_save(session))
+        .cipher(test_cipher().await)
+        .build();
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    let (session, persistence) = expect_pending(loaded);
+    assert_eq!(persistence, SessionPersistence::Save);
+    // The refresh itself was applied — only persistence is outstanding.
+    assert!(session.token_expiry() > SystemTime::now() + Duration::from_mins(30));
 }
 
 // ── Transient refresh failure inside the early-refresh window ─────────────
@@ -1181,11 +1336,11 @@ async fn transient_refresh_failure_with_valid_token_retains_session() {
     let session = refreshable_session(SystemTime::now() + Duration::from_secs(15));
     let (e, calls) = engine_with_failing_refresh(true, session).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (_, persistence) = loaded.session.expect("session retained");
-    // last_active is fresh, so the throttled activity update skips.
-    assert_eq!(persistence, SessionPersistence::Skip);
-    assert!(loaded.clear_cookies.is_empty());
-    assert!(!e.session_store().delete_called());
+    // last_active is fresh, so the throttled activity update owes nothing —
+    // the retained session comes back `Active`.
+    let (_session, set_cookies) = expect_active(loaded);
+    assert!(set_cookies.is_empty());
+    assert!(!e.session_store.delete_called());
     // The full retry budget was spent before falling back to retention.
     assert_eq!(calls.load(Ordering::SeqCst), super::REFRESH_MAX_ATTEMPTS);
 }
@@ -1198,8 +1353,9 @@ async fn non_retryable_refresh_failure_clears_session_even_with_valid_token() {
     let session = refreshable_session(SystemTime::now() + Duration::from_secs(15));
     let (e, _) = engine_with_failing_refresh(false, session).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    assert!(loaded.session.is_none());
-    assert!(e.session_store().delete_called());
+    let (reason, _) = expect_cleared(loaded);
+    assert_eq!(reason, TeardownReason::RefreshRejected);
+    assert!(e.session_store.delete_called());
 }
 
 #[tokio::test]
@@ -1209,8 +1365,9 @@ async fn transient_refresh_failure_with_expired_token_clears_session() {
     let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
     let (e, _) = engine_with_failing_refresh(true, session).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    assert!(loaded.session.is_none());
-    assert!(e.session_store().delete_called());
+    let (reason, _) = expect_cleared(loaded);
+    assert_eq!(reason, TeardownReason::RefreshUnavailable);
+    assert!(e.session_store.delete_called());
 }
 
 #[tokio::test]
@@ -1231,24 +1388,24 @@ async fn load_session_store_error_bubbles_up() {
 async fn persist_save_calls_store_save() {
     let e = engine(MockSessionStore::with_session(valid_session())).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (session, _) = loaded.session.expect("session present");
+    let (session, _) = expect_active(loaded);
     e.persist_session(&session, SessionPersistence::Save, &api_headers())
         .await
         .unwrap();
-    assert!(e.session_store().save_called());
-    assert!(!e.session_store().touch_called());
+    assert!(e.session_store.save_called());
+    assert!(!e.session_store.touch_called());
 }
 
 #[tokio::test]
 async fn persist_touch_calls_store_touch() {
     let e = engine(MockSessionStore::with_session(valid_session())).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (session, _) = loaded.session.expect("session present");
+    let (session, _) = expect_active(loaded);
     e.persist_session(&session, SessionPersistence::Touch, &api_headers())
         .await
         .unwrap();
-    assert!(e.session_store().touch_called());
-    assert!(!e.session_store().save_called());
+    assert!(e.session_store.touch_called());
+    assert!(!e.session_store.save_called());
 }
 
 // ── Callback handler ──────────────────────────────────────────────────────
@@ -1256,10 +1413,10 @@ async fn persist_touch_calls_store_touch() {
 async fn callback_status(path_and_query: &str, request_headers: &HeaderMap) -> StatusCode {
     let e = engine(MockSessionStore::empty()).await;
     let uri = path_and_query.parse().unwrap();
-    e.try_handle_login_route("/callback", &Method::GET, request_headers, &uri)
+    e.try_handle_login_route(&Method::GET, request_headers, &uri)
         .await
         .expect("callback handled")
-        .status
+        .status()
 }
 
 #[tokio::test]
@@ -1371,18 +1528,18 @@ async fn callback_success_redirects_to_original_url() {
         .parse()
         .unwrap();
     let r = e
-        .try_handle_login_route("/callback", &Method::GET, &h, &uri)
+        .try_handle_login_route(&Method::GET, &h, &uri)
         .await
         .expect("callback handled");
-    assert_eq!(r.status, StatusCode::FOUND);
-    let loc = r
-        .headers
+    assert_eq!(r.status(), StatusCode::FOUND);
+    let hdrs = r.headers();
+    let loc = hdrs
         .iter()
         .find(|(n, _)| *n == http::header::LOCATION)
         .map(|(_, v)| v.to_str().unwrap());
     assert_eq!(loc, Some("https://app.example.com/page"));
     // The login-state cookie is cleared on the way out.
-    let login_cookie_cleared = r.headers.iter().any(|(n, v)| {
+    let login_cookie_cleared = r.headers().iter().any(|(n, v)| {
         *n == http::header::SET_COOKIE
             && v.to_str().unwrap().contains("huskarl_login_")
             && v.to_str().unwrap().contains("Max-Age=0")
@@ -1397,12 +1554,12 @@ async fn logout_without_session_redirects_to_base_url() {
     let e = engine_with_config(MockSessionStore::empty(), config_with_logout()).await;
     let uri = "/logout".parse().unwrap();
     let r = e
-        .try_handle_login_route("/logout", &Method::GET, &HeaderMap::new(), &uri)
+        .try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
         .await
         .expect("logout handled");
-    assert_eq!(r.status, StatusCode::FOUND);
-    let loc = r
-        .headers
+    assert_eq!(r.status(), StatusCode::FOUND);
+    let hdrs = r.headers();
+    let loc = hdrs
         .iter()
         .find(|(n, _)| *n == http::header::LOCATION)
         .map(|(_, v)| v.to_str().unwrap());
@@ -1418,9 +1575,9 @@ async fn logout_with_session_deletes_session() {
     .await;
     let uri = "/logout".parse().unwrap();
     let _ = e
-        .try_handle_login_route("/logout", &Method::GET, &HeaderMap::new(), &uri)
+        .try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
         .await;
-    assert!(e.session_store().delete_called());
+    assert!(e.session_store.delete_called());
 }
 
 #[tokio::test]
@@ -1429,18 +1586,22 @@ async fn logout_redirects_to_configured_post_logout_uri() {
         .callback_path("/callback".to_owned())
         .scopes(vec![])
         .base_url("https://app.example.com".parse().unwrap())
-        .logout_path("/logout".to_owned())
-        .post_logout_redirect_uri("https://app.example.com/signed-out".to_owned())
+        .logout(
+            LogoutConfig::builder()
+                .path("/logout")
+                .post_logout_redirect_uri("https://app.example.com/signed-out".parse().unwrap())
+                .build(),
+        )
         .build()
         .unwrap();
     let e = engine_with_config(MockSessionStore::empty(), config).await;
     let uri = "/logout".parse().unwrap();
     let r = e
-        .try_handle_login_route("/logout", &Method::GET, &HeaderMap::new(), &uri)
+        .try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
         .await
         .expect("logout handled");
-    let loc = r
-        .headers
+    let hdrs = r.headers();
+    let loc = hdrs
         .iter()
         .find(|(n, _)| *n == http::header::LOCATION)
         .map(|(_, v)| v.to_str().unwrap());
@@ -1459,15 +1620,15 @@ async fn logout_rejects_cross_site_request_without_deleting_session() {
     let uri = "/logout".parse().unwrap();
     let h = headers(&[("sec-fetch-site", "cross-site")]);
     let r = e
-        .try_handle_login_route("/logout", &Method::GET, &h, &uri)
+        .try_handle_login_route(&Method::GET, &h, &uri)
         .await
         .expect("logout handled");
-    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
     assert!(
-        !r.headers.iter().any(|(n, _)| *n == http::header::LOCATION),
+        !r.headers().iter().any(|(n, _)| *n == http::header::LOCATION),
         "cross-site logout must not redirect"
     );
-    assert!(!e.session_store().delete_called());
+    assert!(!e.session_store.delete_called());
 }
 
 #[tokio::test]
@@ -1480,11 +1641,11 @@ async fn logout_allows_same_origin_request() {
     let uri = "/logout".parse().unwrap();
     let h = headers(&[("sec-fetch-site", "same-origin")]);
     let r = e
-        .try_handle_login_route("/logout", &Method::GET, &h, &uri)
+        .try_handle_login_route(&Method::GET, &h, &uri)
         .await
         .expect("logout handled");
-    assert_eq!(r.status, StatusCode::FOUND);
-    assert!(e.session_store().delete_called());
+    assert_eq!(r.status(), StatusCode::FOUND);
+    assert!(e.session_store.delete_called());
 }
 
 // ── Clock-skew handling ───────────────────────────────────────────────────
@@ -1500,8 +1661,8 @@ async fn small_future_skew_is_tolerated() {
     );
     let e = engine(MockSessionStore::with_session(session)).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    assert!(loaded.session.is_some());
-    assert!(!e.session_store().delete_called());
+    assert!(loaded.session().is_some());
+    assert!(!e.session_store.delete_called());
 }
 
 #[tokio::test]
@@ -1516,8 +1677,9 @@ async fn future_created_at_clears_session() {
     let store = MockSessionStore::with_session(session);
     let e = engine(store).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    assert!(loaded.session.is_none());
-    assert!(e.session_store().delete_called());
+    let (reason, _) = expect_cleared(loaded);
+    assert_eq!(reason, TeardownReason::ClockSkew);
+    assert!(e.session_store.delete_called());
 }
 
 #[tokio::test]
@@ -1532,8 +1694,9 @@ async fn future_last_active_clears_session() {
     let store = MockSessionStore::with_session(session);
     let e = engine(store).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    assert!(loaded.session.is_none());
-    assert!(e.session_store().delete_called());
+    let (reason, _) = expect_cleared(loaded);
+    assert_eq!(reason, TeardownReason::ClockSkew);
+    assert!(e.session_store.delete_called());
 }
 
 // ── Metrics test infrastructure ───────────────────────────────────────────
@@ -1552,6 +1715,9 @@ enum MetricCall {
     },
     Activity {
         outcome: &'static str,
+    },
+    Teardown {
+        reason: &'static str,
     },
 }
 
@@ -1590,6 +1756,12 @@ impl LoginEngineMetrics for TestEngineMetrics {
             outcome: o.as_str(),
         });
     }
+    fn record_teardown(&self, r: &TeardownReason) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(MetricCall::Teardown { reason: r.as_str() });
+    }
 }
 
 async fn engine_with_metrics(
@@ -1611,7 +1783,8 @@ async fn engine_with_metrics(
 #[tokio::test]
 async fn metrics_login_start_ok_on_nav_redirect() {
     let (e, m) = engine_with_metrics(MockSessionStore::empty()).await;
-    e.redirect_to_login(&nav_headers(), &"/protected".parse().unwrap())
+    let _ = e
+        .redirect_to_login(&nav_headers(), &"/protected".parse().unwrap())
         .await;
     assert_eq!(m.calls(), vec![MetricCall::LoginStart { result: "ok" }]);
 }
@@ -1620,7 +1793,8 @@ async fn metrics_login_start_ok_on_nav_redirect() {
 async fn metrics_no_login_start_on_api_401() {
     // XHR/API 401s don't redirect to the AS — no login start is recorded.
     let (e, m) = engine_with_metrics(MockSessionStore::empty()).await;
-    e.redirect_to_login(&api_headers(), &"/api".parse().unwrap())
+    let _ = e
+        .redirect_to_login(&api_headers(), &"/api".parse().unwrap())
         .await;
     assert!(m.calls().is_empty());
 }
@@ -1637,7 +1811,8 @@ async fn metrics_login_start_error_when_grant_start_fails() {
         .cipher(test_cipher().await)
         .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
         .build();
-    e.redirect_to_login(&nav_headers(), &"/protected".parse().unwrap())
+    let _ = e
+        .redirect_to_login(&nav_headers(), &"/protected".parse().unwrap())
         .await;
     assert_eq!(m.calls(), vec![MetricCall::LoginStart { result: "error" }]);
 }
@@ -1648,7 +1823,7 @@ async fn metrics_login_start_error_when_grant_start_fails() {
 async fn metrics_callback_invalid_request_on_missing_params() {
     let (e, m) = engine_with_metrics(MockSessionStore::empty()).await;
     let uri = "/callback".parse().unwrap();
-    e.try_handle_login_route("/callback", &Method::GET, &HeaderMap::new(), &uri)
+    e.try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
         .await;
     assert_eq!(
         m.calls(),
@@ -1663,7 +1838,7 @@ async fn metrics_callback_invalid_request_on_missing_params() {
 async fn metrics_callback_as_denied_carries_error_code() {
     let (e, m) = engine_with_metrics(MockSessionStore::empty()).await;
     let uri = "/callback?error=access_denied".parse().unwrap();
-    e.try_handle_login_route("/callback", &Method::GET, &HeaderMap::new(), &uri)
+    e.try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
         .await;
     assert_eq!(
         m.calls(),
@@ -1683,7 +1858,7 @@ async fn metrics_callback_as_denied_normalizes_unknown_error_code() {
     let uri = "/callback?error=attacker_chosen_garbage_12345"
         .parse()
         .unwrap();
-    e.try_handle_login_route("/callback", &Method::GET, &HeaderMap::new(), &uri)
+    e.try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
         .await;
     assert_eq!(
         m.calls(),
@@ -1698,7 +1873,7 @@ async fn metrics_callback_as_denied_normalizes_unknown_error_code() {
 async fn metrics_callback_invalid_request_on_missing_state_cookie() {
     let (e, m) = engine_with_metrics(MockSessionStore::empty()).await;
     let uri = "/callback?code=authcode&state=mystate".parse().unwrap();
-    e.try_handle_login_route("/callback", &Method::GET, &HeaderMap::new(), &uri)
+    e.try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
         .await;
     assert_eq!(
         m.calls(),
@@ -1718,8 +1893,7 @@ async fn metrics_callback_state_invalid_on_tampered_bundle() {
     let uri = format!("/callback?code=authcode&state={state}")
         .parse()
         .unwrap();
-    e.try_handle_login_route("/callback", &Method::GET, &h, &uri)
-        .await;
+    e.try_handle_login_route(&Method::GET, &h, &uri).await;
     assert_eq!(
         m.calls(),
         vec![MetricCall::LoginComplete {
@@ -1745,8 +1919,7 @@ async fn metrics_callback_ok_on_successful_login() {
     let uri = format!("/callback?code=authcode&state={state}")
         .parse()
         .unwrap();
-    e.try_handle_login_route("/callback", &Method::GET, &h, &uri)
-        .await;
+    e.try_handle_login_route(&Method::GET, &h, &uri).await;
     assert_eq!(
         m.calls(),
         vec![MetricCall::LoginComplete {
@@ -1767,8 +1940,7 @@ async fn metrics_callback_token_exchange_failed_when_grant_complete_fails() {
     let uri = format!("/callback?code=authcode&state={state}")
         .parse()
         .unwrap();
-    e.try_handle_login_route("/callback", &Method::GET, &h, &uri)
-        .await;
+    e.try_handle_login_route(&Method::GET, &h, &uri).await;
     assert_eq!(
         m.calls(),
         vec![MetricCall::LoginComplete {
@@ -1789,12 +1961,17 @@ async fn metrics_refresh_no_refresh_token_when_none_available() {
         SystemTime::now(),
     );
     let (e, m) = engine_with_metrics(MockSessionStore::with_session(session)).await;
-    e.load_session(&HeaderMap::new()).await.unwrap();
+    let _ = e.load_session(&HeaderMap::new()).await.unwrap();
     assert_eq!(
         m.calls(),
-        vec![MetricCall::Refresh {
-            result: "no_refresh_token"
-        }]
+        vec![
+            MetricCall::Refresh {
+                result: "no_refresh_token"
+            },
+            MetricCall::Teardown {
+                reason: "no_refresh_token"
+            },
+        ]
     );
 }
 
@@ -1808,8 +1985,51 @@ async fn metrics_refresh_failed_when_grant_refresh_fails() {
         SystemTime::now(),
     );
     let (e, m) = engine_with_metrics(MockSessionStore::with_session(session)).await;
-    e.load_session(&HeaderMap::new()).await.unwrap();
-    assert_eq!(m.calls(), vec![MetricCall::Refresh { result: "failed" }]);
+    let _ = e.load_session(&HeaderMap::new()).await.unwrap();
+    // The engine's HTTP double fails non-retryably — a conclusive rejection.
+    assert_eq!(
+        m.calls(),
+        vec![
+            MetricCall::Refresh { result: "failed" },
+            MetricCall::Teardown {
+                reason: "refresh_rejected"
+            },
+        ]
+    );
+}
+
+// ── Teardown metrics ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn metrics_teardown_on_idle_timeout() {
+    let m = Arc::new(TestEngineMetrics::default());
+    let session = session_with(
+        SystemTime::now() + Duration::from_hours(1),
+        None,
+        SystemTime::now(),
+        SystemTime::now() - Duration::from_secs(1801),
+    );
+    let config = LoginConfig::builder()
+        .callback_path("/callback".to_owned())
+        .scopes(vec![])
+        .base_url("https://app.example.com".parse().unwrap())
+        .idle_timeout(Duration::from_mins(15))
+        .build()
+        .unwrap();
+    let e = LoginEngine::builder()
+        .config(config)
+        .grant(test_grant(FailingHttp::new(false).0).await)
+        .session_store(MockSessionStore::with_session(session))
+        .cipher(test_cipher().await)
+        .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
+        .build();
+    let _ = e.load_session(&HeaderMap::new()).await.unwrap();
+    assert_eq!(
+        m.calls(),
+        vec![MetricCall::Teardown {
+            reason: "idle_timeout"
+        }]
+    );
 }
 
 #[tokio::test]
@@ -1823,7 +2043,7 @@ async fn metrics_refresh_failed_retained_on_transient_failure_with_valid_token()
         .cipher(test_cipher().await)
         .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
         .build();
-    e.load_session(&HeaderMap::new()).await.unwrap();
+    let _ = e.load_session(&HeaderMap::new()).await.unwrap();
     // The retained session goes through the normal activity path, so a
     // (throttled) activity outcome follows the refresh outcome.
     assert_eq!(
@@ -1848,7 +2068,7 @@ async fn metrics_refresh_ok_on_successful_refresh() {
         .cipher(test_cipher().await)
         .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
         .build();
-    e.load_session(&HeaderMap::new()).await.unwrap();
+    let _ = e.load_session(&HeaderMap::new()).await.unwrap();
     assert_eq!(m.calls(), vec![MetricCall::Refresh { result: "ok" }]);
 }
 
@@ -1857,7 +2077,7 @@ async fn metrics_refresh_ok_on_successful_refresh() {
 #[tokio::test]
 async fn metrics_activity_skip_when_recently_active() {
     let (e, m) = engine_with_metrics(MockSessionStore::with_session(valid_session())).await;
-    e.load_session(&HeaderMap::new()).await.unwrap();
+    let _ = e.load_session(&HeaderMap::new()).await.unwrap();
     assert_eq!(m.calls(), vec![MetricCall::Activity { outcome: "skip" }]);
 }
 
@@ -1870,6 +2090,6 @@ async fn metrics_activity_touch_when_interval_elapsed() {
         SystemTime::now() - Duration::from_hours(2),
     );
     let (e, m) = engine_with_metrics(MockSessionStore::with_session(session)).await;
-    e.load_session(&HeaderMap::new()).await.unwrap();
+    let _ = e.load_session(&HeaderMap::new()).await.unwrap();
     assert_eq!(m.calls(), vec![MetricCall::Activity { outcome: "touch" }]);
 }

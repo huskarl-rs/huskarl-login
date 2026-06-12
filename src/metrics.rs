@@ -11,6 +11,8 @@
 
 use huskarl::core::platform::MaybeSendSync;
 
+use crate::engine::TeardownReason;
+
 /// Outcome of a session cookie decryption attempt.
 ///
 /// Passed to [`SessionCookieMetrics::record_decrypt`] to indicate why
@@ -259,6 +261,17 @@ pub trait LoginEngineMetrics: MaybeSendSync + 'static {
     /// [`Touch`](ActivityOutcome::Touch) to [`Skip`](ActivityOutcome::Skip)
     /// outcomes reflects the effective touch rate.
     fn record_activity(&self, outcome: &ActivityOutcome);
+
+    /// Record the teardown of a presented session — why
+    /// [`load_session`](crate::engine::LoginEngine::load_session) dropped it
+    /// instead of serving it.
+    ///
+    /// Distinguishes benign policy expirations
+    /// ([`MaxLifetime`](TeardownReason::MaxLifetime),
+    /// [`IdleTimeout`](TeardownReason::IdleTimeout)) from refresh problems
+    /// and corrupt timestamps — signals that would otherwise look identical
+    /// to users ("I was logged out"). Defaults to a no-op.
+    fn record_teardown(&self, _reason: &TeardownReason) {}
 }
 
 #[cfg(test)]

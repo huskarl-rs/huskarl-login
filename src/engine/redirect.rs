@@ -2,8 +2,7 @@
 //! user to the authorization server.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use bytes::Bytes;
-use http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
+use http::{HeaderMap, HeaderValue, Uri, header};
 use huskarl::{
     core::{
         crypto::cipher::{AeadSealer as _, AeadUnsealer as _},
@@ -44,21 +43,13 @@ where
             .build_login_state_cookie(&state, orig_url, start.pending_state)
             .await?;
 
-        let mut resp_headers = vec![
-            (
-                header::LOCATION,
-                HeaderValue::from_str(&start.authorization_url.to_string())?,
-            ),
-            (header::SET_COOKIE, cookie_header),
-        ];
-        for clear in self.evict_excess_login_flows(request_headers).await {
-            resp_headers.push((header::SET_COOKIE, clear));
-        }
+        let location = HeaderValue::from_str(&start.authorization_url.to_string())?;
+        let mut set_cookies = vec![cookie_header];
+        set_cookies.extend(self.evict_excess_login_flows(request_headers).await);
 
-        Ok(LoginResponse {
-            status: StatusCode::FOUND,
-            headers: resp_headers,
-            body: Bytes::new(),
+        Ok(LoginResponse::Redirect {
+            location,
+            set_cookies,
         })
     }
 
