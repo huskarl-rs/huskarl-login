@@ -55,7 +55,15 @@ use crate::{completed_login::CompletedLogin, session::SessionError};
 /// The simplest enrichers need no I/O at all — they copy claims from the
 /// validated ID token into the session:
 ///
-/// ```ignore
+/// ```
+/// use huskarl::core::platform::MaybeSendBoxFuture;
+/// use huskarl_login::{CompletedLogin, SessionEnricher, SessionError, SessionState};
+/// # struct MySession {
+/// #     state: SessionState,
+/// #     email: Option<String>,
+/// #     name: Option<String>,
+/// # }
+///
 /// struct ClaimsEnricher;
 ///
 /// impl SessionEnricher<SessionState, MySession> for ClaimsEnricher {
@@ -83,9 +91,24 @@ use crate::{completed_login::CompletedLogin, session::SessionError};
 /// Enrichers that need claims the ID token doesn't carry own their clients
 /// and await them:
 ///
-/// ```ignore
+/// ```
+/// use std::sync::Arc;
+///
+/// use huskarl::{
+///     core::{http::HttpClient, platform::MaybeSendBoxFuture},
+///     userinfo::UserInfoClient,
+/// };
+/// use huskarl_login::{
+///     CompletedLogin, CookieSessionStore, SessionEnricher, SessionError, SessionState,
+/// };
+/// # struct MySession {
+/// #     state: SessionState,
+/// #     email: Option<String>,
+/// #     name: Option<String>,
+/// # }
+///
 /// struct UserInfoEnricher {
-///     http_client: MyHttpClient,
+///     http_client: Arc<dyn HttpClient>,
 ///     userinfo: UserInfoClient,
 /// }
 ///
@@ -96,10 +119,14 @@ use crate::{completed_login::CompletedLogin, session::SessionError};
 ///         completed: &'a CompletedLogin,
 ///     ) -> MaybeSendBoxFuture<'a, Result<MySession, SessionError>> {
 ///         Box::pin(async move {
-///             let sub = seed.sub.clone().ok_or(MyError::NoSubject)?;
+///             let sub = seed.sub.clone().ok_or("no subject in session seed")?;
 ///             let info = self
 ///                 .userinfo
-///                 .get(&self.http_client, completed.token_response().access_token(), &sub)
+///                 .get(
+///                     &self.http_client,
+///                     completed.token_response().access_token(),
+///                     &sub,
+///                 )
 ///                 .await?;
 ///             Ok(MySession {
 ///                 state: seed,
@@ -110,12 +137,22 @@ use crate::{completed_login::CompletedLogin, session::SessionError};
 ///     }
 /// }
 ///
+/// # fn attach(
+/// #     cipher: impl huskarl::core::crypto::cipher::AeadCipher + 'static,
+/// #     http_client: Arc<dyn HttpClient>,
+/// #     userinfo: UserInfoClient,
+/// # ) -> CookieSessionStore<MySession> {
 /// let store = CookieSessionStore::<MySession>::builder()
 ///     .cipher(cipher)
 ///     .cookie_name("session")
 ///     .secure(true)
 ///     .cookie_path("/")
-///     .build_with_enricher(UserInfoEnricher { userinfo });
+///     .build_with_enricher(UserInfoEnricher {
+///         http_client,
+///         userinfo,
+///     });
+/// # store
+/// # }
 /// ```
 ///
 /// The same enricher type can serve a store-backed deployment by implementing

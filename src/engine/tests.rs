@@ -405,6 +405,10 @@ fn api_headers() -> HeaderMap {
 // ── Login-state cookie helper ─────────────────────────────────────────────
 
 async fn seal_login_cookie(state: &str, original_url: &str) -> String {
+    seal_login_cookie_at(state, original_url, SystemTime::now()).await
+}
+
+async fn seal_login_cookie_at(state: &str, original_url: &str, created_at: SystemTime) -> String {
     let sealer = AeadV1Cipher::new(test_cipher().await);
     let cookie = super::LoginStateCookie {
         original_url: original_url.to_owned(),
@@ -415,6 +419,7 @@ async fn seal_login_cookie(state: &str, original_url: &str) -> String {
             nonce: "test_nonce".to_owned(),
             dpop_jkt: None,
         },
+        created_at,
     };
     let payload = crate::cookie::encode_payload(&cookie).unwrap();
     let bundle = sealer.seal(&payload, state.as_bytes()).await.unwrap();
@@ -614,6 +619,55 @@ async fn logout_path_is_handled_when_configured() {
 }
 
 #[tokio::test]
+async fn callback_rejects_non_get_methods() {
+    let e = engine(MockSessionStore::empty()).await;
+    let uri = "/callback".parse().unwrap();
+    for method in [Method::POST, Method::PUT, Method::DELETE, Method::HEAD] {
+        let resp = e
+            .try_handle_login_route("/callback", &method, &HeaderMap::new(), &uri)
+            .await
+            .expect("reserved path must not fall through");
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        let allow = resp
+            .headers
+            .iter()
+            .find(|(n, _)| *n == http::header::ALLOW)
+            .map(|(_, v)| v.to_str().unwrap());
+        assert_eq!(allow, Some("GET"), "{method}");
+    }
+}
+
+#[tokio::test]
+async fn logout_accepts_post() {
+    let e = engine_with_config(MockSessionStore::empty(), config_with_logout()).await;
+    let uri = "/logout".parse().unwrap();
+    let resp = e
+        .try_handle_login_route("/logout", &Method::POST, &HeaderMap::new(), &uri)
+        .await
+        .expect("logout handles POST");
+    assert_eq!(resp.status, StatusCode::FOUND);
+}
+
+#[tokio::test]
+async fn logout_rejects_other_methods() {
+    let e = engine_with_config(MockSessionStore::empty(), config_with_logout()).await;
+    let uri = "/logout".parse().unwrap();
+    for method in [Method::PUT, Method::DELETE, Method::HEAD] {
+        let resp = e
+            .try_handle_login_route("/logout", &method, &HeaderMap::new(), &uri)
+            .await
+            .expect("reserved path must not fall through");
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        let allow = resp
+            .headers
+            .iter()
+            .find(|(n, _)| *n == http::header::ALLOW)
+            .map(|(_, v)| v.to_str().unwrap());
+        assert_eq!(allow, Some("GET, POST"), "{method}");
+    }
+}
+
+#[tokio::test]
 async fn logout_path_returns_none_when_unconfigured() {
     let e = engine(MockSessionStore::empty()).await;
     let uri = "/logout".parse().unwrap();
@@ -788,6 +842,192 @@ async fn login_state_cookie_uses_configured_ttl() {
         })
         .expect("login-state cookie");
     assert!(cookie.1.to_str().unwrap().contains("Max-Age=1800"));
+}
+
+// ── Login-flow cap (max_pending_logins) ───────────────────────────────────
+
+fn login_cookie_name(state: &str) -> String {
+    crate::cookie::login_state_cookie_name(
+        state,
+        true,
+        "/callback",
+        crate::cookie::DEFAULT_LOGIN_COOKIE_PREFIX,
+    )
+}
+
+/// Navigation headers carrying the given `(name, value)` login-state cookies.
+fn nav_headers_with_login_cookies(cookies: &[(String, String)]) -> HeaderMap {
+    let joined = cookies
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    headers(&[("sec-fetch-mode", "navigate"), ("cookie", &joined)])
+}
+
+/// Names of the login-state cookies the response clears via `Max-Age=0`.
+fn cleared_login_cookies(r: &super::LoginResponse) -> Vec<String> {
+    r.headers
+        .iter()
+        .filter(|(n, _)| *n == http::header::SET_COOKIE)
+        .filter_map(|(_, v)| {
+            let s = v.to_str().ok()?;
+            (s.contains("huskarl_login_") && s.contains("Max-Age=0"))
+                .then(|| s.split_once('=').unwrap().0.to_owned())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn redirect_under_cap_clears_no_login_cookies() {
+    // Three existing flows + the new one = the default cap of 4. Nothing to
+    // evict, and (by design) nothing should even be decrypted.
+    let e = engine(MockSessionStore::empty()).await;
+    let mut cookies = Vec::new();
+    for s in ["s1", "s2", "s3"] {
+        cookies.push((
+            login_cookie_name(s),
+            seal_login_cookie(s, "https://app.example.com/a").await,
+        ));
+    }
+    let uri = "/protected".parse().unwrap();
+    let r = e
+        .redirect_to_login(&nav_headers_with_login_cookies(&cookies), &uri)
+        .await;
+    assert_eq!(r.status, StatusCode::FOUND);
+    assert!(cleared_login_cookies(&r).is_empty());
+}
+
+#[tokio::test]
+async fn redirect_over_cap_evicts_oldest_flow() {
+    // Four existing flows + the new one exceeds the cap of 4 by one: the
+    // flow with the oldest sealed created_at (s1) is evicted, the rest kept.
+    let e = engine(MockSessionStore::empty()).await;
+    let now = SystemTime::now();
+    let mut cookies = Vec::new();
+    for (i, s) in ["s1", "s2", "s3", "s4"].iter().enumerate() {
+        let created_at = now - Duration::from_secs(60 * (4 - i as u64));
+        cookies.push((
+            login_cookie_name(s),
+            seal_login_cookie_at(s, "https://app.example.com/a", created_at).await,
+        ));
+    }
+    let uri = "/protected".parse().unwrap();
+    let r = e
+        .redirect_to_login(&nav_headers_with_login_cookies(&cookies), &uri)
+        .await;
+    assert_eq!(r.status, StatusCode::FOUND);
+    assert_eq!(cleared_login_cookies(&r), vec![login_cookie_name("s1")]);
+}
+
+#[tokio::test]
+async fn redirect_over_cap_evicts_unreadable_cookies_first() {
+    // One garbage cookie under our prefix plus three valid recent flows:
+    // over the cap, the unreadable cookie goes before any live flow.
+    let e = engine(MockSessionStore::empty()).await;
+    let mut cookies = vec![(login_cookie_name("bad"), "!!!garbage!!!".to_owned())];
+    for s in ["s1", "s2", "s3"] {
+        cookies.push((
+            login_cookie_name(s),
+            seal_login_cookie(s, "https://app.example.com/a").await,
+        ));
+    }
+    let uri = "/protected".parse().unwrap();
+    let r = e
+        .redirect_to_login(&nav_headers_with_login_cookies(&cookies), &uri)
+        .await;
+    assert_eq!(cleared_login_cookies(&r), vec![login_cookie_name("bad")]);
+}
+
+#[tokio::test]
+async fn redirect_respects_configured_cap() {
+    // Cap of 2 → keep one existing flow: the newer of the two survives.
+    let config = LoginConfig::builder()
+        .callback_path("/callback".to_owned())
+        .scopes(vec![])
+        .base_url("https://app.example.com".parse().unwrap())
+        .max_pending_logins(2)
+        .build()
+        .unwrap();
+    let e = engine_with_config(MockSessionStore::empty(), config).await;
+    let now = SystemTime::now();
+    let cookies = vec![
+        (
+            login_cookie_name("old"),
+            seal_login_cookie_at("old", "https://app.example.com/a", now - Duration::from_mins(2)).await,
+        ),
+        (
+            login_cookie_name("new"),
+            seal_login_cookie_at("new", "https://app.example.com/b", now - Duration::from_mins(1)).await,
+        ),
+    ];
+    let uri = "/protected".parse().unwrap();
+    let r = e
+        .redirect_to_login(&nav_headers_with_login_cookies(&cookies), &uri)
+        .await;
+    assert_eq!(cleared_login_cookies(&r), vec![login_cookie_name("old")]);
+}
+
+// ── Server-side login-state TTL ───────────────────────────────────────────
+
+#[tokio::test]
+async fn callback_expired_login_state_returns_400_and_clears_cookie() {
+    let e = engine(MockSessionStore::empty()).await;
+    let state = "expiredstate";
+    // Default login_state_ttl is 10 minutes; this flow started 11 minutes ago.
+    let created_at = SystemTime::now() - Duration::from_mins(11);
+    let value = seal_login_cookie_at(state, "https://app.example.com/a", created_at).await;
+    let h = headers_with_login_cookie(state, &value);
+    let uri = format!("/callback?code=abc&state={state}").parse().unwrap();
+    let r = e
+        .try_handle_login_route("/callback", &Method::GET, &h, &uri)
+        .await
+        .expect("callback handled");
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let cleared = r.headers.iter().any(|(n, v)| {
+        *n == http::header::SET_COOKIE && {
+            let s = v.to_str().unwrap();
+            s.starts_with(&format!("{}=;", login_cookie_name(state))) && s.contains("Max-Age=0")
+        }
+    });
+    assert!(cleared, "expired flow's cookie must be cleared");
+}
+
+#[tokio::test]
+async fn callback_pre_created_at_format_treated_as_expired() {
+    // A cookie sealed before the created_at field existed deserializes with
+    // the epoch default and is uniformly rejected as expired — the documented
+    // re-login behavior for wire-format changes.
+    #[derive(serde::Serialize)]
+    struct OldLoginStateCookie<'a> {
+        original_url: &'a str,
+        pending_state: &'a PendingState,
+    }
+    let state = "oldformat";
+    let pending_state = PendingState {
+        redirect_uri: "https://app.example.com/callback".to_owned(),
+        pkce_verifier: None,
+        state: state.to_owned(),
+        nonce: "test_nonce".to_owned(),
+        dpop_jkt: None,
+    };
+    let payload = crate::cookie::encode_payload(&OldLoginStateCookie {
+        original_url: "https://app.example.com/a",
+        pending_state: &pending_state,
+    })
+    .unwrap();
+    let sealer = AeadV1Cipher::new(test_cipher().await);
+    let bundle = sealer.seal(&payload, state.as_bytes()).await.unwrap();
+    let value = URL_SAFE_NO_PAD.encode(&bundle);
+
+    let e = engine(MockSessionStore::empty()).await;
+    let h = headers_with_login_cookie(state, &value);
+    let uri = format!("/callback?code=abc&state={state}").parse().unwrap();
+    let r = e
+        .try_handle_login_route("/callback", &Method::GET, &h, &uri)
+        .await
+        .expect("callback handled");
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

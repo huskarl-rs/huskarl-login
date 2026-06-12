@@ -25,6 +25,7 @@ use huskarl::{
         Error,
         crypto::cipher::{AeadCipher, AeadV1Cipher},
         platform::{Duration, MaybeSendSync, SystemTime, sleep},
+        serde_utils::time::unix_secs,
     },
     grant::{
         authorization_code::{AuthorizationCodeGrant, PendingState},
@@ -164,6 +165,20 @@ impl PersistFailurePolicy for DefaultPersistFailurePolicy {
 struct LoginStateCookie {
     original_url: String,
     pending_state: PendingState,
+    /// When the flow started. Lets the engine evict the oldest flows once a
+    /// browser exceeds [`LoginConfig::max_pending_logins`] and enforce
+    /// [`LoginConfig::login_state_ttl`] server-side (the cookie's `Max-Age`
+    /// only enforces it browser-side). Cookies sealed before this field
+    /// existed decode as the epoch, which uniformly classifies them as
+    /// expired — exactly the re-login behavior a format change is documented
+    /// to produce.
+    #[serde(with = "unix_secs", default = "unix_epoch")]
+    created_at: SystemTime,
+}
+
+/// `#[serde(default)]` helper — see [`LoginStateCookie::created_at`].
+fn unix_epoch() -> SystemTime {
+    SystemTime::UNIX_EPOCH
 }
 
 // ── LoginEngine ───────────────────────────────────────────────────────────────
@@ -244,14 +259,23 @@ where
     /// If `path` is the configured callback or logout path, returns the
     /// corresponding response. Otherwise returns `None` and the framework
     /// adapter should fall through to the next layer.
+    ///
+    /// The callback only accepts `GET` — the authorization server delivers the
+    /// response as a query-string redirect (top-level navigation). Logout
+    /// accepts `GET` (links) and `POST` (forms). Other methods on these paths
+    /// get a `405 Method Not Allowed` with an `Allow` header rather than
+    /// falling through, since the paths are reserved for the engine.
     pub async fn try_handle_login_route(
         &self,
         path: &str,
-        _method: &Method,
+        method: &Method,
         headers: &HeaderMap,
         uri: &Uri,
     ) -> Option<LoginResponse> {
         if path == self.config.callback_path {
+            if *method != Method::GET {
+                return Some(self.method_not_allowed("GET"));
+            }
             return Some(self.handle_callback(uri, headers).await);
         }
         if self
@@ -260,9 +284,22 @@ where
             .as_deref()
             .is_some_and(|p| path == p)
         {
+            if *method != Method::GET && *method != Method::POST {
+                return Some(self.method_not_allowed("GET, POST"));
+            }
             return Some(self.handle_logout(headers).await);
         }
         None
+    }
+
+    /// Builds a `405 Method Not Allowed` response advertising the allowed
+    /// methods (RFC 9110 §15.5.6 requires the `Allow` header).
+    fn method_not_allowed(&self, allow: &'static str) -> LoginResponse {
+        let mut resp =
+            self.build_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+        resp.headers
+            .push((header::ALLOW, HeaderValue::from_static(allow)));
+        resp
     }
 
     /// Loads and validates the session from request cookies, refreshing
@@ -272,6 +309,35 @@ where
     /// decides what to do when no session is present (a downstream gate may
     /// call [`redirect_to_login`](Self::redirect_to_login), or the request
     /// may simply proceed unauthenticated).
+    ///
+    /// # Concurrent refresh and refresh-token rotation
+    ///
+    /// Two in-flight requests — or two replicas in a distributed deployment —
+    /// can enter the refresh window for the same session at once, and each
+    /// will exchange the session's refresh token independently. When the
+    /// authorization server rotates refresh tokens, the expected deployment
+    /// shape is:
+    ///
+    /// - a **shared refresh-token cache** across replicas (implement
+    ///   `huskarl::cache::TokenCache` / `RefreshTokenStore` over shared
+    ///   storage) so concurrent refreshes converge on the rotated token
+    ///   instead of racing each other, and
+    /// - an authorization server configured with a **rotation grace period**,
+    ///   so reuse of the just-rotated token inside the race window is honored
+    ///   rather than treated as token theft (which would revoke the token
+    ///   family and log the user out).
+    ///
+    /// The race window is the length of the read → exchange → save-back
+    /// workflow. Note that the save-back happens via
+    /// [`persist_session`](Self::persist_session) *after* the inner handler
+    /// has responded, so the window includes the handler's own latency — size
+    /// the grace period against the slowest endpoints behind the session
+    /// middleware, not the token-exchange round trip.
+    ///
+    /// Without both, occasional concurrent refreshes will lose the race and
+    /// surface as [`RefreshResult::Failed`] teardowns — most visibly with
+    /// cookie sessions, where the refresh token lives in the cookie and the
+    /// last writer wins.
     ///
     /// On infrastructure failure (e.g. the session store is unreachable) the
     /// underlying error is returned; the adapter typically maps that to a
@@ -323,7 +389,7 @@ where
         if !is_navigation_request(headers) {
             return self.build_error_response(StatusCode::UNAUTHORIZED, "authentication required");
         }
-        match self.redirect_to_as(headers, uri, None).await {
+        match self.redirect_to_as(headers, uri).await {
             Ok(resp) => {
                 self.record_login_start(&LoginStartResult::Ok);
                 resp

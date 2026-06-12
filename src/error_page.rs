@@ -22,9 +22,22 @@ pub struct ErrorPageResponse {
 /// The default implementation ([`DefaultErrorPage`]) produces minimal,
 /// self-contained HTML. Implement this trait to customise the look of error
 /// pages served during the login flow.
+///
+/// # Security
+///
+/// `message` can contain **attacker-controlled content**. In particular,
+/// when the authorization server returns an error response to the callback,
+/// the `error_description` query parameter — which anyone can put in a
+/// request to the callback URL — is included verbatim. Implementations MUST
+/// treat `message` as untrusted data and escape it for whatever output
+/// context they render into (HTML-entity escaping for HTML bodies, as
+/// [`DefaultErrorPage`] does), or reflected XSS is possible.
 pub trait ErrorPage: MaybeSendSync {
     /// Render an error page for the given HTTP status and human-readable
     /// message.
+    ///
+    /// `message` is untrusted input — see the [trait docs](ErrorPage#security)
+    /// for the escaping requirement.
     fn render(&self, status: StatusCode, message: &str) -> ErrorPageResponse;
 }
 

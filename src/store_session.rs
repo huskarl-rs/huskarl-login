@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::{
     cookie::{
         DEFAULT_COOKIE_MAX_AGE, SessionCipher, cookie_attrs, encode_kid, get_cookie,
-        get_kid_cookie, kid_cookie_name, unseal_with_kid_fallback,
+        get_kid_cookie, kid_cookie_name, session_cookie_name, unseal_with_kid_fallback,
     },
     enrich::{NoEnrichment, SessionEnricher},
     metrics::{DecryptResult, SessionCookieMetrics},
@@ -191,6 +191,14 @@ fn generate_session_key() -> Uuid {
 /// type implementing `From<PersistedSessionState>`). For sessions needing
 /// claims or I/O, supply an enricher via the `build_with_enricher(…)`
 /// finisher.
+///
+/// When `secure` is set and `cookie_path` is `"/"`, the configured cookie
+/// name is automatically given the `__Host-` prefix (unless it already
+/// starts with `__Host-` or `__Secure-`). The prefix makes the browser
+/// reject the cookie if set by a sibling subdomain or over plain HTTP,
+/// blocking session fixation by cookie tossing. Note that enabling this on
+/// an existing deployment renames the cookie: in-flight sessions under the
+/// old name are ignored and users re-login on their next navigation.
 pub struct StoreBackedSessionStore<E: ExternalSessionStore> {
     external: E,
     enricher: Box<dyn SessionEnricher<PersistedSessionState, E::SessionType>>,
@@ -227,6 +235,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         /// Optional metrics observer for encrypt/decrypt events.
         metrics: Option<Arc<dyn SessionCookieMetrics>>,
     ) -> Self {
+        let cookie_name = session_cookie_name(cookie_name, secure, &cookie_path);
         Self {
             external,
             enricher,
@@ -680,7 +689,7 @@ mod tests {
                 let s = h.to_str().unwrap();
                 let value_part = s.split(';').next().unwrap();
                 let (name, value) = value_part.split_once('=').unwrap();
-                name.trim() == "session" && !value.is_empty()
+                name.trim() == "__Host-session" && !value.is_empty()
             })
             .expect("pointer cookie present");
         let cookie_value = pointer
@@ -695,7 +704,7 @@ mod tests {
         let mut req_headers = http::HeaderMap::new();
         req_headers.insert(
             http::header::COOKIE,
-            format!("session={cookie_value}").parse().unwrap(),
+            format!("__Host-session={cookie_value}").parse().unwrap(),
         );
 
         let recovered = store
@@ -734,7 +743,7 @@ mod tests {
         let expected_value = URL_SAFE_NO_PAD.encode("kid-7".as_bytes());
         let sidecar_set = headers_out.iter().any(|h| {
             let s = h.to_str().unwrap();
-            s.starts_with(&format!("session.kid={expected_value};"))
+            s.starts_with(&format!("__Host-session.kid={expected_value};"))
         });
         assert!(
             sidecar_set,
@@ -780,7 +789,7 @@ mod tests {
                 let s = h.to_str().ok()?;
                 let pair = s.split(';').next()?;
                 let (name, value) = pair.split_once('=')?;
-                (name.trim() == "session" && !value.is_empty()).then(|| value.to_owned())
+                (name.trim() == "__Host-session" && !value.is_empty()).then(|| value.to_owned())
             })
             .expect("pointer cookie present");
 
@@ -789,7 +798,10 @@ mod tests {
         let mut req = http::HeaderMap::new();
         req.insert(
             http::header::COOKIE,
-            format!("session={pointer_value}; session.kid={}", encode_kid("v1"))
+            format!(
+                "__Host-session={pointer_value}; __Host-session.kid={}",
+                encode_kid("v1")
+            )
                 .parse()
                 .unwrap(),
         );
@@ -810,11 +822,11 @@ mod tests {
         let clears = store.delete_session(&session).await.unwrap();
         let bare = clears.iter().any(|h| {
             let s = h.to_str().unwrap();
-            s.starts_with("session=;") && s.contains("Max-Age=0")
+            s.starts_with("__Host-session=;") && s.contains("Max-Age=0")
         });
         let kid = clears.iter().any(|h| {
             let s = h.to_str().unwrap();
-            s.starts_with("session.kid=;") && s.contains("Max-Age=0")
+            s.starts_with("__Host-session.kid=;") && s.contains("Max-Age=0")
         });
         assert!(bare, "expected pointer cookie clear");
         assert!(kid, "expected kid sidecar clear");
@@ -927,7 +939,7 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert(
             http::header::COOKIE,
-            "session=not!!valid!!base64".parse().unwrap(),
+            "__Host-session=not!!valid!!base64".parse().unwrap(),
         );
         store.read_pointer_cookie(&headers).await;
         assert_eq!(m.decrypts(), vec![(None, "bad_encoding")]);
@@ -948,7 +960,7 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert(
             http::header::COOKIE,
-            "session=AAAAAAAAAAAA".parse().unwrap(),
+            "__Host-session=AAAAAAAAAAAA".parse().unwrap(),
         );
         store.read_pointer_cookie(&headers).await;
         assert_eq!(m.decrypts(), vec![(None, "decrypt_failed")]);
@@ -976,7 +988,7 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert(
             http::header::COOKIE,
-            format!("session={encoded}").parse().unwrap(),
+            format!("__Host-session={encoded}").parse().unwrap(),
         );
         store.read_pointer_cookie(&headers).await;
         assert_eq!(m.decrypts(), vec![(None, "payload_invalid")]);

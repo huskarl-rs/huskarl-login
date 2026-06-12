@@ -161,6 +161,22 @@ pub struct LoginConfig {
     ///
     /// Defaults to 600 seconds (10 minutes).
     pub login_state_ttl: Duration,
+    /// Maximum number of in-flight login flows (login-state cookies) kept
+    /// per browser, including the flow being started.
+    ///
+    /// Each login redirect sets a per-flow cookie named by its `state`, so
+    /// concurrent tabs can each complete their own flow. Without a cap,
+    /// abandoned flows accumulate in the cookie jar until their `Max-Age`
+    /// expires, and enough of them can push the browser into evicting other
+    /// cookies. When starting a flow would exceed the cap, the engine emits
+    /// clears for the excess: unreadable login-state cookies first, then the
+    /// oldest flows by their sealed creation time. An evicted flow fails at
+    /// the callback with an invalid-state error and the user just logs in
+    /// again. As long as the request carries fewer cookies than the cap, no
+    /// extra work (in particular no decryption) is done.
+    ///
+    /// Defaults to 4. Values below 1 are treated as 1 (the new flow itself).
+    pub max_pending_logins: usize,
     /// Minimum interval between activity "touches" for an active session.
     ///
     /// On each authenticated request, the middleware updates `last_active` and
@@ -256,6 +272,9 @@ impl LoginConfig {
         /// Lifetime of the per-flow login-state cookie. Defaults to 10 minutes.
         #[builder(default = Duration::from_mins(10))]
         login_state_ttl: Duration,
+        /// Maximum number of in-flight login flows per browser. Defaults to 4.
+        #[builder(default = 4)]
+        max_pending_logins: usize,
         /// Minimum interval between activity touches. Defaults to 1 hour.
         #[builder(default = Duration::from_hours(1))]
         touch_min_interval: Duration,
@@ -310,6 +329,7 @@ impl LoginConfig {
             token_refresh_margin,
             default_token_lifetime,
             login_state_ttl,
+            max_pending_logins,
             touch_min_interval,
             base_url,
             strip_prefix,
@@ -386,6 +406,23 @@ mod tests {
             default_policy_config().login_state_ttl,
             Duration::from_mins(10)
         );
+    }
+
+    #[test]
+    fn login_config_max_pending_logins_defaults_4() {
+        assert_eq!(default_policy_config().max_pending_logins, 4);
+    }
+
+    #[test]
+    fn login_config_max_pending_logins_override() {
+        let config = LoginConfig::builder()
+            .callback_path("/callback".into())
+            .scopes(vec![])
+            .base_url("https://app.example.com".parse().unwrap())
+            .max_pending_logins(2)
+            .build()
+            .unwrap();
+        assert_eq!(config.max_pending_logins, 2);
     }
 
     #[test]

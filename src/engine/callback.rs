@@ -4,7 +4,10 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
-use huskarl::{core::crypto::cipher::AeadUnsealer as _, grant::authorization_code::CompleteInput};
+use huskarl::{
+    core::{crypto::cipher::AeadUnsealer as _, platform::SystemTime},
+    grant::authorization_code::CompleteInput,
+};
 use serde::Deserialize;
 
 use super::{LoginEngine, LoginResponse, LoginStateCookie, error_chain};
@@ -24,20 +27,12 @@ where
         let (code, state, iss) = match parse_callback_params(uri.query().unwrap_or("")) {
             CallbackParse::Valid { code, state, iss } => (code, state, iss),
             CallbackParse::AuthServerError { error, description } => {
-                return self
-                    .handle_as_error(&error, description.as_deref(), headers)
-                    .await;
+                return self.handle_as_error(&error, description.as_deref());
             }
             CallbackParse::Missing => {
                 self.record_login_complete(&LoginCompleteResult::InvalidRequest, None);
                 return self
-                    .build_error_response_with_delete(
-                        StatusCode::BAD_REQUEST,
-                        "missing code or state",
-                        headers,
-                        None,
-                    )
-                    .await;
+                    .build_error_response(StatusCode::BAD_REQUEST, "missing code or state");
             }
         };
 
@@ -52,14 +47,7 @@ where
             // No cookie to clear — either none was set, or the browser sent a
             // cookie under a different `state` name (which we can't address).
             self.record_login_complete(&LoginCompleteResult::InvalidRequest, None);
-            return self
-                .build_error_response_with_delete(
-                    StatusCode::BAD_REQUEST,
-                    "invalid or missing state",
-                    headers,
-                    None,
-                )
-                .await;
+            return self.build_error_response(StatusCode::BAD_REQUEST, "invalid or missing state");
         };
 
         // From here on, the login-state cookie is present and known by name —
@@ -68,9 +56,7 @@ where
             Ok(s) => s,
             Err((status, msg)) => {
                 self.record_login_complete(&LoginCompleteResult::StateInvalid, None);
-                return self
-                    .callback_error(status, msg, headers, &cookie_name)
-                    .await;
+                return self.callback_error(status, msg, &cookie_name);
             }
         };
 
@@ -91,14 +77,11 @@ where
             Err(e) => {
                 log::error!("token exchange failed: {}", error_chain(&e));
                 self.record_login_complete(&LoginCompleteResult::TokenExchangeFailed, None);
-                return self
-                    .callback_error(
-                        StatusCode::BAD_GATEWAY,
-                        "token exchange failed",
-                        headers,
-                        &cookie_name,
-                    )
-                    .await;
+                return self.callback_error(
+                    StatusCode::BAD_GATEWAY,
+                    "token exchange failed",
+                    &cookie_name,
+                );
             }
         };
 
@@ -111,14 +94,11 @@ where
             Err(e) => {
                 log::error!("failed to create session: {}", error_chain(&*e));
                 self.record_login_complete(&LoginCompleteResult::SessionCreateFailed, None);
-                return self
-                    .callback_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "failed to create session",
-                        headers,
-                        &cookie_name,
-                    )
-                    .await;
+                return self.callback_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to create session",
+                    &cookie_name,
+                );
             }
         };
 
@@ -131,12 +111,7 @@ where
     /// set — the parameter is attacker-suppliable) and renders a 403. The
     /// raw `description` reaches the error page, which is responsible for
     /// escaping it.
-    async fn handle_as_error(
-        &self,
-        error: &str,
-        description: Option<&str>,
-        headers: &HeaderMap,
-    ) -> LoginResponse {
+    fn handle_as_error(&self, error: &str, description: Option<&str>) -> LoginResponse {
         let message = match description {
             Some(desc) => format!("authorization denied: {desc}"),
             None => format!("authorization denied ({error})"),
@@ -145,8 +120,7 @@ where
             &LoginCompleteResult::AsDenied,
             Some(normalize_as_error(error)),
         );
-        self.build_error_response_with_delete(StatusCode::FORBIDDEN, &message, headers, None)
-            .await
+        self.build_error_response(StatusCode::FORBIDDEN, &message)
     }
 
     /// Assembles the 302 response that sends the user back to their original
@@ -182,6 +156,11 @@ where
     /// returns the deserialized payload. On failure, returns the status code
     /// and message the callback should respond with — the caller is
     /// responsible for clearing the cookie.
+    ///
+    /// The payload's `created_at` is checked against
+    /// [`login_state_ttl`](crate::LoginConfig::login_state_ttl): the cookie's
+    /// `Max-Age` enforces the TTL browser-side only, so without this check a
+    /// captured cookie would stay usable indefinitely.
     async fn decode_login_state(
         &self,
         cookie_encoded: &str,
@@ -195,14 +174,20 @@ where
             .unseal(None, &bundle, state.as_bytes())
             .await
             .map_err(|_| (StatusCode::BAD_REQUEST, "state cookie decryption failed"))?;
-        decode_payload::<LoginStateCookie>(&plaintext)
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "corrupt login state"))
+        let login_state = decode_payload::<LoginStateCookie>(&plaintext)
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "corrupt login state"))?;
+        if super::elapsed_since(login_state.created_at, SystemTime::now())
+            > self.config.login_state_ttl
+        {
+            return Err((StatusCode::BAD_REQUEST, "login state expired"));
+        }
+        Ok(login_state)
     }
 
     /// Builds the `Set-Cookie` value that clears a login-state cookie by name.
     /// Returns `None` only if the name produces an invalid header value, which
     /// shouldn't happen for cookies we generated.
-    fn clear_login_state_cookie(&self, cookie_name: &str) -> Option<HeaderValue> {
+    pub(super) fn clear_login_state_cookie(&self, cookie_name: &str) -> Option<HeaderValue> {
         let attrs = cookie_attrs(self.config.secure, &self.config.browser_callback_path);
         HeaderValue::from_str(&format!("{cookie_name}=; {attrs}; Max-Age=0")).ok()
     }
@@ -210,16 +195,8 @@ where
     /// Builds an error response for a failed callback and appends a
     /// `Set-Cookie` that clears the located login-state cookie, so a stale
     /// flow cannot be replayed.
-    async fn callback_error(
-        &self,
-        status: StatusCode,
-        message: &str,
-        request_headers: &HeaderMap,
-        cookie_name: &str,
-    ) -> LoginResponse {
-        let mut resp = self
-            .build_error_response_with_delete(status, message, request_headers, None)
-            .await;
+    fn callback_error(&self, status: StatusCode, message: &str, cookie_name: &str) -> LoginResponse {
+        let mut resp = self.build_error_response(status, message);
         if let Some(v) = self.clear_login_state_cookie(cookie_name) {
             resp.headers.push((header::SET_COOKIE, v));
         }

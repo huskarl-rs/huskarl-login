@@ -89,12 +89,43 @@ pub fn login_state_cookie_name(state: &str, secure: bool, path: &str, prefix: &s
         is_valid_oauth_state(state),
         "login_state_cookie_name called with state that is not URL-safe base64url"
     );
+    format!(
+        "{}{state}",
+        login_state_cookie_name_prefix(secure, path, prefix)
+    )
+}
+
+/// Returns the name prefix shared by every login-state cookie under the given
+/// security settings: `{security_prefix}{prefix}_`. A request cookie whose
+/// name starts with this prefix is one of this deployment's in-flight login
+/// flows; the rest of the name is the flow's `state` value.
+pub(crate) fn login_state_cookie_name_prefix(secure: bool, path: &str, prefix: &str) -> String {
     let security_prefix = if secure {
         if path == "/" { "__Host-" } else { "__Secure-" }
     } else {
         ""
     };
-    format!("{security_prefix}{prefix}_{state}")
+    format!("{security_prefix}{prefix}_")
+}
+
+/// Returns the session cookie base name with the `__Host-` prefix applied
+/// when the deployment qualifies for it: `secure` set and the cookie scoped
+/// to `Path=/` (session cookies never set `Domain`, so those are the only
+/// remaining prefix requirements). The prefix makes the browser reject any
+/// attempt by a sibling subdomain or a non-secure connection to plant or
+/// overwrite the cookie — AEAD already stops forgery, but not an attacker
+/// tossing their *own* valid session onto a victim (login CSRF / fixation).
+///
+/// Names that already carry a security prefix are left untouched, so callers
+/// who explicitly chose `__Host-`/`__Secure-` naming keep their exact name.
+/// Chunk (`{name}.N`) and kid sidecar (`{name}.kid`) cookies derive from the
+/// returned base name, so they inherit the prefix.
+pub(crate) fn session_cookie_name(name: String, secure: bool, path: &str) -> String {
+    if secure && path == "/" && !name.starts_with("__Host-") && !name.starts_with("__Secure-") {
+        format!("__Host-{name}")
+    } else {
+        name
+    }
 }
 
 /// Builds the standard cookie attribute string for session cookies.
@@ -265,6 +296,15 @@ mod tests {
     }
 
     #[test]
+    fn cookie_name_is_prefix_plus_state() {
+        for (secure, path) in [(true, "/"), (true, "/app"), (false, "/")] {
+            let name = login_state_cookie_name("abc123", secure, path, DEFAULT_LOGIN_COOKIE_PREFIX);
+            let prefix = login_state_cookie_name_prefix(secure, path, DEFAULT_LOGIN_COOKIE_PREFIX);
+            assert_eq!(name, format!("{prefix}abc123"));
+        }
+    }
+
+    #[test]
     fn cookie_name_contains_state() {
         let name = login_state_cookie_name("mystate", true, "/", DEFAULT_LOGIN_COOKIE_PREFIX);
         assert!(name.contains("mystate"));
@@ -301,6 +341,38 @@ mod tests {
     #[test]
     fn state_rejects_non_ascii() {
         assert!(!is_valid_oauth_state("café"));
+    }
+
+    // -- session_cookie_name tests --
+
+    #[test]
+    fn session_cookie_name_prefixes_secure_root() {
+        assert_eq!(
+            session_cookie_name("sess".into(), true, "/"),
+            "__Host-sess"
+        );
+    }
+
+    #[test]
+    fn session_cookie_name_skips_insecure() {
+        assert_eq!(session_cookie_name("sess".into(), false, "/"), "sess");
+    }
+
+    #[test]
+    fn session_cookie_name_skips_subpath() {
+        assert_eq!(session_cookie_name("sess".into(), true, "/app"), "sess");
+    }
+
+    #[test]
+    fn session_cookie_name_keeps_existing_prefix() {
+        assert_eq!(
+            session_cookie_name("__Host-sess".into(), true, "/"),
+            "__Host-sess"
+        );
+        assert_eq!(
+            session_cookie_name("__Secure-sess".into(), true, "/"),
+            "__Secure-sess"
+        );
     }
 
     // -- kid sidecar tests --

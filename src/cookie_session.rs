@@ -19,7 +19,8 @@ use crate::{
     completed_login::CompletedLogin,
     cookie::{
         DEFAULT_COOKIE_MAX_AGE, SessionCipher, cookie_attrs, decode_payload, encode_kid,
-        encode_payload, get_kid_cookie, kid_cookie_name, unseal_with_kid_fallback,
+        encode_payload, get_kid_cookie, kid_cookie_name, session_cookie_name,
+        unseal_with_kid_fallback,
     },
     enrich::{NoEnrichment, SessionEnricher},
     metrics::{DecryptResult, SessionCookieMetrics},
@@ -45,10 +46,20 @@ const CHUNK_SIZE: usize = 3800;
 /// (no OP confirmation page), store the `id_token` in your custom type and
 /// override [`Session::id_token`]:
 ///
-/// ```ignore
+/// ```
+/// # use huskarl::token::IdToken;
+/// # use huskarl_login::{Session, SessionState};
+/// # struct MySession {
+/// #     state: SessionState,
+/// #     id_token: Option<IdToken>,
+/// # }
 /// impl Session for MySession {
-///     fn id_token(&self) -> Option<&IdToken> { self.id_token.as_ref() }
+///     fn id_token(&self) -> Option<&IdToken> {
+///         self.id_token.as_ref()
+///     }
 ///     // ...other methods
+/// #     fn state(&self) -> &SessionState { &self.state }
+/// #     fn set_state(&mut self, state: SessionState) { self.state = state; }
 /// }
 /// ```
 ///
@@ -57,12 +68,19 @@ const CHUNK_SIZE: usize = 3800;
 /// If any of your custom fields come from a refresh response, override
 /// [`Session::apply_refresh`] to update them alongside the [`SessionState`]:
 ///
-/// ```ignore
+/// ```
+/// # use huskarl::{core::platform::Duration, grant::core::TokenResponse};
+/// # use huskarl_login::{Session, SessionState};
+/// # struct MySession { state: SessionState }
+/// # impl Session for MySession {
+/// #     fn state(&self) -> &SessionState { &self.state }
+/// #     fn set_state(&mut self, state: SessionState) { self.state = state; }
 /// fn apply_refresh(&mut self, token_response: &TokenResponse, default_lifetime: Duration) {
 ///     let new_state = self.state().refreshed(token_response, default_lifetime);
 ///     self.set_state(new_state);
 ///     // update your own fields from token_response here
 /// }
+/// # }
 /// ```
 pub trait CookiePayload:
     Session + Serialize + for<'de> Deserialize<'de> + MaybeSendSync + 'static
@@ -126,6 +144,14 @@ impl From<SessionState> for CookieSession {
 /// - Chunk value: raw base64 of the sealed payload, split across chunks
 /// - Attributes: `HttpOnly; SameSite=Lax; Path={path}` plus optional `Secure`
 ///
+/// When `secure` is set and `cookie_path` is `"/"`, the configured name is
+/// automatically given the `__Host-` prefix (unless it already starts with
+/// `__Host-` or `__Secure-`). The prefix makes the browser reject the cookie
+/// if set by a sibling subdomain or over plain HTTP, blocking session
+/// fixation by cookie tossing. Note that enabling this on an existing
+/// deployment renames the cookie: in-flight sessions under the old name are
+/// ignored and users re-login on their next navigation.
+///
 /// On read, chunks are concatenated by walking `{name}.0`, `{name}.1`, … until
 /// an index is missing. Truncation or stale leftover chunks just produce a
 /// payload the AEAD layer can't authenticate, which surfaces as "no session"
@@ -162,6 +188,7 @@ impl<C> CookieSessionStore<C> {
         /// Optional metrics observer for encrypt/decrypt events.
         metrics: Option<Arc<dyn SessionCookieMetrics>>,
     ) -> Self {
+        let cookie_name = session_cookie_name(cookie_name, secure, &cookie_path);
         Self {
             cipher: AeadV1Cipher::new(cipher),
             cookie_name,
@@ -608,7 +635,7 @@ mod tests {
     fn request_with_chunk_slots(n: usize) -> HeaderMap {
         let mut headers = HeaderMap::new();
         if n > 0 {
-            let pairs: Vec<String> = (0..n).map(|i| format!("huskarl_session.{i}=x")).collect();
+            let pairs: Vec<String> = (0..n).map(|i| format!("__Host-huskarl_session.{i}=x")).collect();
             headers.insert(http::header::COOKIE, pairs.join("; ").parse().unwrap());
         }
         headers
@@ -626,7 +653,7 @@ mod tests {
             .unwrap();
 
         let chunk0 = cookies[0].to_str().unwrap();
-        assert!(chunk0.starts_with("huskarl_session.0="), "got: {chunk0}");
+        assert!(chunk0.starts_with("__Host-huskarl_session.0="), "got: {chunk0}");
         let value = chunk0.split('=').nth(1).unwrap().split(';').next().unwrap();
         // URL-safe base64 has no ':' — chunk 0 is now raw payload, no prefix.
         assert!(
@@ -663,11 +690,11 @@ mod tests {
             .iter()
             .filter(|c| {
                 let s = c.to_str().unwrap();
-                // Exclude the kid sidecar: it lives under `huskarl_session.kid`
+                // Exclude the kid sidecar: it lives under `__Host-huskarl_session.kid`
                 // and is always emitted (as a set or clear) on save, but it's
                 // not a chunk.
-                s.contains("huskarl_session.")
-                    && !s.starts_with("huskarl_session.kid=")
+                s.contains("__Host-huskarl_session.")
+                    && !s.starts_with("__Host-huskarl_session.kid=")
                     && s.contains("Max-Age=0")
             })
             .count();
@@ -693,7 +720,7 @@ mod tests {
         let expected_value = URL_SAFE_NO_PAD.encode("arn:aws:kms:us-east-1:111:key/abc".as_bytes());
         let kid_set = cookies.iter().any(|c| {
             let s = c.to_str().unwrap();
-            s.starts_with(&format!("huskarl_session.kid={expected_value};"))
+            s.starts_with(&format!("__Host-huskarl_session.kid={expected_value};"))
         });
         assert!(kid_set, "expected kid sidecar set to base64url(identity)");
     }
@@ -714,7 +741,7 @@ mod tests {
         let req_headers = request_cookies_from_set_cookies(&set_cookies);
         // Sanity: the kid sidecar made it into the simulated request.
         assert_eq!(
-            get_kid_cookie(&req_headers, "huskarl_session").as_deref(),
+            get_kid_cookie(&req_headers, "__Host-huskarl_session").as_deref(),
             Some("test-kid")
         );
         let loaded = store.load_session(&req_headers).await;
@@ -752,9 +779,9 @@ mod tests {
         let stripped: Vec<&str> = existing
             .split(';')
             .map(str::trim)
-            .filter(|p| !p.starts_with("huskarl_session.kid="))
+            .filter(|p| !p.starts_with("__Host-huskarl_session.kid="))
             .collect();
-        let combined = format!("{}; huskarl_session.kid=!!!", stripped.join("; "));
+        let combined = format!("{}; __Host-huskarl_session.kid=!!!", stripped.join("; "));
         req_headers.insert(http::header::COOKIE, combined.parse().unwrap());
         assert!(store.load_session(&req_headers).await.is_some());
     }
@@ -811,10 +838,10 @@ mod tests {
         let mut pairs: Vec<String> = existing
             .split(';')
             .map(str::trim)
-            .filter(|p| !p.starts_with("huskarl_session.kid="))
+            .filter(|p| !p.starts_with("__Host-huskarl_session.kid="))
             .map(str::to_owned)
             .collect();
-        pairs.push(format!("huskarl_session.kid={value}"));
+        pairs.push(format!("__Host-huskarl_session.kid={value}"));
         req_headers.insert(http::header::COOKIE, pairs.join("; ").parse().unwrap());
     }
 
@@ -833,7 +860,7 @@ mod tests {
         let mut req = request_cookies_from_set_cookies(&set_cookies);
         // Sanity: the save stamped the real sealing key's identity.
         assert_eq!(
-            get_kid_cookie(&req, "huskarl_session").as_deref(),
+            get_kid_cookie(&req, "__Host-huskarl_session").as_deref(),
             Some("v2")
         );
         override_kid_cookie(&mut req, &encode_kid("v1"));
@@ -874,7 +901,7 @@ mod tests {
         headers.insert(
             http::header::COOKIE,
             format!(
-                "huskarl_session.0={}; huskarl_session.kid={}",
+                "__Host-huskarl_session.0={}; __Host-huskarl_session.kid={}",
                 URL_SAFE_NO_PAD.encode(&bundle),
                 encode_kid("v1"),
             )
@@ -897,7 +924,7 @@ mod tests {
             .unwrap();
         let kid_clear = cookies.iter().any(|c| {
             let s = c.to_str().unwrap();
-            s.starts_with("huskarl_session.kid=;") && s.contains("Max-Age=0")
+            s.starts_with("__Host-huskarl_session.kid=;") && s.contains("Max-Age=0")
         });
         assert!(
             kid_clear,
@@ -918,14 +945,14 @@ mod tests {
         for stale in 1..5 {
             let cleared = cookies.iter().any(|c| {
                 let s = c.to_str().unwrap();
-                s.starts_with(&format!("huskarl_session.{stale}=;")) && s.contains("Max-Age=0")
+                s.starts_with(&format!("__Host-huskarl_session.{stale}=;")) && s.contains("Max-Age=0")
             });
             assert!(cleared, "expected clear for stale slot .{stale}");
         }
         // Slot .0 is being overwritten with data, not cleared.
         let zero_clear = cookies.iter().any(|c| {
             let s = c.to_str().unwrap();
-            s.starts_with("huskarl_session.0=;") && s.contains("Max-Age=0")
+            s.starts_with("__Host-huskarl_session.0=;") && s.contains("Max-Age=0")
         });
         assert!(
             !zero_clear,
@@ -1096,7 +1123,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::COOKIE,
-            "huskarl_session.0=AAAA; huskarl_session.2=BBBB"
+            "__Host-huskarl_session.0=AAAA; __Host-huskarl_session.2=BBBB"
                 .parse()
                 .unwrap(),
         );
@@ -1110,7 +1137,7 @@ mod tests {
         // Valid base64 but won't decrypt under the test cipher.
         headers.insert(
             http::header::COOKIE,
-            "huskarl_session.0=AAAAAAAAAAAA".parse().unwrap(),
+            "__Host-huskarl_session.0=AAAAAAAAAAAA".parse().unwrap(),
         );
         assert!(store.load_session(&headers).await.is_none());
     }
@@ -1130,13 +1157,13 @@ mod tests {
         for i in 0..5 {
             let found = clears.iter().any(|c| {
                 let s = c.to_str().unwrap();
-                s.starts_with(&format!("huskarl_session.{i}=;"))
+                s.starts_with(&format!("__Host-huskarl_session.{i}=;"))
             });
             assert!(found, "expected clear for slot .{i}");
         }
         let kid_cleared = clears.iter().any(|c| {
             let s = c.to_str().unwrap();
-            s.starts_with("huskarl_session.kid=;")
+            s.starts_with("__Host-huskarl_session.kid=;")
         });
         assert!(kid_cleared, "expected kid sidecar clear");
     }
@@ -1148,7 +1175,7 @@ mod tests {
         assert_eq!(clears.len(), 1);
         let kid = clears.iter().any(|c| {
             let s = c.to_str().unwrap();
-            s.starts_with("huskarl_session.kid=;") && s.contains("Max-Age=0")
+            s.starts_with("__Host-huskarl_session.kid=;") && s.contains("Max-Age=0")
         });
         assert!(kid, "expected kid sidecar clear");
     }
@@ -1159,7 +1186,7 @@ mod tests {
     async fn parse_chunk_pair_matches_indexed_cookie() {
         let store = test_store().await;
         assert_eq!(
-            store.parse_chunk_pair("huskarl_session.3=abc"),
+            store.parse_chunk_pair("__Host-huskarl_session.3=abc"),
             Some((3, "abc".to_owned()))
         );
     }
@@ -1173,14 +1200,14 @@ mod tests {
     #[tokio::test]
     async fn parse_chunk_pair_rejects_base_name_without_index() {
         let store = test_store().await;
-        // "huskarl_session=foo" — missing `.N` suffix.
-        assert_eq!(store.parse_chunk_pair("huskarl_session=foo"), None);
+        // "__Host-huskarl_session=foo" — missing `.N` suffix.
+        assert_eq!(store.parse_chunk_pair("__Host-huskarl_session=foo"), None);
     }
 
     #[tokio::test]
     async fn parse_chunk_pair_rejects_non_numeric_suffix() {
         let store = test_store().await;
-        assert_eq!(store.parse_chunk_pair("huskarl_session.abc=foo"), None);
+        assert_eq!(store.parse_chunk_pair("__Host-huskarl_session.abc=foo"), None);
     }
 
     #[tokio::test]
@@ -1191,11 +1218,11 @@ mod tests {
         // still parses; the reassembler stops at the first gap regardless.
         let store = test_store().await;
         assert_eq!(
-            store.parse_chunk_pair("huskarl_session.42=foo"),
+            store.parse_chunk_pair("__Host-huskarl_session.42=foo"),
             Some((42, "foo".to_owned()))
         );
         assert_eq!(
-            store.parse_chunk_pair("huskarl_session.1000000=foo"),
+            store.parse_chunk_pair("__Host-huskarl_session.1000000=foo"),
             Some((1_000_000, "foo".to_owned()))
         );
     }
@@ -1326,7 +1353,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::COOKIE,
-            "huskarl_session.0=not!!valid!!base64".parse().unwrap(),
+            "__Host-huskarl_session.0=not!!valid!!base64".parse().unwrap(),
         );
         store.load_session(&headers).await;
         assert_eq!(m.decrypts(), vec![(None, "bad_encoding")]);
@@ -1338,7 +1365,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::COOKIE,
-            "huskarl_session.0=AAAAAAAAAAAA".parse().unwrap(),
+            "__Host-huskarl_session.0=AAAAAAAAAAAA".parse().unwrap(),
         );
         store.load_session(&headers).await;
         assert_eq!(m.decrypts(), vec![(None, "decrypt_failed")]);
@@ -1389,7 +1416,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::COOKIE,
-            format!("huskarl_session.0={encoded}").parse().unwrap(),
+            format!("__Host-huskarl_session.0={encoded}").parse().unwrap(),
         );
         store.load_session(&headers).await;
         assert_eq!(m.decrypts(), vec![(None, "payload_invalid")]);
@@ -1422,7 +1449,7 @@ mod tests {
                     .map(str::trim)
                     .map(str::to_owned)
             })
-            .filter(|p| !p.starts_with("huskarl_session.kid="))
+            .filter(|p| !p.starts_with("__Host-huskarl_session.kid="))
             .collect();
         if !pairs.is_empty() {
             req.insert(http::header::COOKIE, pairs.join("; ").parse().unwrap());
