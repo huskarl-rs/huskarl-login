@@ -71,7 +71,7 @@ impl SessionState {
     /// and computing the token expiry from `expires_in` (or `default_lifetime`
     /// when absent).
     pub(crate) fn from_completed(
-        completed: &crate::grant::CompletedLogin,
+        completed: &crate::CompletedLogin,
         default_lifetime: Duration,
     ) -> Self {
         let now = SystemTime::now();

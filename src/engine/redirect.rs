@@ -4,20 +4,18 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
-use huskarl::core::{crypto::cipher::AeadSealer, http::HttpClient};
+use huskarl::{core::crypto::cipher::AeadSealer as _, grant::authorization_code::StartInput};
 
 use super::{EngineError, LoginEngine, LoginResponse, LoginStateCookie, error_chain};
 use crate::{
-    LoginGrant, SessionDriver,
+    SessionDriver,
     cookie::{cookie_attrs, encode_payload, login_state_cookie_name},
     url::{base_url_as_string, original_url},
 };
 
-impl<G, SD, H> LoginEngine<G, SD, H>
+impl<SD> LoginEngine<SD>
 where
-    G: LoginGrant,
     SD: SessionDriver,
-    H: HttpClient,
 {
     pub(super) async fn redirect_to_as(
         &self,
@@ -30,7 +28,7 @@ where
 
         let start = self
             .grant
-            .start(&self.http_client, self.config.scopes.clone())
+            .start(StartInput::scopes(self.config.scopes.clone()))
             .await?;
         let state = start.pending_state.state.clone();
 
@@ -69,7 +67,7 @@ where
             original_url,
             pending_state,
         })?;
-        let bundle = self.sealer.seal(&payload, state.as_bytes()).await?;
+        let bundle = self.cipher.seal(&payload, state.as_bytes()).await?;
         let cookie_name = login_state_cookie_name(
             state,
             self.config.secure,

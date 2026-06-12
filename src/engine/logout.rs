@@ -3,19 +3,16 @@
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
-use huskarl::core::http::HttpClient;
 
 use super::{LoginEngine, LoginResponse, error_chain, is_cross_site_request};
 use crate::{
-    LoginGrant, Session, SessionDriver,
+    Session, SessionDriver,
     url::{build_end_session_url, default_post_logout_redirect},
 };
 
-impl<G, SD, H> LoginEngine<G, SD, H>
+impl<SD> LoginEngine<SD>
 where
-    G: LoginGrant,
     SD: SessionDriver,
-    H: HttpClient,
 {
     pub(super) async fn handle_logout(&self, headers: &HeaderMap) -> LoginResponse {
         // Logout is state-changing and session cookies are SameSite=Lax (sent

@@ -4,23 +4,21 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
-use huskarl::core::{crypto::cipher::AeadUnsealer, http::HttpClient};
+use huskarl::{core::crypto::cipher::AeadUnsealer as _, grant::authorization_code::CompleteInput};
 use serde::Deserialize;
 
 use super::{LoginEngine, LoginResponse, LoginStateCookie, error_chain};
 use crate::{
-    LoginGrant, SessionDriver,
+    CompletedLogin, SessionDriver,
     cookie::{
         cookie_attrs, decode_payload, get_cookie, is_valid_oauth_state, login_state_cookie_name,
     },
     metrics::{LoginCompleteResult, normalize_as_error},
 };
 
-impl<G, SD, H> LoginEngine<G, SD, H>
+impl<SD> LoginEngine<SD>
 where
-    G: LoginGrant,
     SD: SessionDriver,
-    H: HttpClient,
 {
     pub(super) async fn handle_callback(&self, uri: &Uri, headers: &HeaderMap) -> LoginResponse {
         let (code, state, iss) = match parse_callback_params(uri.query().unwrap_or("")) {
@@ -76,18 +74,20 @@ where
             }
         };
 
+        let complete_input = CompleteInput::builder()
+            .code(code)
+            .state(state)
+            .maybe_iss(iss)
+            .build();
         let completed_login = match self
             .grant
-            .complete(
-                &self.http_client,
-                &login_state.pending_state,
-                code,
-                state,
-                iss,
-            )
+            .complete_oidc(&login_state.pending_state, complete_input)
             .await
         {
-            Ok(cl) => cl,
+            Ok((token_response, validated_id_token)) => CompletedLogin::builder()
+                .token_response(token_response)
+                .maybe_id_token_claims(validated_id_token.map(|jwt| jwt.claims))
+                .build(),
             Err(e) => {
                 log::error!("token exchange failed: {}", error_chain(&e));
                 self.record_login_complete(&LoginCompleteResult::TokenExchangeFailed, None);
@@ -191,7 +191,7 @@ where
             .decode(cookie_encoded)
             .map_err(|_| (StatusCode::BAD_REQUEST, "malformed state cookie"))?;
         let plaintext = self
-            .unsealer
+            .cipher
             .unseal(None, &bundle, state.as_bytes())
             .await
             .map_err(|_| (StatusCode::BAD_REQUEST, "state cookie decryption failed"))?;

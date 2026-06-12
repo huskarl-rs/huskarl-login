@@ -109,7 +109,8 @@ fn compute_browser_callback_path(
 /// Configuration for the login middleware.
 ///
 /// Authorization server endpoints, client credentials, and redirect URI are
-/// configured on the [`LoginGrant`](crate::LoginGrant) (i.e. [`AuthorizationCodeGrant`](huskarl::grant::authorization_code::AuthorizationCodeGrant))
+/// configured on the
+/// [`AuthorizationCodeGrant`](huskarl::grant::authorization_code::AuthorizationCodeGrant)
 /// directly.
 ///
 /// Cookie naming and the `Path` attribute for session cookies are the

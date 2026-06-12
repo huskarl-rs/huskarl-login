@@ -1,34 +1,58 @@
-# huskarl-login
+<!-- cargo-reedme: start -->
 
-Shared login core for huskarl framework integrations. Implements the OAuth 2.0
-Authorization Code Grant decision tree — callback handling, session lifecycle,
-token refresh — and is consumed by framework adapters such as `huskarl-axum`
-and `huskarl-pingora`.
+<!-- cargo-reedme: info-start
 
-## Deployment requirements
+    Do not edit this region by hand
+    ===============================
 
-### Refresh-token reuse grace period
+    This region was generated from Rust documentation comments by `cargo-reedme` using this command:
 
-This library performs **no client-side coordination between concurrent token
-refreshes**. In a distributed deployment, two requests for the same session can
-arrive at different replicas at the same time, both observe that the access
-token is near expiry, and both call your authorization server's token endpoint
-with the same refresh token.
+        cargo +nightly reedme
 
-For this to work without destroying sessions, the authorization server must
-provide a refresh-token reuse grace period — variously called "leeway", "reuse
-interval", or "rotation grace". Within this window the AS accepts the same
-refresh token from multiple requests instead of treating the second use as a
-replay. Without one, the second refresh fails with `invalid_grant`; and if the
-AS has strict reuse-detection enabled it may invalidate the entire
-refresh-token family, terminating both sessions on the next request.
+    for more info: https://github.com/nik-rev/cargo-reedme
 
-Most major IdPs support a configurable grace period (Auth0, Keycloak, Okta,
-and others). Check your authorization server's documentation and confirm the
-value is non-zero before deploying at scale.
+cargo-reedme: info-end -->
 
-If your AS cannot provide a grace period, refresh races must be coordinated
-outside this library — for example a Redis `SETNX` lock or a Postgres advisory
-lock keyed by session ID. An in-process lock is intentionally not provided:
-it would pass single-replica tests and then silently fail the moment a second
-replica was added.
+Shared login core for huskarl framework integrations.
+
+This crate contains the framework-agnostic login logic shared by
+`huskarl-axum` and `huskarl-pingora`: configuration, session drivers,
+session enrichment, cookie helpers, URL helpers, and session store traits.
+The OAuth flow itself is driven by a
+[`huskarl::grant::authorization_code::AuthorizationCodeGrant`](https://docs.rs/huskarl/latest/huskarl/grant/authorization_code/grant/struct.AuthorizationCodeGrant.html), passed
+directly to the [`engine::LoginEngine`](https://docs.rs/huskarl-login/latest/huskarl_login/engine/struct.LoginEngine.html).
+
+# Session model
+
+Session creation follows one model regardless of where sessions live: the
+framework prepares a *seed* ([`SessionState`](https://docs.rs/huskarl-login/latest/huskarl_login/session_state/struct.SessionState.html), plus the session key for
+store-backed sessions), a [`SessionEnricher`](https://docs.rs/huskarl-login/latest/huskarl_login/enrich/trait.SessionEnricher.html) builds the application’s
+session type from the seed and the [`CompletedLogin`](https://docs.rs/huskarl-login/latest/huskarl_login/completed_login/struct.CompletedLogin.html) (mapping ID token
+claims, calling the OIDC `UserInfo` endpoint, …), and the chosen backend
+stores it:
+
+- [`CookieSessionStore`](https://docs.rs/huskarl-login/latest/huskarl_login/cookie_session/struct.CookieSessionStore.html) seals the session into chunked, AEAD-encrypted
+  browser cookies — no server-side storage.
+- [`StoreBackedSessionStore`](https://docs.rs/huskarl-login/latest/huskarl_login/store_session/struct.StoreBackedSessionStore.html) keeps an encrypted pointer cookie and
+  persists the session via an [`ExternalSessionStore`](https://docs.rs/huskarl-login/latest/huskarl_login/store_session/trait.ExternalSessionStore.html) (Redis, a
+  database, …).
+
+The default enricher, [`NoEnrichment`](https://docs.rs/huskarl-login/latest/huskarl_login/enrich/struct.NoEnrichment.html), converts the seed straight into
+the session type via `From`; pass a custom one to the store builders’
+`build_with_enricher` finisher.
+
+The canonical [`SessionDriver`](https://docs.rs/huskarl-login/latest/huskarl_login/session/trait.SessionDriver.html) interface returns `Vec<HeaderValue>` from
+mutating methods (`save`, `touch`, `delete`). Framework crates that need a
+different interface (e.g. Pingora’s `&mut ResponseHeader`) adapt with a
+small helper that appends the returned headers.
+
+# Platform support
+
+Trait bounds use `huskarl::core::platform`’s `MaybeSend` / `MaybeSendSync`
+markers rather than bare `Send` / `Sync`: on native targets they are
+equivalent to `Send + Sync`, while on `wasm32` (assumed single-threaded)
+the requirement disappears. Time and sleeping likewise go through
+`huskarl::core::platform`, so the crate compiles for
+`wasm32-unknown-unknown` and WASI targets.
+
+<!-- cargo-reedme: end -->

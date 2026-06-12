@@ -22,19 +22,23 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use huskarl::{
     core::{
-        BoxedError, Error as _,
-        crypto::cipher::{AeadV1Sealer, AeadV1Unsealer, BoxedAeadCipher},
-        http::HttpClient,
+        Error,
+        crypto::cipher::{AeadCipher, AeadV1Cipher},
         platform::{Duration, MaybeSendSync, SystemTime, sleep},
     },
-    grant::{authorization_code::PendingState, core::TokenResponse},
+    grant::{
+        authorization_code::{AuthorizationCodeGrant, PendingState},
+        core::{OAuth2ExchangeGrant as _, TokenResponse},
+        refresh::RefreshGrantParameters,
+    },
     token::RefreshToken,
 };
 use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DefaultErrorPage, ErrorPage, LoginConfig, LoginGrant, Session, SessionDriver, SessionError,
+    DefaultErrorPage, ErrorPage, LoginConfig, Session, SessionDriver, SessionError,
+    cookie::SessionCipher,
     metrics::{
         ActivityOutcome, LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult,
     },
@@ -168,13 +172,11 @@ struct LoginStateCookie {
 ///
 /// See the [module documentation](self) for the set of primitives this
 /// engine exposes; framework adapters compose them into middleware.
-pub struct LoginEngine<G, SD, H> {
+pub struct LoginEngine<SD> {
     config: LoginConfig,
-    grant: G,
+    grant: AuthorizationCodeGrant,
     session_store: SD,
-    sealer: AeadV1Sealer<BoxedAeadCipher>,
-    unsealer: AeadV1Unsealer<BoxedAeadCipher>,
-    http_client: H,
+    cipher: SessionCipher,
     error_page: Box<dyn ErrorPage>,
     metrics: Option<Arc<dyn LoginEngineMetrics>>,
 }
@@ -182,13 +184,15 @@ pub struct LoginEngine<G, SD, H> {
 // ── Constructor ───────────────────────────────────────────────────────────────
 
 #[bon::bon]
-impl<G, SD, H> LoginEngine<G, SD, H>
+impl<SD> LoginEngine<SD>
 where
-    G: LoginGrant,
     SD: SessionDriver,
-    H: HttpClient,
 {
     /// Creates a new `LoginEngine`.
+    ///
+    /// The `grant` drives the OAuth flow itself — PAR, JAR, `DPoP`, PKCE, and
+    /// state/nonce generation all follow the grant's own configuration, and
+    /// the grant carries its own HTTP client.
     ///
     /// The `cipher` is used only for the short-lived login-state cookie (CSRF
     /// protection during the OAuth flow). Session persistence is handled
@@ -196,10 +200,10 @@ where
     #[builder]
     pub fn new(
         config: LoginConfig,
-        grant: G,
+        grant: AuthorizationCodeGrant,
         session_store: SD,
-        cipher: BoxedAeadCipher,
-        http_client: H,
+        #[builder(with = |cipher: impl AeadCipher + 'static| Arc::new(cipher) as Arc<dyn AeadCipher>)]
+        cipher: Arc<dyn AeadCipher>,
         /// Custom error page renderer. Defaults to [`DefaultErrorPage`].
         #[builder(default = Box::new(DefaultErrorPage) as Box<dyn ErrorPage>)]
         error_page: Box<dyn ErrorPage>,
@@ -210,9 +214,7 @@ where
             config,
             grant,
             session_store,
-            sealer: AeadV1Sealer::new(cipher.clone()),
-            unsealer: AeadV1Unsealer::new(cipher),
-            http_client,
+            cipher: AeadV1Cipher::new(cipher),
             error_page,
             metrics,
         }
@@ -221,7 +223,7 @@ where
 
 // ── Accessors (no trait bounds needed) ────────────────────────────────────────
 
-impl<G, SD, H> LoginEngine<G, SD, H> {
+impl<SD> LoginEngine<SD> {
     /// Returns a reference to the login configuration.
     pub fn config(&self) -> &LoginConfig {
         &self.config
@@ -235,11 +237,9 @@ impl<G, SD, H> LoginEngine<G, SD, H> {
 
 // ── Core logic ────────────────────────────────────────────────────────────────
 
-impl<G, SD, H> LoginEngine<G, SD, H>
+impl<SD> LoginEngine<SD>
 where
-    G: LoginGrant,
     SD: SessionDriver,
-    H: HttpClient,
 {
     /// If `path` is the configured callback or logout path, returns the
     /// corresponding response. Otherwise returns `None` and the framework
@@ -439,21 +439,25 @@ where
         }
     }
 
-    /// Calls the grant's refresh up to [`REFRESH_MAX_ATTEMPTS`] times, retrying
-    /// only when the underlying error advertises itself as retryable (transient
-    /// transport failures). Non-retryable errors (e.g. `invalid_grant` from the
-    /// authorization server) are returned immediately so we don't waste calls —
-    /// or risk tripping AS-side rate limiting — on a refresh token the AS has
-    /// already rejected.
+    /// Exchanges the refresh token up to [`REFRESH_MAX_ATTEMPTS`] times,
+    /// retrying only when the underlying error advertises itself as retryable
+    /// (transient transport failures). Non-retryable errors (e.g.
+    /// `invalid_grant` from the authorization server) are returned immediately
+    /// so we don't waste calls — or risk tripping AS-side rate limiting — on a
+    /// refresh token the AS has already rejected.
     ///
     /// Retries use exponential backoff with jitter ([`refresh_retry_delay`]) so
     /// a brief AS outage doesn't produce a synchronized thundering herd when
     /// every in-flight refresh retries at the same moment.
-    async fn refresh_with_retry(&self, rt: &RefreshToken) -> Result<TokenResponse, BoxedError> {
+    async fn refresh_with_retry(&self, rt: &RefreshToken) -> Result<TokenResponse, Error> {
+        let refresh_grant = self.grant.to_refresh_grant();
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.grant.refresh(&self.http_client, rt).await {
+            match refresh_grant
+                .exchange(RefreshGrantParameters::refresh_token(rt.clone()))
+                .await
+            {
                 Ok(tr) => return Ok(tr),
                 Err(e) if attempt < REFRESH_MAX_ATTEMPTS && e.is_retryable() => {
                     let delay = refresh_retry_delay(attempt);

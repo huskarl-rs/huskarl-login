@@ -1,6 +1,9 @@
 use std::{
     convert::Infallible,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -9,15 +12,14 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use huskarl::{
     core::{
-        BoxedError,
-        crypto::cipher::{AeadSealer, AeadV1Sealer, BoxedAeadCipher},
-        http::{HttpClient, HttpResponse},
+        Error, ErrorKind,
+        client_auth::NoAuth,
+        crypto::cipher::{AeadSealer as _, AeadV1Cipher},
+        http::{HttpClient, HttpResponse, Idempotency},
+        platform::MaybeSendBoxFuture,
         secrets::{Secret, SecretBytes, SecretOutput},
     },
-    grant::{
-        authorization_code::{PendingState, StartOutput},
-        core::TokenResponse,
-    },
+    grant::authorization_code::{AuthorizationCodeGrant, PendingState},
     token::RefreshToken,
 };
 use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
@@ -27,8 +29,7 @@ use super::{
     is_navigation_request,
 };
 use crate::{
-    LoginConfig, LoginGrant, Session, SessionDriver, SessionError,
-    grant::CompletedLogin,
+    CompletedLogin, LoginConfig, Session, SessionDriver, SessionError, SessionState,
     metrics::{
         ActivityOutcome, LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult,
     },
@@ -42,52 +43,137 @@ struct TestSecret(SecretBytes);
 
 impl Secret for TestSecret {
     type Output = SecretBytes;
-    type Error = Infallible;
-    async fn get_secret_value(&self) -> Result<SecretOutput<SecretBytes>, Infallible> {
-        Ok(SecretOutput {
+    fn get_secret_value(&self) -> MaybeSendBoxFuture<'_, Result<SecretOutput<SecretBytes>, Error>> {
+        let out = SecretOutput {
             value: self.0.clone(),
             identity: None,
-        })
+        };
+        Box::pin(async move { Ok(out) })
     }
 }
 
-async fn test_cipher() -> BoxedAeadCipher {
-    let key = AesGcmKey::from_secret(
+async fn test_cipher() -> AesGcmKey {
+    AesGcmKey::from_secret(
         AesGcmKeyType::Aes256,
         TestSecret(SecretBytes::new(vec![0u8; 32])),
         |_| None,
     )
     .await
-    .unwrap();
-    BoxedAeadCipher::new(key)
+    .unwrap()
 }
 
-// ── MockHttpClient ────────────────────────────────────────────────────────
+// ── HTTP doubles ──────────────────────────────────────────────────────────
 
-struct MockHttpResponse;
+#[derive(Debug)]
+struct FlakyError;
 
-impl HttpResponse for MockHttpResponse {
-    type Error = Infallible;
-    fn status(&self) -> StatusCode {
-        unimplemented!()
-    }
-    fn headers(&self) -> HeaderMap {
-        unimplemented!()
-    }
-    async fn body(self) -> Result<Bytes, Infallible> {
-        unimplemented!()
+impl std::fmt::Display for FlakyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("flaky transport error")
     }
 }
 
-struct MockHttpClient;
+impl std::error::Error for FlakyError {}
 
-impl HttpClient for MockHttpClient {
-    type Response = MockHttpResponse;
-    type Error = Infallible;
-    type ResponseError = Infallible;
-    async fn execute(&self, _: http::Request<Bytes>) -> Result<MockHttpResponse, Infallible> {
-        unimplemented!()
+/// Fails every request with a transport error of the given retryability,
+/// counting calls. One refresh attempt makes exactly one token-endpoint
+/// request (`NoAuth` needs no HTTP and no `DPoP` is configured), so the call
+/// count equals the attempt count.
+struct FailingHttp {
+    calls: Arc<AtomicU32>,
+    retryable: bool,
+}
+
+impl FailingHttp {
+    fn new(retryable: bool) -> (Self, Arc<AtomicU32>) {
+        let calls = Arc::new(AtomicU32::new(0));
+        (
+            Self {
+                calls: Arc::clone(&calls),
+                retryable,
+            },
+            calls,
+        )
     }
+}
+
+impl HttpClient for FailingHttp {
+    fn execute(
+        &self,
+        _: http::Request<Bytes>,
+        _: Idempotency,
+    ) -> MaybeSendBoxFuture<'_, Result<HttpResponse, Error>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let retryable = self.retryable;
+        Box::pin(async move { Err(Error::new(ErrorKind::Transport { retryable }, FlakyError)) })
+    }
+}
+
+/// Answers every request with a minimal valid token response, exercising the
+/// success paths (token exchange on callback, token refresh).
+struct TokenHttp;
+
+impl HttpClient for TokenHttp {
+    fn execute(
+        &self,
+        _: http::Request<Bytes>,
+        _: Idempotency,
+    ) -> MaybeSendBoxFuture<'_, Result<HttpResponse, Error>> {
+        Box::pin(async {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            Ok(HttpResponse {
+                status: StatusCode::OK,
+                headers,
+                body: Bytes::from_static(
+                    br#"{"access_token":"at","token_type":"Bearer","expires_in":3600}"#,
+                ),
+            })
+        })
+    }
+}
+
+// ── Grant fixtures ────────────────────────────────────────────────────────
+
+/// A real `AuthorizationCodeGrant` over the given HTTP double. `start()` uses
+/// direct delivery (no PAR) and performs no HTTP, so the double only sees
+/// token-endpoint requests.
+async fn test_grant(http_client: impl HttpClient + 'static) -> AuthorizationCodeGrant {
+    AuthorizationCodeGrant::builder()
+        .client_id("client")
+        .http_client(http_client)
+        .client_auth(NoAuth)
+        .token_endpoint("https://auth.example.com/token")
+        .unwrap()
+        .authorization_endpoint("https://auth.example.com/authorize")
+        .unwrap()
+        .redirect_uri("https://app.example.com/callback")
+        .build()
+        .await
+        .unwrap()
+}
+
+/// A grant that must deliver its authorization request via PAR, so `start()`
+/// performs HTTP and fails against the failing double.
+async fn par_failing_grant() -> AuthorizationCodeGrant {
+    AuthorizationCodeGrant::builder()
+        .client_id("client")
+        .http_client(FailingHttp::new(false).0)
+        .client_auth(NoAuth)
+        .token_endpoint("https://auth.example.com/token")
+        .unwrap()
+        .authorization_endpoint("https://auth.example.com/authorize")
+        .unwrap()
+        .pushed_authorization_request_endpoint("https://auth.example.com/par")
+        .unwrap()
+        .require_pushed_authorization_requests(true)
+        .redirect_uri("https://app.example.com/callback")
+        .build()
+        .await
+        .unwrap()
 }
 
 // ── MockSession ───────────────────────────────────────────────────────────
@@ -175,11 +261,16 @@ impl SessionDriver for MockSessionStore {
 
     async fn create(
         &self,
-        _: CompletedLogin,
-        _: Duration,
+        completed: CompletedLogin,
+        default_lifetime: Duration,
         _: &HeaderMap,
     ) -> Result<(MockSession, Vec<HeaderValue>), SessionError> {
-        unimplemented!()
+        Ok((
+            MockSession {
+                state: SessionState::from_completed(&completed, default_lifetime),
+            },
+            vec![],
+        ))
     }
     async fn load(&self, _: &HeaderMap) -> Result<Option<MockSession>, Infallible> {
         Ok(self.session.lock().unwrap().take())
@@ -253,51 +344,6 @@ impl SessionDriver for ErrorSessionStore {
     }
 }
 
-// ── MockGrant ─────────────────────────────────────────────────────────────
-
-struct MockGrant {
-    authorization_url: &'static str,
-}
-
-impl LoginGrant for MockGrant {
-    async fn start(&self, _: &impl HttpClient, _: Vec<String>) -> Result<StartOutput, BoxedError> {
-        Ok(StartOutput {
-            authorization_url: self.authorization_url.parse().unwrap(),
-            expires_in: None,
-            pending_state: PendingState {
-                redirect_uri: "https://app.example.com/callback".to_owned(),
-                pkce_verifier: None,
-                state: "mock_state".to_owned(),
-                nonce: "mock_nonce".to_owned(),
-                dpop_jkt: None,
-            },
-        })
-    }
-
-    async fn complete(
-        &self,
-        _: &impl HttpClient,
-        _: &PendingState,
-        _: String,
-        _: String,
-        _: Option<String>,
-    ) -> Result<CompletedLogin, BoxedError> {
-        Err(BoxedError::from_err("\0".parse::<http::Uri>().unwrap_err()))
-    }
-
-    // Note: constructing a successful TokenResponse requires huskarl's
-    // pub(crate) RawTokenResponse::into_token_response, so only the failure
-    // path is testable here. The success path (Continue { Save }) is covered
-    // indirectly by the persist_session test with Save persistence.
-    async fn refresh(
-        &self,
-        _: &impl HttpClient,
-        _: &RefreshToken,
-    ) -> Result<TokenResponse, BoxedError> {
-        Err(BoxedError::from_err("\0".parse::<http::Uri>().unwrap_err()))
-    }
-}
-
 // ── Engine / config helpers ───────────────────────────────────────────────
 
 fn default_config() -> LoginConfig {
@@ -319,24 +365,19 @@ fn config_with_logout() -> LoginConfig {
         .unwrap()
 }
 
-async fn engine(
-    store: MockSessionStore,
-) -> LoginEngine<MockGrant, MockSessionStore, MockHttpClient> {
+async fn engine(store: MockSessionStore) -> LoginEngine<MockSessionStore> {
     engine_with_config(store, default_config()).await
 }
 
 async fn engine_with_config(
     store: MockSessionStore,
     config: LoginConfig,
-) -> LoginEngine<MockGrant, MockSessionStore, MockHttpClient> {
+) -> LoginEngine<MockSessionStore> {
     LoginEngine::builder()
         .config(config)
-        .grant(MockGrant {
-            authorization_url: "https://auth.example.com/authorize",
-        })
+        .grant(test_grant(FailingHttp::new(false).0).await)
         .session_store(store)
         .cipher(test_cipher().await)
-        .http_client(MockHttpClient)
         .build()
 }
 
@@ -364,8 +405,7 @@ fn api_headers() -> HeaderMap {
 // ── Login-state cookie helper ─────────────────────────────────────────────
 
 async fn seal_login_cookie(state: &str, original_url: &str) -> String {
-    let cipher = test_cipher().await;
-    let sealer = AeadV1Sealer::new(cipher);
+    let sealer = AeadV1Cipher::new(test_cipher().await);
     let cookie = super::LoginStateCookie {
         original_url: original_url.to_owned(),
         pending_state: PendingState {
@@ -606,8 +646,13 @@ async fn redirect_to_login_navigation_returns_302() {
         .headers
         .iter()
         .find(|(n, _)| *n == http::header::LOCATION)
-        .map(|(_, v)| v.to_str().unwrap());
-    assert_eq!(loc, Some("https://auth.example.com/authorize"));
+        .map(|(_, v)| v.to_str().unwrap())
+        .expect("Location header");
+    assert!(
+        loc.starts_with("https://auth.example.com/authorize?"),
+        "{loc}"
+    );
+    assert!(loc.contains("client_id=client"), "{loc}");
 }
 
 #[tokio::test]
@@ -821,86 +866,6 @@ async fn token_expired_refresh_fails_clears_session() {
 
 // ── Refresh retry ─────────────────────────────────────────────────────────
 
-#[derive(Debug)]
-struct FlakyError {
-    retryable: bool,
-}
-
-impl std::fmt::Display for FlakyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("flaky transport error")
-    }
-}
-
-impl std::error::Error for FlakyError {}
-
-impl huskarl::core::Error for FlakyError {
-    fn is_retryable(&self) -> bool {
-        self.retryable
-    }
-}
-
-struct RetryGrant {
-    refresh_calls: std::sync::atomic::AtomicU32,
-    /// Number of leading attempts that should fail. The next attempt succeeds
-    /// if a `token_response` is available, otherwise it keeps failing.
-    fail_first_n: u32,
-    retryable: bool,
-}
-
-impl RetryGrant {
-    fn refresh_count(&self) -> u32 {
-        self.refresh_calls.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-impl LoginGrant for RetryGrant {
-    async fn start(&self, _: &impl HttpClient, _: Vec<String>) -> Result<StartOutput, BoxedError> {
-        unimplemented!()
-    }
-
-    async fn complete(
-        &self,
-        _: &impl HttpClient,
-        _: &PendingState,
-        _: String,
-        _: String,
-        _: Option<String>,
-    ) -> Result<CompletedLogin, BoxedError> {
-        unimplemented!()
-    }
-
-    async fn refresh(
-        &self,
-        _: &impl HttpClient,
-        _: &RefreshToken,
-    ) -> Result<TokenResponse, BoxedError> {
-        let attempt = self
-            .refresh_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        if attempt <= self.fail_first_n {
-            return Err(BoxedError::from_err(FlakyError {
-                retryable: self.retryable,
-            }));
-        }
-        // We never actually succeed in these tests — constructing a successful
-        // TokenResponse requires huskarl-internal APIs. We assert call counts,
-        // not the post-refresh Continue path.
-        Err(BoxedError::from_err(FlakyError {
-            retryable: self.retryable,
-        }))
-    }
-}
-
-fn retry_grant(retryable: bool) -> RetryGrant {
-    RetryGrant {
-        refresh_calls: std::sync::atomic::AtomicU32::new(0),
-        fail_first_n: u32::MAX,
-        retryable,
-    }
-}
-
 /// A session whose access token expires at `token_expiry` and that holds a
 /// refresh token — i.e. one that enters the refresh path on load whenever
 /// `token_expiry` is within the refresh margin.
@@ -914,52 +879,57 @@ fn refreshable_session(token_expiry: SystemTime) -> MockSession {
     )
 }
 
-async fn engine_with_retry_grant_and_session(
-    grant: RetryGrant,
+/// Engine whose grant fails every token request with the given retryability,
+/// returning the HTTP call counter alongside.
+async fn engine_with_failing_refresh(
+    retryable: bool,
     session: MockSession,
-) -> LoginEngine<RetryGrant, MockSessionStore, MockHttpClient> {
-    LoginEngine::builder()
+) -> (LoginEngine<MockSessionStore>, Arc<AtomicU32>) {
+    let (http, calls) = FailingHttp::new(retryable);
+    let e = LoginEngine::builder()
         .config(default_config())
-        .grant(grant)
+        .grant(test_grant(http).await)
         .session_store(MockSessionStore::with_session(session))
         .cipher(test_cipher().await)
-        .http_client(MockHttpClient)
-        .build()
-}
-
-async fn engine_with_retry_grant(
-    grant: RetryGrant,
-) -> LoginEngine<RetryGrant, MockSessionStore, MockHttpClient> {
-    // Token expired a minute ago — the refresh outcome is decisive.
-    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
-    engine_with_retry_grant_and_session(grant, session).await
+        .build();
+    (e, calls)
 }
 
 #[tokio::test]
 async fn refresh_retries_when_error_is_retryable() {
-    let grant = RetryGrant {
-        refresh_calls: std::sync::atomic::AtomicU32::new(0),
-        fail_first_n: u32::MAX,
-        retryable: true,
-    };
-    let e = engine_with_retry_grant(grant).await;
+    // Token expired a minute ago — the refresh outcome is decisive.
+    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    let (e, calls) = engine_with_failing_refresh(true, session).await;
     let _ = e.load_session(&HeaderMap::new()).await;
     // Initial call + REFRESH_MAX_ATTEMPTS - 1 retries == REFRESH_MAX_ATTEMPTS total.
-    assert_eq!(e.grant.refresh_count(), super::REFRESH_MAX_ATTEMPTS);
+    assert_eq!(calls.load(Ordering::SeqCst), super::REFRESH_MAX_ATTEMPTS);
 }
 
 #[tokio::test]
 async fn refresh_does_not_retry_when_error_is_non_retryable() {
-    let grant = RetryGrant {
-        refresh_calls: std::sync::atomic::AtomicU32::new(0),
-        fail_first_n: u32::MAX,
-        retryable: false,
-    };
-    let e = engine_with_retry_grant(grant).await;
+    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    let (e, calls) = engine_with_failing_refresh(false, session).await;
     let _ = e.load_session(&HeaderMap::new()).await;
     // Non-retryable AS rejection (e.g. invalid_grant) must short-circuit at
     // the first attempt — retrying would just amplify load.
-    assert_eq!(e.grant.refresh_count(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn refresh_success_returns_save_persistence() {
+    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    let e = LoginEngine::builder()
+        .config(default_config())
+        .grant(test_grant(TokenHttp).await)
+        .session_store(MockSessionStore::with_session(session))
+        .cipher(test_cipher().await)
+        .build();
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    let (session, persistence) = loaded.session.expect("session refreshed");
+    assert_eq!(persistence, SessionPersistence::Save);
+    // The refresh response carried expires_in=3600 — expiry moved well past now.
+    assert!(session.token_expiry() > SystemTime::now() + Duration::from_mins(30));
+    assert!(loaded.clear_cookies.is_empty());
 }
 
 // ── Transient refresh failure inside the early-refresh window ─────────────
@@ -969,7 +939,7 @@ async fn transient_refresh_failure_with_valid_token_retains_session() {
     // Token expires 15s from now — inside the 30s refresh margin but still
     // valid. A transient refresh failure must not log the user out.
     let session = refreshable_session(SystemTime::now() + Duration::from_secs(15));
-    let e = engine_with_retry_grant_and_session(retry_grant(true), session).await;
+    let (e, calls) = engine_with_failing_refresh(true, session).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let (_, persistence) = loaded.session.expect("session retained");
     // last_active is fresh, so the throttled activity update skips.
@@ -977,7 +947,7 @@ async fn transient_refresh_failure_with_valid_token_retains_session() {
     assert!(loaded.clear_cookies.is_empty());
     assert!(!e.session_store().delete_called());
     // The full retry budget was spent before falling back to retention.
-    assert_eq!(e.grant.refresh_count(), super::REFRESH_MAX_ATTEMPTS);
+    assert_eq!(calls.load(Ordering::SeqCst), super::REFRESH_MAX_ATTEMPTS);
 }
 
 #[tokio::test]
@@ -986,7 +956,7 @@ async fn non_retryable_refresh_failure_clears_session_even_with_valid_token() {
     // possibly reuse-detection revocation). Retention would serve a session
     // the AS just disowned; tear it down even though the token has 15s left.
     let session = refreshable_session(SystemTime::now() + Duration::from_secs(15));
-    let e = engine_with_retry_grant_and_session(retry_grant(false), session).await;
+    let (e, _) = engine_with_failing_refresh(false, session).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     assert!(loaded.session.is_none());
     assert!(e.session_store().delete_called());
@@ -997,7 +967,7 @@ async fn transient_refresh_failure_with_expired_token_clears_session() {
     // Past actual expiry there is no valid token to keep serving — transient
     // or not, the session is torn down.
     let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
-    let e = engine_with_retry_grant_and_session(retry_grant(true), session).await;
+    let (e, _) = engine_with_failing_refresh(true, session).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     assert!(loaded.session.is_none());
     assert!(e.session_store().delete_called());
@@ -1007,12 +977,9 @@ async fn transient_refresh_failure_with_expired_token_clears_session() {
 async fn load_session_store_error_bubbles_up() {
     let e = LoginEngine::builder()
         .config(default_config())
-        .grant(MockGrant {
-            authorization_url: "https://auth.example.com/authorize",
-        })
+        .grant(test_grant(FailingHttp::new(false).0).await)
         .session_store(ErrorSessionStore)
         .cipher(test_cipher().await)
-        .http_client(MockHttpClient)
         .build();
     let err = e.load_session(&HeaderMap::new()).await;
     assert!(err.is_err());
@@ -1147,6 +1114,40 @@ async fn callback_valid_cookie_exchange_fails_returns_502() {
         callback_status(&format!("/callback?code=authcode&state={state}"), &h).await,
         StatusCode::BAD_GATEWAY,
     );
+}
+
+#[tokio::test]
+async fn callback_success_redirects_to_original_url() {
+    let e = LoginEngine::builder()
+        .config(default_config())
+        .grant(test_grant(TokenHttp).await)
+        .session_store(MockSessionStore::empty())
+        .cipher(test_cipher().await)
+        .build();
+    let state = "valid_state";
+    let sealed = seal_login_cookie(state, "https://app.example.com/page").await;
+    let h = headers_with_login_cookie(state, &sealed);
+    let uri = format!("/callback?code=authcode&state={state}")
+        .parse()
+        .unwrap();
+    let r = e
+        .try_handle_login_route("/callback", &Method::GET, &h, &uri)
+        .await
+        .expect("callback handled");
+    assert_eq!(r.status, StatusCode::FOUND);
+    let loc = r
+        .headers
+        .iter()
+        .find(|(n, _)| *n == http::header::LOCATION)
+        .map(|(_, v)| v.to_str().unwrap());
+    assert_eq!(loc, Some("https://app.example.com/page"));
+    // The login-state cookie is cleared on the way out.
+    let login_cookie_cleared = r.headers.iter().any(|(n, v)| {
+        *n == http::header::SET_COOKIE
+            && v.to_str().unwrap().contains("huskarl_login_")
+            && v.to_str().unwrap().contains("Max-Age=0")
+    });
+    assert!(login_cookie_cleared, "login-state cookie must be cleared");
 }
 
 // ── Logout handler ────────────────────────────────────────────────────────
@@ -1353,47 +1354,16 @@ impl LoginEngineMetrics for TestEngineMetrics {
 
 async fn engine_with_metrics(
     store: MockSessionStore,
-) -> (
-    LoginEngine<MockGrant, MockSessionStore, MockHttpClient>,
-    Arc<TestEngineMetrics>,
-) {
+) -> (LoginEngine<MockSessionStore>, Arc<TestEngineMetrics>) {
     let m = Arc::new(TestEngineMetrics::default());
     let e = LoginEngine::builder()
         .config(default_config())
-        .grant(MockGrant {
-            authorization_url: "https://auth.example.com/authorize",
-        })
+        .grant(test_grant(FailingHttp::new(false).0).await)
         .session_store(store)
         .cipher(test_cipher().await)
-        .http_client(MockHttpClient)
         .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
         .build();
     (e, m)
-}
-
-struct FailStartGrant;
-
-impl LoginGrant for FailStartGrant {
-    async fn start(&self, _: &impl HttpClient, _: Vec<String>) -> Result<StartOutput, BoxedError> {
-        Err(BoxedError::from_err("\0".parse::<http::Uri>().unwrap_err()))
-    }
-    async fn complete(
-        &self,
-        _: &impl HttpClient,
-        _: &PendingState,
-        _: String,
-        _: String,
-        _: Option<String>,
-    ) -> Result<CompletedLogin, BoxedError> {
-        unimplemented!()
-    }
-    async fn refresh(
-        &self,
-        _: &impl HttpClient,
-        _: &RefreshToken,
-    ) -> Result<TokenResponse, BoxedError> {
-        unimplemented!()
-    }
 }
 
 // ── Login start metrics ───────────────────────────────────────────────────
@@ -1417,13 +1387,14 @@ async fn metrics_no_login_start_on_api_401() {
 
 #[tokio::test]
 async fn metrics_login_start_error_when_grant_start_fails() {
+    // PAR-required grant + failing HTTP double: start() must perform HTTP and
+    // therefore fails.
     let m = Arc::new(TestEngineMetrics::default());
     let e = LoginEngine::builder()
         .config(default_config())
-        .grant(FailStartGrant)
+        .grant(par_failing_grant().await)
         .session_store(MockSessionStore::empty())
         .cipher(test_cipher().await)
-        .http_client(MockHttpClient)
         .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
         .build();
     e.redirect_to_login(&nav_headers(), &"/protected".parse().unwrap())
@@ -1432,12 +1403,6 @@ async fn metrics_login_start_error_when_grant_start_fails() {
 }
 
 // ── Login complete metrics ────────────────────────────────────────────────
-//
-// Three outcomes cannot be tested here because constructing a successful
-// `CompletedLogin` or `TokenResponse` requires huskarl-internal APIs:
-//   - `LoginCompleteResult::Ok` (requires successful token exchange)
-//   - `LoginCompleteResult::SessionCreateFailed` (same prerequisite)
-//   - `RefreshResult::Ok` (requires a successful `TokenResponse`)
 
 #[tokio::test]
 async fn metrics_callback_invalid_request_on_missing_params() {
@@ -1525,8 +1490,36 @@ async fn metrics_callback_state_invalid_on_tampered_bundle() {
 }
 
 #[tokio::test]
+async fn metrics_callback_ok_on_successful_login() {
+    let m = Arc::new(TestEngineMetrics::default());
+    let e = LoginEngine::builder()
+        .config(default_config())
+        .grant(test_grant(TokenHttp).await)
+        .session_store(MockSessionStore::empty())
+        .cipher(test_cipher().await)
+        .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
+        .build();
+    let state = "valid_state";
+    let sealed = seal_login_cookie(state, "https://app.example.com/").await;
+    let h = headers_with_login_cookie(state, &sealed);
+    let uri = format!("/callback?code=authcode&state={state}")
+        .parse()
+        .unwrap();
+    e.try_handle_login_route("/callback", &Method::GET, &h, &uri)
+        .await;
+    assert_eq!(
+        m.calls(),
+        vec![MetricCall::LoginComplete {
+            result: "ok",
+            as_error: None
+        }]
+    );
+}
+
+#[tokio::test]
 async fn metrics_callback_token_exchange_failed_when_grant_complete_fails() {
-    // MockGrant.complete() always fails — verify token_exchange_failed is recorded.
+    // The default engine's HTTP double fails every token request — verify
+    // token_exchange_failed is recorded.
     let (e, m) = engine_with_metrics(MockSessionStore::empty()).await;
     let state = "valid_state";
     let sealed = seal_login_cookie(state, "https://app.example.com/").await;
@@ -1585,10 +1578,9 @@ async fn metrics_refresh_failed_retained_on_transient_failure_with_valid_token()
     let session = refreshable_session(SystemTime::now() + Duration::from_secs(15));
     let e = LoginEngine::builder()
         .config(default_config())
-        .grant(retry_grant(true))
+        .grant(test_grant(FailingHttp::new(true).0).await)
         .session_store(MockSessionStore::with_session(session))
         .cipher(test_cipher().await)
-        .http_client(MockHttpClient)
         .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
         .build();
     e.load_session(&HeaderMap::new()).await.unwrap();
@@ -1603,6 +1595,21 @@ async fn metrics_refresh_failed_retained_on_transient_failure_with_valid_token()
             MetricCall::Activity { outcome: "skip" },
         ]
     );
+}
+
+#[tokio::test]
+async fn metrics_refresh_ok_on_successful_refresh() {
+    let m = Arc::new(TestEngineMetrics::default());
+    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    let e = LoginEngine::builder()
+        .config(default_config())
+        .grant(test_grant(TokenHttp).await)
+        .session_store(MockSessionStore::with_session(session))
+        .cipher(test_cipher().await)
+        .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
+        .build();
+    e.load_session(&HeaderMap::new()).await.unwrap();
+    assert_eq!(m.calls(), vec![MetricCall::Refresh { result: "ok" }]);
 }
 
 // ── Activity metrics ──────────────────────────────────────────────────────

@@ -13,14 +13,18 @@
 //! flow. No explicit format-versioning is needed because re-login already
 //! recovers gracefully.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::header;
-use huskarl::core::crypto::cipher::{
-    AeadUnsealer as _, AeadV1Unsealer, BoxedAeadCipher, CipherMatch,
-};
+use huskarl::core::crypto::cipher::{AeadCipher, AeadUnsealer, AeadV1Cipher, CipherMatch};
 use serde::{Serialize, de::DeserializeOwned};
+
+/// The bundle cipher used for every cookie this crate seals: the v1 bundle
+/// format over a type-erased AEAD cipher. The format choice is an
+/// implementation detail of the cookie layer — builders accept any
+/// [`AeadCipher`] and wrap it here.
+pub(crate) type SessionCipher = AeadV1Cipher<Arc<dyn AeadCipher>>;
 
 /// Default `Max-Age` for session cookies. 400 days is the practical ceiling
 /// most browsers enforce; using it as the default means the cookie is finite
@@ -127,7 +131,7 @@ pub(crate) const KID_COOKIE_SUFFIX: &str = ".kid";
 /// must degrade to exactly that. The happy path still pays only one unseal;
 /// the retry happens only on failure, where a second decrypt attempt is noise.
 pub(crate) async fn unseal_with_kid_fallback(
-    unsealer: &AeadV1Unsealer<BoxedAeadCipher>,
+    unsealer: &impl AeadUnsealer,
     cipher_match: Option<&CipherMatch<'_>>,
     bundle: &[u8],
     aad: &[u8],

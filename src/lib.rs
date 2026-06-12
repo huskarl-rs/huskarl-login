@@ -8,8 +8,10 @@
 //!
 //! This crate contains the framework-agnostic login logic shared by
 //! `huskarl-axum` and `huskarl-pingora`: configuration, session drivers,
-//! session enrichment, cookie helpers, URL helpers, grant abstraction, and
-//! session store traits.
+//! session enrichment, cookie helpers, URL helpers, and session store traits.
+//! The OAuth flow itself is driven by a
+//! [`huskarl::grant::authorization_code::AuthorizationCodeGrant`], passed
+//! directly to the [`engine::LoginEngine`].
 //!
 //! # Session model
 //!
@@ -27,8 +29,8 @@
 //!   database, …).
 //!
 //! The default enricher, [`NoEnrichment`], converts the seed straight into
-//! the session type via `From`; attach a custom one with the stores'
-//! `with_enricher` method.
+//! the session type via `From`; pass a custom one to the store builders'
+//! `build_with_enricher` finisher.
 //!
 //! The canonical [`SessionDriver`] interface returns `Vec<HeaderValue>` from
 //! mutating methods (`save`, `touch`, `delete`). Framework crates that need a
@@ -50,20 +52,22 @@ pub mod metrics;
 pub mod session;
 pub mod url;
 
+mod completed_login;
 mod config;
 mod cookie_session;
 mod enrich;
 mod error_page;
-mod grant;
 mod session_state;
 mod store_session;
 
+pub use completed_login::CompletedLogin;
 pub use config::{ConfigError, LoginConfig};
-pub use cookie_session::{CookiePayload, CookieSession, CookieSessionStore};
+pub use cookie_session::{
+    CookiePayload, CookieSession, CookieSessionStore, CookieSessionStoreBuilder,
+};
 pub use engine::{DefaultPersistFailurePolicy, PersistFailurePolicy};
 pub use enrich::{NoEnrichment, SessionEnricher};
 pub use error_page::{DefaultErrorPage, ErrorPage, ErrorPageResponse};
-pub use grant::{CompletedLogin, LoginGrant};
 pub use metrics::{
     ActivityOutcome, DecryptResult, LoginCompleteResult, LoginEngineMetrics, LoginStartResult,
     RefreshResult, SessionCookieMetrics, normalize_as_error,
@@ -72,4 +76,5 @@ pub use session::{SessionDriver, SessionError};
 pub use session_state::{Session, SessionState};
 pub use store_session::{
     ExternalSessionStore, PersistedSession, PersistedSessionState, StoreBackedSessionStore,
+    StoreBackedSessionStoreBuilder,
 };

@@ -12,7 +12,7 @@
 use http::HeaderValue;
 use huskarl::core::platform::{MaybeSend, MaybeSendSync};
 
-use crate::{grant::CompletedLogin, session_state::Session};
+use crate::{completed_login::CompletedLogin, session_state::Session};
 
 /// A boxed standard error type used by session store methods.
 ///

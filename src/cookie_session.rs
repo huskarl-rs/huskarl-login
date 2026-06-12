@@ -5,25 +5,23 @@
 //! payloads are automatically split across multiple cookies (`.0`, `.1`, ...)
 //! to stay within browser size limits.
 
-use std::{borrow::Cow, marker::PhantomData, sync::Arc, time::Duration};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
 use huskarl::core::{
-    crypto::cipher::{
-        AeadEncryptor, AeadSealer, AeadV1Sealer, AeadV1Unsealer, BoxedAeadCipher, CipherMatch,
-    },
+    crypto::cipher::{AeadCipher, AeadEncryptor as _, AeadSealer as _, AeadV1Cipher, CipherMatch},
     platform::MaybeSendSync,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    completed_login::CompletedLogin,
     cookie::{
-        DEFAULT_COOKIE_MAX_AGE, cookie_attrs, decode_payload, encode_kid, encode_payload,
-        get_kid_cookie, kid_cookie_name, unseal_with_kid_fallback,
+        DEFAULT_COOKIE_MAX_AGE, SessionCipher, cookie_attrs, decode_payload, encode_kid,
+        encode_payload, get_kid_cookie, kid_cookie_name, unseal_with_kid_fallback,
     },
     enrich::{NoEnrichment, SessionEnricher},
-    grant::CompletedLogin,
     metrics::{DecryptResult, SessionCookieMetrics},
     session::{SessionDriver, SessionError, to_session_err},
     session_state::{Session, SessionState},
@@ -37,8 +35,9 @@ const CHUNK_SIZE: usize = 3800;
 /// Blanket-implemented — never implement it directly. Define a custom payload
 /// type to store only the fields your application needs in the browser cookie
 /// rather than the full [`SessionState`], and build it with a
-/// [`SessionEnricher`] (attached via [`CookieSessionStore::with_enricher`]) —
-/// see [`SessionEnricher`] for claim-mapping and `UserInfo` examples.
+/// [`SessionEnricher`] (supplied via the builder's `build_with_enricher`
+/// finisher) — see [`SessionEnricher`] for claim-mapping and `UserInfo`
+/// examples.
 ///
 /// # Storing the `id_token` for RP-initiated logout
 ///
@@ -59,8 +58,8 @@ const CHUNK_SIZE: usize = 3800;
 /// [`Session::apply_refresh`] to update them alongside the [`SessionState`]:
 ///
 /// ```ignore
-/// fn apply_refresh(&mut self, token_response: &TokenResponse) {
-///     let new_state = self.state().refreshed(token_response);
+/// fn apply_refresh(&mut self, token_response: &TokenResponse, default_lifetime: Duration) {
+///     let new_state = self.state().refreshed(token_response, default_lifetime);
 ///     self.set_state(new_state);
 ///     // update your own fields from token_response here
 /// }
@@ -114,11 +113,12 @@ impl From<SessionState> for CookieSession {
 /// is [`CookieSession`], which stores the full [`SessionState`]. For a custom
 /// payload, supply any [`CookiePayload`] type.
 ///
-/// The type parameter `F` is the [`SessionEnricher`] that builds the session
-/// payload after a completed login. The default, [`NoEnrichment`], converts
-/// the [`SessionState`] seed via `From`; attach a custom enricher (e.g. one
-/// that maps ID token claims or calls the OIDC `UserInfo` endpoint) with
-/// [`with_enricher`](Self::with_enricher).
+/// The session payload is built after a completed login by a
+/// [`SessionEnricher`]. The builder's `build()` finisher uses
+/// [`NoEnrichment`] (requires `C: From<SessionState>`); the
+/// `build_with_enricher(…)` finisher attaches a custom enricher (e.g. one
+/// that maps ID token claims or calls the OIDC `UserInfo` endpoint) for
+/// payloads that need claims or I/O.
 ///
 /// # Cookie format
 ///
@@ -130,26 +130,26 @@ impl From<SessionState> for CookieSession {
 /// an index is missing. Truncation or stale leftover chunks just produce a
 /// payload the AEAD layer can't authenticate, which surfaces as "no session"
 /// and triggers a fresh login.
-pub struct CookieSessionStore<C = CookieSession, F = NoEnrichment> {
-    sealer: AeadV1Sealer<BoxedAeadCipher>,
-    unsealer: AeadV1Unsealer<BoxedAeadCipher>,
+pub struct CookieSessionStore<C = CookieSession> {
+    cipher: SessionCipher,
     cookie_name: String,
     secure: bool,
     cookie_path: String,
     max_age: Duration,
     metrics: Option<Arc<dyn SessionCookieMetrics>>,
-    enricher: F,
-    _phantom: PhantomData<C>,
+    enricher: Box<dyn SessionEnricher<SessionState, C>>,
 }
 
 #[bon::bon]
 impl<C> CookieSessionStore<C> {
-    /// Creates a new cookie session store (with [`NoEnrichment`] — chain
-    /// [`with_enricher`](Self::with_enricher) on the built store to attach an
-    /// async [`SessionEnricher`]).
-    #[builder]
+    /// Creates a new cookie session store. Finish the builder with `build()`
+    /// (uses [`NoEnrichment`]; requires `C: From<SessionState>`) or
+    /// `build_with_enricher(…)` to attach an async [`SessionEnricher`].
+    #[builder(state_mod(name = "cookie_store_builder"), finish_fn(vis = "", name = build_internal))]
     pub fn new(
-        cipher: BoxedAeadCipher,
+        #[builder(finish_fn)] enricher: Box<dyn SessionEnricher<SessionState, C>>,
+        #[builder(with = |cipher: impl AeadCipher + 'static| Arc::new(cipher) as Arc<dyn AeadCipher>)]
+        cipher: Arc<dyn AeadCipher>,
         #[builder(into)] cookie_name: String,
         secure: bool,
         #[builder(into)] cookie_path: String,
@@ -163,48 +163,51 @@ impl<C> CookieSessionStore<C> {
         metrics: Option<Arc<dyn SessionCookieMetrics>>,
     ) -> Self {
         Self {
-            sealer: AeadV1Sealer::new(cipher.clone()),
-            unsealer: AeadV1Unsealer::new(cipher),
+            cipher: AeadV1Cipher::new(cipher),
             cookie_name,
             secure,
             cookie_path,
             max_age,
             metrics,
-            enricher: NoEnrichment,
-            _phantom: PhantomData,
+            enricher,
         }
     }
 }
 
-impl<C, F> CookieSessionStore<C, F> {
-    /// Replaces the session enricher, e.g. with one that calls the OIDC
-    /// `UserInfo` endpoint after login. See [`SessionEnricher`] for an example.
-    pub fn with_enricher<F2: SessionEnricher<SessionState, C>>(
-        self,
-        enricher: F2,
-    ) -> CookieSessionStore<C, F2> {
-        CookieSessionStore {
-            sealer: self.sealer,
-            unsealer: self.unsealer,
-            cookie_name: self.cookie_name,
-            secure: self.secure,
-            cookie_path: self.cookie_path,
-            max_age: self.max_age,
-            metrics: self.metrics,
-            enricher,
-            _phantom: PhantomData,
-        }
+impl<C, S: cookie_store_builder::IsComplete> CookieSessionStoreBuilder<C, S> {
+    /// Finishes the builder with the default [`NoEnrichment`] enricher, which
+    /// converts the [`SessionState`] seed into the payload via `From`.
+    #[must_use]
+    pub fn build(self) -> CookieSessionStore<C>
+    where
+        C: From<SessionState>,
+    {
+        self.build_internal(Box::new(NoEnrichment))
     }
 
-    /// Returns the active sealer's key ID, if the key has an identity.
+    /// Finishes the builder with a custom [`SessionEnricher`], for payloads
+    /// that need ID token claims or I/O (e.g. the OIDC `UserInfo` endpoint)
+    /// to construct. See [`SessionEnricher`] for examples.
+    #[must_use]
+    pub fn build_with_enricher(
+        self,
+        enricher: impl SessionEnricher<SessionState, C> + 'static,
+    ) -> CookieSessionStore<C> {
+        self.build_internal(Box::new(enricher))
+    }
+}
+
+impl<C> CookieSessionStore<C> {
+    /// Returns the active cipher's key ID, if the key has an identity.
     ///
-    /// Delegates to [`AeadEncryptor::key_id`]. Once reload support is added to
-    /// `AeadCipher`, this will reflect the key that will be used for the
-    /// **next** seal operation — suitable for updating an active-key gauge from
-    /// a reload callback.
+    /// Delegates to
+    /// [`AeadEncryptor::key_id`](huskarl::core::crypto::cipher::AeadEncryptor::key_id).
+    /// Once reload support is added to `AeadCipher`, this will reflect the key
+    /// that will be used for the **next** seal operation — suitable for
+    /// updating an active-key gauge from a reload callback.
     #[must_use]
     pub fn key_id(&self) -> Option<Cow<'_, str>> {
-        self.sealer.key_id()
+        self.cipher.key_id()
     }
 
     fn base_cookie_attrs(&self) -> String {
@@ -222,7 +225,7 @@ impl<C, F> CookieSessionStore<C, F> {
 
 // -- Internal methods --
 
-impl<C: CookiePayload, F> CookieSessionStore<C, F> {
+impl<C: CookiePayload> CookieSessionStore<C> {
     pub(crate) async fn load_session(&self, headers: &http::HeaderMap) -> Option<C> {
         let chunks = self.collect_session_chunks(headers);
         let raw_encoded = reassemble_chunks(&chunks)?;
@@ -238,7 +241,7 @@ impl<C: CookiePayload, F> CookieSessionStore<C, F> {
             .as_deref()
             .map(|k| CipherMatch::builder().kid(k).build());
         let Some(plaintext) =
-            unseal_with_kid_fallback(&self.unsealer, cipher_match.as_ref(), &bundle, b"session")
+            unseal_with_kid_fallback(&self.cipher, cipher_match.as_ref(), &bundle, b"session")
                 .await
         else {
             self.record_decrypt(kid.as_deref(), &DecryptResult::DecryptFailed);
@@ -319,16 +322,16 @@ impl<C: CookiePayload, F> CookieSessionStore<C, F> {
     ) -> Result<Vec<HeaderValue>, SessionError> {
         let payload = encode_payload(session)?;
         let bundle = self
-            .sealer
+            .cipher
             .seal(&payload, b"session")
             .await
             .map_err(to_session_err)?;
-        // Read the active key's identity from the same sealer that just sealed
-        // the bundle. For `AeadV1Sealer<BoxedAeadCipher>` the cipher is fixed
-        // at construction so this is stable; if huskarl-login ever switches to
-        // a multi-key sealer that picks per-call, this should move to a
-        // select-then-use pattern via `AeadCipherSelector`.
-        let kid = self.sealer.key_id();
+        // Read the active key's identity from the same cipher that just sealed
+        // the bundle. The cipher is fixed at construction so this is stable;
+        // if huskarl-login ever switches to a multi-key sealer that picks
+        // per-call, this should move to a select-then-use pattern via
+        // `AeadCipherSelector`.
+        let kid = self.cipher.key_id();
         if let Some(m) = &self.metrics {
             m.record_encrypt(&self.cookie_name, kid.as_deref());
         }
@@ -418,14 +421,9 @@ impl<C: CookiePayload, F> CookieSessionStore<C, F> {
     }
 }
 
-impl<C: CookiePayload, F: SessionEnricher<SessionState, C>> crate::session::sealed::Sealed
-    for CookieSessionStore<C, F>
-{
-}
+impl<C: CookiePayload> crate::session::sealed::Sealed for CookieSessionStore<C> {}
 
-impl<C: CookiePayload, F: SessionEnricher<SessionState, C>> SessionDriver
-    for CookieSessionStore<C, F>
-{
+impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
     type SessionType = C;
     type LoadError = std::convert::Infallible;
 
@@ -436,11 +434,7 @@ impl<C: CookiePayload, F: SessionEnricher<SessionState, C>> SessionDriver
         headers: &http::HeaderMap,
     ) -> Result<(C, Vec<HeaderValue>), SessionError> {
         let state = SessionState::from_completed(&completed, default_lifetime);
-        let session = self
-            .enricher
-            .build_session(state, &completed)
-            .await
-            .map_err(to_session_err)?;
+        let session = self.enricher.build_session(state, &completed).await?;
         let cookies = self.save_session(&session, headers).await?;
         Ok((session, cookies))
     }
@@ -516,13 +510,14 @@ fn reassemble_chunks(chunks: &std::collections::HashMap<usize, String>) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        convert::Infallible,
-        time::{Duration, SystemTime},
-    };
+    use std::time::{Duration, SystemTime};
 
     use http::HeaderMap;
-    use huskarl::core::secrets::{Secret, SecretBytes, SecretOutput};
+    use huskarl::core::{
+        Error,
+        platform::MaybeSendBoxFuture,
+        secrets::{Secret, SecretBytes, SecretOutput},
+    };
     use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
 
     use super::*;
@@ -534,24 +529,25 @@ mod tests {
     struct TestSecret(SecretBytes);
     impl Secret for TestSecret {
         type Output = SecretBytes;
-        type Error = Infallible;
-        async fn get_secret_value(&self) -> Result<SecretOutput<SecretBytes>, Infallible> {
-            Ok(SecretOutput {
+        fn get_secret_value(
+            &self,
+        ) -> MaybeSendBoxFuture<'_, Result<SecretOutput<SecretBytes>, Error>> {
+            let out = SecretOutput {
                 value: self.0.clone(),
                 identity: None,
-            })
+            };
+            Box::pin(async move { Ok(out) })
         }
     }
 
-    async fn test_cipher() -> BoxedAeadCipher {
-        let key = AesGcmKey::from_secret(
+    async fn test_cipher() -> AesGcmKey {
+        AesGcmKey::from_secret(
             AesGcmKeyType::Aes256,
             TestSecret(SecretBytes::new(vec![0u8; 32])),
             |_| None,
         )
         .await
-        .unwrap();
-        BoxedAeadCipher::new(key)
+        .unwrap()
     }
 
     fn test_state() -> SessionState {
@@ -574,16 +570,15 @@ mod tests {
 
     /// A cipher whose `key_id()` reports a fixed identity, used to exercise
     /// the kid-sidecar set path on save and the `CipherMatch` path on load.
-    async fn test_cipher_with_kid(kid: &str) -> BoxedAeadCipher {
+    async fn test_cipher_with_kid(kid: &str) -> AesGcmKey {
         let kid_owned = kid.to_owned();
-        let key = AesGcmKey::from_secret(
+        AesGcmKey::from_secret(
             AesGcmKeyType::Aes256,
             TestSecret(SecretBytes::new(vec![0u8; 32])),
             move |_| Some(kid_owned.clone()),
         )
         .await
-        .unwrap();
-        BoxedAeadCipher::new(key)
+        .unwrap()
     }
 
     /// Builds a `Cookie:` header from the `Set-Cookie` values a save produced,
@@ -766,7 +761,7 @@ mod tests {
 
     // ── kid sidecar as hint, not filter ───────────────────────────────────
 
-    use huskarl::core::crypto::cipher::{BoxedAeadDecryptor, MultiKeyCipher, MultiKeyDecryptor};
+    use huskarl::core::crypto::cipher::{AeadDecryptor, MultiKeyCipher, MultiKeyDecryptor};
 
     /// An AES-256 key with a stable identity, deterministic in `byte` so the
     /// "same" key can be constructed twice (e.g. once for a decryptor set and
@@ -787,15 +782,12 @@ mod tests {
     /// hint entirely), the multi-key decryptor takes an exact-kid match as
     /// definitive and reports "no matching key" for unknown kids — the shape
     /// that makes a wrong sidecar hint actually bite.
-    async fn multi_key_cipher() -> BoxedAeadCipher {
+    async fn multi_key_cipher() -> MultiKeyCipher<AesGcmKey> {
         let decryptor = MultiKeyDecryptor::new(vec![
-            BoxedAeadDecryptor::new(aes_key_with_kid("v1", 1).await),
-            BoxedAeadDecryptor::new(aes_key_with_kid("v2", 2).await),
+            Arc::new(aes_key_with_kid("v1", 1).await) as Arc<dyn AeadDecryptor>,
+            Arc::new(aes_key_with_kid("v2", 2).await) as Arc<dyn AeadDecryptor>,
         ]);
-        BoxedAeadCipher::new(MultiKeyCipher::new(
-            aes_key_with_kid("v2", 2).await,
-            decryptor,
-        ))
+        MultiKeyCipher::new(aes_key_with_kid("v2", 2).await, decryptor)
     }
 
     async fn multi_key_store() -> CookieSessionStore<CookieSession> {
@@ -875,7 +867,7 @@ mod tests {
         // authenticity gate. A bundle sealed under a key outside the
         // configured set must still fail, whatever the sidecar claims.
         let store = multi_key_store().await;
-        let foreign = AeadV1Sealer::new(BoxedAeadCipher::new(aes_key_with_kid("v9", 9).await));
+        let foreign = AeadV1Cipher::new(aes_key_with_kid("v9", 9).await);
         let payload = crate::cookie::encode_payload(&CookieSession(test_state())).unwrap();
         let bundle = foreign.seal(&payload, b"session").await.unwrap();
         let mut headers = HeaderMap::new();
@@ -1030,16 +1022,16 @@ mod tests {
     struct TestEnricher;
 
     impl SessionEnricher<SessionState, EnrichedSession> for TestEnricher {
-        type Error = Infallible;
-
-        async fn build_session(
-            &self,
+        fn build_session<'a>(
+            &'a self,
             state: SessionState,
-            _completed: &CompletedLogin,
-        ) -> Result<EnrichedSession, Infallible> {
-            Ok(EnrichedSession {
-                state,
-                email: "user@example.com".to_owned(),
+            _completed: &'a CompletedLogin,
+        ) -> MaybeSendBoxFuture<'a, Result<EnrichedSession, SessionError>> {
+            Box::pin(async move {
+                Ok(EnrichedSession {
+                    state,
+                    email: "user@example.com".to_owned(),
+                })
             })
         }
     }
@@ -1048,16 +1040,14 @@ mod tests {
 
     #[tokio::test]
     async fn enriched_store_roundtrips_enrichment_only_payload() {
+        // EnrichedSession has no From<SessionState>, so plain `build()` would
+        // not compile — the enricher must be supplied at the finisher.
         let store = CookieSessionStore::<EnrichedSession>::builder()
             .cipher(test_cipher().await)
             .cookie_name("huskarl_session")
             .secure(true)
             .cookie_path("/")
-            .build()
-            .with_enricher(TestEnricher);
-        // The enriched store still satisfies SessionDriver, so the engine can
-        // drive it. (Without the enricher it would not: EnrichedSession has no
-        // From<SessionState>, so NoEnrichment can't build it.)
+            .build_with_enricher(TestEnricher);
         assert_session_driver(&store);
 
         let session = EnrichedSession {
@@ -1075,8 +1065,8 @@ mod tests {
 
     #[tokio::test]
     async fn default_store_still_satisfies_session_driver() {
-        // Regression guard: adding the enricher type parameter must not cost
-        // the plain (NoEnrichment) store its SessionDriver impl.
+        // Regression guard: the default `build()` finisher (NoEnrichment)
+        // must keep producing a store the engine can drive.
         let store = test_store().await;
         assert_session_driver(&store);
     }
@@ -1391,7 +1381,7 @@ mod tests {
         let (store, m) = store_with_metrics().await;
         // Seal garbage bytes under the session AAD — AEAD passes but CBOR
         // deserialization of CookieSession fails, exercising PayloadInvalid.
-        let bundle = AeadV1Sealer::new(test_cipher().await)
+        let bundle = AeadV1Cipher::new(test_cipher().await)
             .seal(b"not cbor", b"session")
             .await
             .unwrap();
