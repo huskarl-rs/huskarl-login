@@ -53,8 +53,16 @@ pub fn original_url(config: &LoginConfig, req_uri: &http::Uri) -> Option<String>
     })
 }
 
-/// Builds the end-session URL, appending `id_token_hint` and
+/// Builds the end-session URL, appending `id_token_hint`, `client_id`, and
 /// `post_logout_redirect_uri` query parameters when present.
+///
+/// `client_id` matters for the common case: the built-in session types do not
+/// store the `id_token`, so `id_token_hint` is absent, and per OIDC
+/// RP-Initiated Logout 1.0 §2 the OP then needs `client_id` to identify the RP
+/// — without it the OP cannot validate (and so silently drops)
+/// `post_logout_redirect_uri`, stranding the user on the OP's logout page.
+/// Sending `client_id` alongside an `id_token_hint` is also safe: the OP just
+/// verifies the two identify the same client.
 ///
 /// # Errors
 ///
@@ -63,6 +71,7 @@ pub fn original_url(config: &LoginConfig, req_uri: &http::Uri) -> Option<String>
 pub fn build_end_session_url(
     endpoint: &http::Uri,
     id_token_hint: Option<&str>,
+    client_id: Option<&str>,
     post_logout_redirect_uri: Option<&str>,
 ) -> Result<String, serde_html_form::ser::Error> {
     #[derive(Serialize)]
@@ -70,14 +79,17 @@ pub fn build_end_session_url(
         #[serde(skip_serializing_if = "Option::is_none")]
         id_token_hint: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        client_id: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         post_logout_redirect_uri: Option<&'a str>,
     }
 
     let params = EndSessionParams {
         id_token_hint,
+        client_id,
         post_logout_redirect_uri,
     };
-    if id_token_hint.is_none() && post_logout_redirect_uri.is_none() {
+    if id_token_hint.is_none() && client_id.is_none() && post_logout_redirect_uri.is_none() {
         return Ok(endpoint.to_string());
     }
     let query = serde_html_form::to_string(&params)?;
@@ -141,7 +153,7 @@ mod tests {
     #[test]
     fn end_session_url_no_params() {
         let endpoint: http::Uri = "https://auth.example.com/logout".parse().unwrap();
-        let url = build_end_session_url(&endpoint, None, None).unwrap();
+        let url = build_end_session_url(&endpoint, None, None, None).unwrap();
         assert_eq!(url, "https://auth.example.com/logout");
     }
 
@@ -149,29 +161,48 @@ mod tests {
     fn end_session_url_with_id_token_hint() {
         let endpoint: http::Uri = "https://auth.example.com/logout".parse().unwrap();
         let url =
-            build_end_session_url(&endpoint, Some("eyJhbGciOiJSUzI1NiJ9.e30.sig"), None).unwrap();
+            build_end_session_url(&endpoint, Some("eyJhbGciOiJSUzI1NiJ9.e30.sig"), None, None)
+                .unwrap();
         assert!(url.contains("id_token_hint=eyJhbGciOiJSUzI1NiJ9.e30.sig"));
         assert!(url.starts_with("https://auth.example.com/logout?"));
     }
 
     #[test]
+    fn end_session_url_with_client_id() {
+        // The common stock case: no id_token_hint (built-in sessions don't
+        // store the JWT), so client_id is what lets the OP honor the redirect.
+        let endpoint: http::Uri = "https://auth.example.com/logout".parse().unwrap();
+        let url = build_end_session_url(
+            &endpoint,
+            None,
+            Some("my-client"),
+            Some("https://app.example.com/"),
+        )
+        .unwrap();
+        assert!(url.contains("client_id=my-client"));
+        assert!(url.contains("post_logout_redirect_uri="));
+    }
+
+    #[test]
     fn end_session_url_with_post_logout_redirect() {
         let endpoint: http::Uri = "https://auth.example.com/logout".parse().unwrap();
-        let url = build_end_session_url(&endpoint, None, Some("https://app.example.com/")).unwrap();
+        let url =
+            build_end_session_url(&endpoint, None, None, Some("https://app.example.com/")).unwrap();
         assert!(url.contains("post_logout_redirect_uri="));
         assert!(url.contains("app.example.com"));
     }
 
     #[test]
     fn end_session_url_preserves_existing_query() {
-        let endpoint: http::Uri = "https://auth.example.com/logout?client_id=abc"
+        let endpoint: http::Uri = "https://auth.example.com/logout?foo=bar"
             .parse()
             .unwrap();
-        let url = build_end_session_url(&endpoint, None, Some("https://app.example.com/")).unwrap();
-        assert!(url.contains("client_id=abc"));
+        let url =
+            build_end_session_url(&endpoint, None, None, Some("https://app.example.com/")).unwrap();
+        assert!(url.contains("foo=bar"));
         assert!(url.contains("post_logout_redirect_uri="));
         // existing query separator is &, not ?
-        assert!(url.contains("client_id=abc&post_logout_redirect_uri="));
+        assert!(url.contains("foo=bar&post_logout_redirect_uri="));
     }
 
     // -- default_post_logout_redirect tests --

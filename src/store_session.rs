@@ -21,7 +21,8 @@ use uuid::Uuid;
 use crate::{
     cookie::{
         DEFAULT_COOKIE_MAX_AGE, SessionCipher, cookie_attrs, encode_kid, get_cookie,
-        get_kid_cookie, kid_cookie_name, session_cookie_name, unseal_with_kid_fallback,
+        get_kid_cookie, kid_cookie_name, normalize_kid_label, session_cookie_name,
+        unseal_with_kid_fallback,
     },
     enrich::{NoEnrichment, SessionEnricher},
     metrics::{DecryptResult, SessionCookieMetrics},
@@ -223,6 +224,11 @@ pub struct StoreBackedSessionStore<E: ExternalSessionStore> {
     external: E,
     enricher: Box<dyn SessionEnricher<PersistedSessionState, E::SessionType>>,
     cipher: SessionCipher,
+    /// The raw cipher behind [`cipher`](Self::cipher), retained so the store
+    /// can hand it back via
+    /// [`SessionDriver::session_aead_cipher`](crate::SessionDriver::session_aead_cipher)
+    /// without re-wrapping it in the v1 bundle envelope.
+    aead: Arc<dyn AeadCipher>,
     /// The configured cookie name, before any security prefix is applied.
     /// Retained so [`apply_cookie_secure`](SessionDriver::apply_cookie_secure)
     /// can recompute `cookie_name` once the engine supplies the deployment's
@@ -269,6 +275,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         Self {
             external,
             enricher,
+            aead: cipher.clone(),
             cipher: AeadV1Cipher::new(cipher),
             raw_cookie_name,
             cookie_name,
@@ -301,6 +308,23 @@ impl<E: ExternalSessionStore, S: store_builder::IsComplete> StoreBackedSessionSt
         enricher: impl SessionEnricher<PersistedSessionState, E::SessionType> + 'static,
     ) -> StoreBackedSessionStore<E> {
         self.build_internal(Box::new(enricher))
+    }
+
+    /// Finishes the builder with a synchronous claim-mapper: build the session
+    /// from the [`PersistedSessionState`] seed and the
+    /// [`CompletedLogin`](crate::CompletedLogin) (e.g.
+    /// copy ID token claims) without I/O. For enrichment that must `await` —
+    /// such as the OIDC `UserInfo` endpoint — use
+    /// [`build_with_enricher`](Self::build_with_enricher) instead; for sessions
+    /// built from the seed alone, use [`build`](Self::build).
+    #[must_use]
+    pub fn build_with_claims<F>(self, f: F) -> StoreBackedSessionStore<E>
+    where
+        F: Fn(PersistedSessionState, &crate::CompletedLogin) -> Result<E::SessionType, SessionError>
+            + MaybeSendSync
+            + 'static,
+    {
+        self.build_internal(Box::new(crate::enrich::ClaimsFn(f)))
     }
 }
 
@@ -408,8 +432,11 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     }
 
     fn record_decrypt(&self, kid: Option<&str>, result: &DecryptResult) {
+        // The kid comes from the client-supplied sidecar cookie; bound it to a
+        // configured key (or "unknown") before it becomes a metrics label.
+        let label = normalize_kid_label(&*self.aead, &self.cookie_name, kid);
         if let Some(m) = &self.metrics {
-            m.record_decrypt(&self.cookie_name, kid, result);
+            m.record_decrypt(&self.cookie_name, label, result);
         }
     }
 }
@@ -499,6 +526,10 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
     fn apply_cookie_secure(&mut self, secure: bool) {
         self.secure = secure;
         self.cookie_name = session_cookie_name(self.raw_cookie_name.clone(), secure, &self.cookie_path);
+    }
+
+    fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
+        self.aead.clone()
     }
 
     async fn create(
@@ -612,6 +643,9 @@ mod tests {
 
     struct MinimalExternalStore(MinimalSession);
 
+    // Test stub: the async method signatures are mandated by the trait; the
+    // bodies are synchronous.
+    #[allow(clippy::unused_async_trait_impl)]
     impl ExternalSessionStore for MinimalExternalStore {
         type SessionType = MinimalSession;
         type Error = Infallible;
@@ -839,6 +873,150 @@ mod tests {
         assert_eq!(store.read_pointer_cookie(&req).await, Some(original_key));
     }
 
+    // ── build_with_claims ─────────────────────────────────────────────────
+
+    /// A store-backed session enriched with an `email` claim. Has no
+    /// `From<PersistedSessionState>`, so it can only be built by an enricher
+    /// or the synchronous claim-mapper.
+    #[derive(Clone)]
+    struct EnrichedStoreSession {
+        persisted: PersistedSessionState,
+        email: String,
+    }
+
+    impl Session for EnrichedStoreSession {
+        fn state(&self) -> &SessionState {
+            self.persisted.state()
+        }
+        fn set_state(&mut self, s: SessionState) {
+            self.persisted.set_state(s);
+        }
+    }
+
+    impl PersistedSession for EnrichedStoreSession {
+        fn persisted(&self) -> &PersistedSessionState {
+            &self.persisted
+        }
+        fn persisted_mut(&mut self) -> &mut PersistedSessionState {
+            &mut self.persisted
+        }
+    }
+
+    /// External store that records the email of the session handed to `insert`,
+    /// so the test can confirm the claim-mapper ran before persistence.
+    struct EnrichedExternalStore(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+
+    // Test stub: the async method signatures are mandated by the trait; the
+    // bodies are synchronous.
+    #[allow(clippy::unused_async_trait_impl)]
+    impl ExternalSessionStore for EnrichedExternalStore {
+        type SessionType = EnrichedStoreSession;
+        type Error = Infallible;
+
+        async fn insert(&self, s: &EnrichedStoreSession) -> Result<(), Infallible> {
+            *self.0.lock().unwrap() = Some(s.email.clone());
+            Ok(())
+        }
+        async fn load(&self, _: Uuid) -> Result<Option<EnrichedStoreSession>, Infallible> {
+            Ok(None)
+        }
+        async fn save(&self, _: &EnrichedStoreSession) -> Result<(), Infallible> {
+            Ok(())
+        }
+        async fn touch(&self, _: &EnrichedStoreSession) -> Result<(), Infallible> {
+            Ok(())
+        }
+        async fn delete(&self, _: &EnrichedStoreSession) -> Result<(), Infallible> {
+            Ok(())
+        }
+    }
+
+    /// A completed login carrying an `email` profile claim.
+    fn completed_with_email(email: &str) -> crate::CompletedLogin {
+        let token_response = huskarl::grant::core::RawTokenResponse::builder()
+            // A fixture token value, not a key — `SecretString::new` is the
+            // value wrapper, distinct from the `Secret` key-source layer.
+            .access_token(huskarl::core::secrets::SecretString::new("access-token"))
+            .token_type("Bearer")
+            .build()
+            .into_token_response(None, std::time::SystemTime::now())
+            .unwrap();
+        let mut claims = huskarl::token::id_token::IdTokenClaims::default();
+        claims.profile.email = Some(email.to_owned());
+        crate::CompletedLogin::builder()
+            .token_response(token_response)
+            .id_token_claims(claims)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn build_with_claims_maps_claims_and_inserts() {
+        // Same closure shape as the cookie store, only the seed type differs
+        // (PersistedSessionState) — the uniformity the finisher is meant to
+        // preserve.
+        let inserted = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let store = StoreBackedSessionStore::builder()
+            .external(EnrichedExternalStore(inserted.clone()))
+            .cipher(test_cipher().await)
+            .cookie_name("session")
+            .cookie_path("/")
+            .build_with_claims(|seed, completed| {
+                Ok(EnrichedStoreSession {
+                    persisted: seed,
+                    email: completed
+                        .id_token_claims()
+                        .and_then(|c| c.profile.email.clone())
+                        .ok_or("missing email claim")?,
+                })
+            });
+
+        let (session, cookies) = store
+            .create_session(&completed_with_email("user@example.com"), Duration::from_hours(1))
+            .await
+            .expect("create succeeds");
+        assert_eq!(session.email, "user@example.com");
+        // The enriched session reached the external store, and a pointer
+        // cookie was emitted.
+        assert_eq!(inserted.lock().unwrap().as_deref(), Some("user@example.com"));
+        assert!(!cookies.is_empty(), "pointer cookie emitted");
+    }
+
+    #[tokio::test]
+    async fn build_with_claims_error_fails_session_creation() {
+        let store = StoreBackedSessionStore::builder()
+            .external(EnrichedExternalStore(std::sync::Arc::new(std::sync::Mutex::new(None))))
+            .cipher(test_cipher().await)
+            .cookie_name("session")
+            .cookie_path("/")
+            .build_with_claims(|_seed, _completed| Err("enrichment boom".into()));
+        // The session types here aren't `Debug`, so assert on the `Err` arm
+        // directly rather than via `expect_err`.
+        let result = store
+            .create_session(&completed_with_email("user@example.com"), Duration::from_hours(1))
+            .await;
+        assert!(
+            matches!(&result, Err(e) if e.to_string().contains("enrichment boom")),
+            "enricher error must propagate",
+        );
+    }
+
+    #[tokio::test]
+    async fn session_aead_cipher_returns_the_configured_cipher() {
+        // The accessor a convenience layer uses to default the login-state
+        // cipher: it must hand back the store's actual configured cipher
+        // (matched here by reported key id), not a re-wrapped or empty one.
+        use huskarl::core::crypto::cipher::AeadEncryptor as _;
+        let session = test_session();
+        let store = StoreBackedSessionStore::builder()
+            .external(MinimalExternalStore(session))
+            .cipher(test_cipher_with_kid("v5").await)
+            .cookie_name("session")
+            .cookie_path("/")
+            .build();
+        let cipher = SessionDriver::session_aead_cipher(&store);
+        assert_eq!(cipher.key_id().as_deref(), Some("v5"));
+    }
+
     #[tokio::test]
     async fn delete_clears_pointer_and_kid_sidecar() {
         let session = test_session();
@@ -1050,5 +1228,47 @@ mod tests {
         }
         store.read_pointer_cookie(&req).await;
         assert_eq!(m.decrypts(), vec![(Some("v5".to_owned()), "ok")]);
+    }
+
+    #[tokio::test]
+    async fn metrics_read_pointer_cookie_forged_kid_is_normalized_to_unknown() {
+        // The sidecar is client-supplied: a pointer sealed under "v5" carrying
+        // an attacker-chosen kid must not let that value reach the metrics
+        // label. The read still succeeds (kid is a hint, not a filter), but the
+        // label collapses to "unknown".
+        let (session, external) = test_session_and_store();
+        let m = Arc::new(RecordingMetrics::default());
+        let store = StoreBackedSessionStore::builder()
+            .external(external)
+            .cipher(test_cipher_with_kid("v5").await)
+            .cookie_name("session")
+            .cookie_path("/")
+            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
+            .build();
+        let headers_out = store
+            .pointer_cookie_headers(session.persisted.session_key)
+            .await
+            .unwrap();
+        let pointer_value = headers_out
+            .iter()
+            .find_map(|h| {
+                let s = h.to_str().ok()?;
+                let pair = s.split(';').next()?;
+                let (name, v) = pair.split_once('=')?;
+                (name.trim() == "__Host-session" && !v.is_empty()).then(|| v.to_owned())
+            })
+            .expect("pointer cookie present");
+        let mut req = http::HeaderMap::new();
+        req.insert(
+            http::header::COOKIE,
+            format!(
+                "__Host-session={pointer_value}; __Host-session.kid={}",
+                encode_kid("totally-bogus")
+            )
+            .parse()
+            .unwrap(),
+        );
+        store.read_pointer_cookie(&req).await;
+        assert_eq!(m.decrypts(), vec![(Some("unknown".to_owned()), "ok")]);
     }
 }

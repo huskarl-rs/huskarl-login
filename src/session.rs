@@ -9,8 +9,10 @@
 //! Methods that modify session state return `Vec<HeaderValue>` of Set-Cookie
 //! values. Framework integrations append them to the HTTP response.
 
+use std::sync::Arc;
+
 use http::HeaderValue;
-use huskarl::core::platform::{MaybeSend, MaybeSendSync};
+use huskarl::core::{crypto::cipher::AeadCipher, platform::{MaybeSend, MaybeSendSync}};
 
 use crate::{completed_login::CompletedLogin, session_state::Session};
 
@@ -76,6 +78,21 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     ///
     /// Sealed: implemented only by this crate's built-in stores.
     fn apply_cookie_secure(&mut self, secure: bool);
+
+    /// The AEAD cipher this driver seals session data with.
+    ///
+    /// Every session driver seals with AEAD — cookie stores seal the session
+    /// itself, store-backed stores seal the pointer cookie — so this is a hard
+    /// requirement, not an optional capability.
+    ///
+    /// Exposed so convenience layers (e.g. `huskarl-axum`'s `LoginLayer`) can
+    /// default the engine's *separate* login-state cipher to the same key when
+    /// a deployment only wants one. The two seals are AAD-domain-separated
+    /// (`b"session"` / `b"session_ptr"` vs the OAuth `state`), so sharing a key
+    /// is safe; a deployment that wants distinct keys — e.g. a KMS-backed
+    /// login-state key and a local per-request session key — passes the
+    /// login-state cipher to the engine explicitly instead.
+    fn session_aead_cipher(&self) -> Arc<dyn AeadCipher>;
 
     /// Create a new session from a completed login.
     ///

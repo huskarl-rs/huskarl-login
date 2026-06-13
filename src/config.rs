@@ -154,9 +154,10 @@ pub struct LogoutConfig {
     /// (OIDC RP-Initiated Logout 1.0).
     ///
     /// When set, the logout endpoint redirects here after deleting the local
-    /// session. The `id_token_hint` parameter is included if the session
-    /// holds an ID token, and `post_logout_redirect_uri` is appended when
-    /// configured.
+    /// session. The request includes the `client_id` (from the grant, so the
+    /// OP can identify this RP and validate the redirect target) and an
+    /// `id_token_hint` when the session holds an ID token; the
+    /// `post_logout_redirect_uri` is appended when configured.
     ///
     /// Typically available as the `end_session_endpoint` field in the
     /// authorization server's discovery document.
@@ -167,6 +168,16 @@ pub struct LogoutConfig {
     /// redirecting to `end_session_endpoint`. When no `end_session_endpoint`
     /// is set, used as the redirect target directly. When `None`, defaults
     /// to `base_url`.
+    ///
+    /// # Must be registered at the authorization server
+    ///
+    /// Per OIDC RP-Initiated Logout 1.0 §3, the OP performs post-logout
+    /// redirection only if this value *exactly matches* one of the RP's
+    /// previously registered `post_logout_redirect_uris`. Register it — and
+    /// the `base_url` default, if you rely on it — at the authorization
+    /// server, or the OP will drop the redirect and strand the user on its own
+    /// logout page, regardless of the `client_id` / `id_token_hint` the engine
+    /// sends.
     pub post_logout_redirect_uri: Option<http::Uri>,
 }
 
@@ -264,24 +275,14 @@ pub struct LoginConfig {
     /// MFA prompts, tenant pickers, or password resets) before the callback
     /// will fail with a missing-state error.
     ///
+    /// This is also what bounds the accumulation of abandoned flows: each
+    /// login redirect sets a per-flow cookie named by its `state` (scoped to
+    /// the callback path) with `Max-Age` set to this TTL, so a tab the user
+    /// never completes clears itself from the browser within this window.
+    /// There is no separate server-side cap — the `Max-Age` is the bound.
+    ///
     /// Defaults to 600 seconds (10 minutes).
     pub login_state_ttl: Duration,
-    /// Maximum number of in-flight login flows (login-state cookies) kept
-    /// per browser, including the flow being started.
-    ///
-    /// Each login redirect sets a per-flow cookie named by its `state`, so
-    /// concurrent tabs can each complete their own flow. Without a cap,
-    /// abandoned flows accumulate in the cookie jar until their `Max-Age`
-    /// expires, and enough of them can push the browser into evicting other
-    /// cookies. When starting a flow would exceed the cap, the engine emits
-    /// clears for the excess: unreadable login-state cookies first, then the
-    /// oldest flows by their sealed creation time. An evicted flow fails at
-    /// the callback with an invalid-state error and the user just logs in
-    /// again. As long as the request carries fewer cookies than the cap, no
-    /// extra work (in particular no decryption) is done.
-    ///
-    /// Defaults to 4. Values below 1 are treated as 1 (the new flow itself).
-    pub max_pending_logins: usize,
     /// Minimum interval between activity "touches" for an active session.
     ///
     /// On each authenticated request, the middleware updates `last_active` and
@@ -357,9 +358,6 @@ impl LoginConfig {
         /// Lifetime of the per-flow login-state cookie. Defaults to 10 minutes.
         #[builder(default = Duration::from_mins(10))]
         login_state_ttl: Duration,
-        /// Maximum number of in-flight login flows per browser. Defaults to 4.
-        #[builder(default = 4)]
-        max_pending_logins: usize,
         /// Minimum interval between activity touches. Defaults to 1 hour.
         #[builder(default = Duration::from_hours(1))]
         touch_min_interval: Duration,
@@ -455,7 +453,6 @@ impl LoginConfig {
             token_refresh_margin,
             default_token_lifetime,
             login_state_ttl,
-            max_pending_logins,
             touch_min_interval,
             base_url,
             strip_prefix,
@@ -529,23 +526,6 @@ mod tests {
             default_policy_config().login_state_ttl,
             Duration::from_mins(10)
         );
-    }
-
-    #[test]
-    fn login_config_max_pending_logins_defaults_4() {
-        assert_eq!(default_policy_config().max_pending_logins, 4);
-    }
-
-    #[test]
-    fn login_config_max_pending_logins_override() {
-        let config = LoginConfig::builder()
-            .callback_path("/callback".into())
-            .scopes(vec![])
-            .base_url("https://app.example.com".parse().unwrap())
-            .max_pending_logins(2)
-            .build()
-            .unwrap();
-        assert_eq!(config.max_pending_logins, 2);
     }
 
     #[test]

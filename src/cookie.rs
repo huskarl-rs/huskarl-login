@@ -17,7 +17,10 @@ use std::{sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::header;
-use huskarl::core::crypto::cipher::{AeadCipher, AeadUnsealer, AeadV1Cipher, CipherMatch};
+use huskarl::core::crypto::{
+    KeyMatchStrength,
+    cipher::{AeadCipher, AeadUnsealer, AeadV1Cipher, CipherMatch},
+};
 use serde::{Serialize, de::DeserializeOwned};
 
 /// The bundle cipher used for every cookie this crate seals: the v1 bundle
@@ -198,6 +201,38 @@ pub(crate) fn get_kid_cookie(headers: &http::HeaderMap, base_name: &str) -> Opti
 #[must_use]
 pub(crate) fn encode_kid(identity: &str) -> String {
     URL_SAFE_NO_PAD.encode(identity.as_bytes())
+}
+
+/// Normalizes a kid read from the (client-supplied) sidecar cookie into a
+/// bounded metrics label.
+///
+/// The sidecar is attacker-controllable — anyone can send an arbitrary
+/// `{name}.kid` request cookie — so passing it through verbatim would let
+/// crafted values inflate metrics label cardinality without limit (a TSDB
+/// `DoS`). Instead the value is kept only when it names a configured key
+/// (`cipher_match` reports an exact [`KeyMatchStrength::ByKeyId`]), and
+/// collapsed to `"unknown"` otherwise — the same closed-set discipline
+/// [`normalize_as_error`](crate::normalize_as_error) applies to the
+/// attacker-suppliable authorization-server error code. `ByAlgorithm` does not
+/// count: it fires for keyless / no-kid ciphers on *any* input, which would
+/// leave the label unbounded.
+///
+/// An unmatched kid is logged at debug level. A one-off is just a stale or
+/// forged cookie; a *persistent* unmatched kid can flag a key retired while
+/// sessions sealed under it are still in flight.
+pub(crate) fn normalize_kid_label<'a>(
+    cipher: &dyn AeadCipher,
+    cookie_name: &str,
+    kid: Option<&'a str>,
+) -> Option<&'a str> {
+    let k = kid?;
+    let m = CipherMatch::builder().kid(k).build();
+    if matches!(cipher.cipher_match(&m), Some(KeyMatchStrength::ByKeyId)) {
+        Some(k)
+    } else {
+        log::debug!("session cookie {cookie_name}: sidecar kid {k:?} matches no configured key");
+        Some("unknown")
+    }
 }
 
 /// Extracts a cookie value by name from request headers.

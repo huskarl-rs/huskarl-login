@@ -14,7 +14,13 @@ use huskarl::{
     core::{
         Error, ErrorKind,
         client_auth::NoAuth,
-        crypto::cipher::{AeadSealer as _, AeadV1Cipher},
+        crypto::{
+            KeyMatchStrength,
+            cipher::{
+                AeadCipher, AeadDecryptor, AeadEncryptor, AeadOutput, AeadSealer as _,
+                AeadV1Cipher, CipherMatch, DecryptError,
+            },
+        },
         http::{HttpClient, HttpResponse, Idempotency},
         platform::MaybeSendBoxFuture,
         secrets::{Secret, SecretBytes, SecretOutput},
@@ -260,6 +266,51 @@ fn expect_cleared(loaded: LoadedSession<MockSession>) -> (TeardownReason, Vec<He
 
 // ── MockSessionStore ──────────────────────────────────────────────────────
 
+/// A do-nothing AEAD cipher so [`MockSessionStore`] can satisfy
+/// [`SessionDriver::session_aead_cipher`] without async key construction in its
+/// sync constructors. The engine under test is always built with an explicit
+/// `.cipher(...)`, so this is never actually invoked to seal or unseal.
+#[derive(Debug)]
+struct NoopCipher;
+
+impl AeadEncryptor for NoopCipher {
+    fn enc_algorithm(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed("noop")
+    }
+    fn key_id(&self) -> Option<std::borrow::Cow<'_, str>> {
+        None
+    }
+    fn encrypt<'a>(
+        &'a self,
+        _plaintext: &'a [u8],
+        _aad: &'a [u8],
+    ) -> MaybeSendBoxFuture<'a, Result<AeadOutput, Error>> {
+        Box::pin(async {
+            Ok(AeadOutput {
+                nonce: Vec::new(),
+                ciphertext: Vec::new(),
+                tag: Vec::new(),
+            })
+        })
+    }
+}
+
+impl AeadDecryptor for NoopCipher {
+    fn cipher_match(&self, _m: &CipherMatch<'_>) -> Option<KeyMatchStrength> {
+        None
+    }
+    fn decrypt<'a>(
+        &'a self,
+        _cipher_match: Option<&'a CipherMatch<'a>>,
+        _nonce: &'a [u8],
+        _ciphertext: &'a [u8],
+        _tag: &'a [u8],
+        _aad: &'a [u8],
+    ) -> MaybeSendBoxFuture<'a, Result<Vec<u8>, DecryptError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
 struct MockSessionStore {
     session: Mutex<Option<MockSession>>,
     save_called: Mutex<bool>,
@@ -319,12 +370,19 @@ impl MockSessionStore {
 
 impl Sealed for MockSessionStore {}
 
+// Test stub: the async method signatures are mandated by the trait; the
+// bodies are synchronous.
+#[allow(clippy::unused_async_trait_impl)]
 impl SessionDriver for MockSessionStore {
     type SessionType = MockSession;
     type LoadError = Infallible;
 
     fn apply_cookie_secure(&mut self, secure: bool) {
         *self.applied_secure.lock().unwrap() = Some(secure);
+    }
+
+    fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
+        Arc::new(NoopCipher)
     }
 
     async fn create(
@@ -392,11 +450,18 @@ impl std::error::Error for StoreLoadError {}
 
 struct ErrorSessionStore;
 impl Sealed for ErrorSessionStore {}
+// Test stub: the async method signatures are mandated by the trait; the
+// bodies are synchronous (mostly `unimplemented!()` for unexercised paths).
+#[allow(clippy::unused_async_trait_impl)]
 impl SessionDriver for ErrorSessionStore {
     type SessionType = MockSession;
     type LoadError = StoreLoadError;
 
     fn apply_cookie_secure(&mut self, _secure: bool) {}
+
+    fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
+        unimplemented!()
+    }
 
     async fn create(
         &self,
@@ -717,7 +782,7 @@ async fn logout_path_is_handled_when_configured() {
     let e = engine_with_config(MockSessionStore::empty(), config_with_logout()).await;
     let uri = "/logout".parse().unwrap();
     let resp = e
-        .try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
+        .try_handle_login_route(&Method::POST, &HeaderMap::new(), &uri)
         .await;
     assert!(resp.is_some());
 }
@@ -754,9 +819,11 @@ async fn logout_accepts_post() {
 
 #[tokio::test]
 async fn logout_rejects_other_methods() {
+    // GET is rejected too: logout is POST-only so it can't be triggered by a
+    // link, an `<img>`, or a prefetch.
     let e = engine_with_config(MockSessionStore::empty(), config_with_logout()).await;
     let uri = "/logout".parse().unwrap();
-    for method in [Method::PUT, Method::DELETE, Method::HEAD] {
+    for method in [Method::GET, Method::PUT, Method::DELETE, Method::HEAD] {
         let resp = e
             .try_handle_login_route(&method, &HeaderMap::new(), &uri)
             .await
@@ -767,7 +834,7 @@ async fn logout_rejects_other_methods() {
             .iter()
             .find(|(n, _)| *n == http::header::ALLOW)
             .map(|(_, v)| v.to_str().unwrap());
-        assert_eq!(allow, Some("GET, POST"), "{method}");
+        assert_eq!(allow, Some("POST"), "{method}");
     }
 }
 
@@ -957,8 +1024,6 @@ async fn login_state_cookie_uses_configured_ttl() {
     assert!(cookie.1.to_str().unwrap().contains("Max-Age=1800"));
 }
 
-// ── Login-flow cap (max_pending_logins) ───────────────────────────────────
-
 fn login_cookie_name(state: &str) -> String {
     crate::cookie::login_state_cookie_name(
         state,
@@ -966,129 +1031,6 @@ fn login_cookie_name(state: &str) -> String {
         "/callback",
         crate::cookie::DEFAULT_LOGIN_COOKIE_PREFIX,
     )
-}
-
-/// Navigation headers carrying the given `(name, value)` login-state cookies.
-fn nav_headers_with_login_cookies(cookies: &[(String, String)]) -> HeaderMap {
-    let joined = cookies
-        .iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join("; ");
-    headers(&[("sec-fetch-mode", "navigate"), ("cookie", &joined)])
-}
-
-/// Names of the login-state cookies the response clears via `Max-Age=0`.
-fn cleared_login_cookies(r: &super::LoginResponse) -> Vec<String> {
-    r.headers()
-        .iter()
-        .filter(|(n, _)| *n == http::header::SET_COOKIE)
-        .filter_map(|(_, v)| {
-            let s = v.to_str().ok()?;
-            (s.contains("huskarl_login_") && s.contains("Max-Age=0"))
-                .then(|| s.split_once('=').unwrap().0.to_owned())
-        })
-        .collect()
-}
-
-#[tokio::test]
-async fn redirect_under_cap_clears_no_login_cookies() {
-    // Three existing flows + the new one = the default cap of 4. Nothing to
-    // evict, and (by design) nothing should even be decrypted.
-    let e = engine(MockSessionStore::empty()).await;
-    let mut cookies = Vec::new();
-    for s in ["s1", "s2", "s3"] {
-        cookies.push((
-            login_cookie_name(s),
-            seal_login_cookie(s, "https://app.example.com/a").await,
-        ));
-    }
-    let uri = "/protected".parse().unwrap();
-    let r = e
-        .redirect_to_login(&nav_headers_with_login_cookies(&cookies), &uri)
-        .await;
-    assert_eq!(r.status(), StatusCode::FOUND);
-    assert!(cleared_login_cookies(&r).is_empty());
-}
-
-#[tokio::test]
-async fn redirect_over_cap_evicts_oldest_flow() {
-    // Four existing flows + the new one exceeds the cap of 4 by one: the
-    // flow with the oldest sealed created_at (s1) is evicted, the rest kept.
-    let e = engine(MockSessionStore::empty()).await;
-    let now = SystemTime::now();
-    let mut cookies = Vec::new();
-    for (i, s) in ["s1", "s2", "s3", "s4"].iter().enumerate() {
-        let created_at = now - Duration::from_secs(60 * (4 - i as u64));
-        cookies.push((
-            login_cookie_name(s),
-            seal_login_cookie_at(s, "https://app.example.com/a", created_at).await,
-        ));
-    }
-    let uri = "/protected".parse().unwrap();
-    let r = e
-        .redirect_to_login(&nav_headers_with_login_cookies(&cookies), &uri)
-        .await;
-    assert_eq!(r.status(), StatusCode::FOUND);
-    assert_eq!(cleared_login_cookies(&r), vec![login_cookie_name("s1")]);
-}
-
-#[tokio::test]
-async fn redirect_over_cap_evicts_unreadable_cookies_first() {
-    // One garbage cookie under our prefix plus three valid recent flows:
-    // over the cap, the unreadable cookie goes before any live flow.
-    let e = engine(MockSessionStore::empty()).await;
-    let mut cookies = vec![(login_cookie_name("bad"), "!!!garbage!!!".to_owned())];
-    for s in ["s1", "s2", "s3"] {
-        cookies.push((
-            login_cookie_name(s),
-            seal_login_cookie(s, "https://app.example.com/a").await,
-        ));
-    }
-    let uri = "/protected".parse().unwrap();
-    let r = e
-        .redirect_to_login(&nav_headers_with_login_cookies(&cookies), &uri)
-        .await;
-    assert_eq!(cleared_login_cookies(&r), vec![login_cookie_name("bad")]);
-}
-
-#[tokio::test]
-async fn redirect_respects_configured_cap() {
-    // Cap of 2 → keep one existing flow: the newer of the two survives.
-    let config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
-        .scopes(vec![])
-        .base_url("https://app.example.com".parse().unwrap())
-        .max_pending_logins(2)
-        .build()
-        .unwrap();
-    let e = engine_with_config(MockSessionStore::empty(), config).await;
-    let now = SystemTime::now();
-    let cookies = vec![
-        (
-            login_cookie_name("old"),
-            seal_login_cookie_at(
-                "old",
-                "https://app.example.com/a",
-                now - Duration::from_mins(2),
-            )
-            .await,
-        ),
-        (
-            login_cookie_name("new"),
-            seal_login_cookie_at(
-                "new",
-                "https://app.example.com/b",
-                now - Duration::from_mins(1),
-            )
-            .await,
-        ),
-    ];
-    let uri = "/protected".parse().unwrap();
-    let r = e
-        .redirect_to_login(&nav_headers_with_login_cookies(&cookies), &uri)
-        .await;
-    assert_eq!(cleared_login_cookies(&r), vec![login_cookie_name("old")]);
 }
 
 // ── Server-side login-state TTL ───────────────────────────────────────────
@@ -1554,7 +1496,7 @@ async fn logout_without_session_redirects_to_base_url() {
     let e = engine_with_config(MockSessionStore::empty(), config_with_logout()).await;
     let uri = "/logout".parse().unwrap();
     let r = e
-        .try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
+        .try_handle_login_route(&Method::POST, &HeaderMap::new(), &uri)
         .await
         .expect("logout handled");
     assert_eq!(r.status(), StatusCode::FOUND);
@@ -1575,7 +1517,7 @@ async fn logout_with_session_deletes_session() {
     .await;
     let uri = "/logout".parse().unwrap();
     let _ = e
-        .try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
+        .try_handle_login_route(&Method::POST, &HeaderMap::new(), &uri)
         .await;
     assert!(e.session_store.delete_called());
 }
@@ -1597,7 +1539,7 @@ async fn logout_redirects_to_configured_post_logout_uri() {
     let e = engine_with_config(MockSessionStore::empty(), config).await;
     let uri = "/logout".parse().unwrap();
     let r = e
-        .try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
+        .try_handle_login_route(&Method::POST, &HeaderMap::new(), &uri)
         .await
         .expect("logout handled");
     let hdrs = r.headers();
@@ -1609,9 +1551,44 @@ async fn logout_redirects_to_configured_post_logout_uri() {
 }
 
 #[tokio::test]
+async fn logout_end_session_url_includes_client_id_without_id_token() {
+    // The stock case: built-in sessions store no id_token, so the end-session
+    // URL must still identify the RP via client_id — otherwise the OP drops
+    // post_logout_redirect_uri (OIDC RP-Initiated Logout 1.0 §2).
+    let config = LoginConfig::builder()
+        .callback_path("/callback".to_owned())
+        .scopes(vec![])
+        .base_url("https://app.example.com".parse().unwrap())
+        .logout(
+            LogoutConfig::builder()
+                .path("/logout")
+                .end_session_endpoint("https://auth.example.com/logout".parse().unwrap())
+                .build(),
+        )
+        .build()
+        .unwrap();
+    let e = engine_with_config(MockSessionStore::with_session(valid_session()), config).await;
+    let uri = "/logout".parse().unwrap();
+    let r = e
+        .try_handle_login_route(&Method::POST, &HeaderMap::new(), &uri)
+        .await
+        .expect("logout handled");
+    let loc = r
+        .headers()
+        .iter()
+        .find(|(n, _)| *n == http::header::LOCATION)
+        .map(|(_, v)| v.to_str().unwrap().to_owned())
+        .expect("location header");
+    // test_grant uses client_id = "client".
+    assert!(loc.contains("client_id=client"), "got: {loc}");
+    assert!(loc.contains("post_logout_redirect_uri="), "got: {loc}");
+    assert!(!loc.contains("id_token_hint="), "got: {loc}");
+}
+
+#[tokio::test]
 async fn logout_rejects_cross_site_request_without_deleting_session() {
-    // A forged cross-site navigation (e.g. a link on an attacker's page) must
-    // not log the user out: 403, no redirect, session left intact.
+    // A forged cross-site POST (e.g. an auto-submitting form on an attacker's
+    // page) must not log the user out: 403, no redirect, session left intact.
     let e = engine_with_config(
         MockSessionStore::with_session(valid_session()),
         config_with_logout(),
@@ -1620,7 +1597,7 @@ async fn logout_rejects_cross_site_request_without_deleting_session() {
     let uri = "/logout".parse().unwrap();
     let h = headers(&[("sec-fetch-site", "cross-site")]);
     let r = e
-        .try_handle_login_route(&Method::GET, &h, &uri)
+        .try_handle_login_route(&Method::POST, &h, &uri)
         .await
         .expect("logout handled");
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
@@ -1641,7 +1618,7 @@ async fn logout_allows_same_origin_request() {
     let uri = "/logout".parse().unwrap();
     let h = headers(&[("sec-fetch-site", "same-origin")]);
     let r = e
-        .try_handle_login_route(&Method::GET, &h, &uri)
+        .try_handle_login_route(&Method::POST, &h, &uri)
         .await
         .expect("logout handled");
     assert_eq!(r.status(), StatusCode::FOUND);

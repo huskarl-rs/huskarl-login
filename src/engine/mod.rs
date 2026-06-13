@@ -193,7 +193,10 @@ pub enum LoadedSession<S> {
         session: S,
         /// `Set-Cookie` headers that must reach the final response: the
         /// re-sealed session cookies when a token refresh was persisted
-        /// eagerly, empty otherwise.
+        /// eagerly, empty otherwise. When non-empty these carry a live session
+        /// cookie, so the response they ride on must not be cached by shared
+        /// caches — see [`load_session`](LoginEngine::load_session)'s *Response
+        /// caching* note.
         set_cookies: Vec<HeaderValue>,
     },
     /// Authenticated, with persistence owed after the inner handler responds
@@ -340,8 +343,7 @@ impl PersistFailurePolicy for DefaultPersistFailurePolicy {
 struct LoginStateCookie {
     original_url: String,
     pending_state: PendingState,
-    /// When the flow started. Lets the engine evict the oldest flows once a
-    /// browser exceeds [`LoginConfig::max_pending_logins`] and enforce
+    /// When the flow started. Lets the engine enforce
     /// [`LoginConfig::login_state_ttl`] server-side (the cookie's `Max-Age`
     /// only enforces it browser-side). Cookies sealed before this field
     /// existed decode as the epoch, which uniformly classifies them as
@@ -434,9 +436,12 @@ where
     ///
     /// The callback only accepts `GET` — the authorization server delivers the
     /// response as a query-string redirect (top-level navigation). Logout
-    /// accepts `GET` (links) and `POST` (forms). Other methods on these paths
-    /// get a `405 Method Not Allowed` with an `Allow` header rather than
-    /// falling through, since the paths are reserved for the engine.
+    /// accepts only `POST` (submitted from a form): logout is state-changing,
+    /// so restricting it to `POST` keeps it from being triggered by a `GET`
+    /// the user never intended — a cross-site link, an `<img>` tag, a
+    /// prefetch. Other methods on these paths get a `405 Method Not Allowed`
+    /// with an `Allow` header rather than falling through, since the paths are
+    /// reserved for the engine.
     pub async fn try_handle_login_route(
         &self,
         method: &Method,
@@ -453,8 +458,8 @@ where
         if let Some(logout) = &self.config.logout
             && path == logout.path
         {
-            if *method != Method::GET && *method != Method::POST {
-                return Some(self.method_not_allowed("GET, POST"));
+            if *method != Method::POST {
+                return Some(self.method_not_allowed("POST"));
             }
             return Some(self.handle_logout(logout, headers).await);
         }
@@ -526,6 +531,20 @@ where
     /// underlying error is returned; the adapter typically maps that to a
     /// 5xx response.
     ///
+    /// # Response caching
+    ///
+    /// A [`LoadedSession::Active`] returned after an eager refresh carries the
+    /// re-sealed session cookies in its `set_cookies`, and the adapter attaches
+    /// them to the **inner handler's** response — whose caching the engine does
+    /// not control. The engine marks its *own* redirects and error pages
+    /// `Cache-Control: no-store`, but a refreshed session cookie riding on a
+    /// cacheable handler response could be stored by a shared cache and later
+    /// replayed to a different user. Adapters MUST ensure any response carrying
+    /// session `Set-Cookie` values — these, or those returned by
+    /// [`persist_session`](Self::persist_session) — is non-cacheable
+    /// (`Cache-Control: no-store`, or at minimum `private`). The same applies
+    /// to the cookie clears on [`LoadedSession::Cleared`].
+    ///
     /// # Errors
     ///
     /// Returns [`SessionError`] if the underlying session store fails to load
@@ -563,7 +582,7 @@ where
         if !is_navigation_request(headers) {
             return self.build_error_response(StatusCode::UNAUTHORIZED, "authentication required");
         }
-        match self.redirect_to_as(headers, uri).await {
+        match self.redirect_to_as(uri).await {
             Ok(resp) => {
                 self.record_login_start(&LoginStartResult::Ok);
                 resp
@@ -795,6 +814,10 @@ where
     /// `request_headers` are the cookies the browser sent on the original
     /// request — cookie-backed session stores use them to clear any stale
     /// chunked-cookie slots that the new session no longer occupies.
+    ///
+    /// The returned `Set-Cookie` values may carry a re-sealed session cookie,
+    /// so the response they attach to must not be cached by shared caches — see
+    /// [`load_session`](Self::load_session)'s *Response caching* note.
     ///
     /// # Errors
     ///

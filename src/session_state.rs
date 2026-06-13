@@ -82,16 +82,7 @@ impl SessionState {
             .map_or(default_lifetime, Duration::from_secs);
         let token_expiry = now + lifetime;
         let (sub, sid) = match completed.id_token_claims() {
-            Some(claims) => (
-                claims.sub.clone(),
-                // TODO: replace with `claims.sid.clone()` once huskarl-core
-                // exposes `sid` as a first-class field on `IdTokenClaims`.
-                claims
-                    .extra
-                    .get("sid")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned),
-            ),
+            Some(claims) => (claims.sub.clone(), claims.sid.clone()),
             None => (None, None),
         };
 

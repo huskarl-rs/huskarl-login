@@ -19,7 +19,7 @@ use crate::{
     completed_login::CompletedLogin,
     cookie::{
         DEFAULT_COOKIE_MAX_AGE, SessionCipher, cookie_attrs, decode_payload, encode_kid,
-        encode_payload, get_kid_cookie, kid_cookie_name, session_cookie_name,
+        encode_payload, get_kid_cookie, kid_cookie_name, normalize_kid_label, session_cookie_name,
         unseal_with_kid_fallback,
     },
     enrich::{NoEnrichment, SessionEnricher},
@@ -163,8 +163,35 @@ impl From<SessionState> for CookieSession {
 /// an index is missing. Truncation or stale leftover chunks just produce a
 /// payload the AEAD layer can't authenticate, which surfaces as "no session"
 /// and triggers a fresh login.
+///
+/// # Logout and revocation
+///
+/// A cookie session lives entirely in the browser — there is no server-side
+/// record to invalidate. Logout (and [`delete`](SessionDriver::delete)) can
+/// only emit `Max-Age=0` clears that drop the cookie from the *cooperating*
+/// browser; it cannot revoke a copy of the sealed cookie an attacker already
+/// captured (via XSS, a shared machine, or malware). Such a copy stays valid
+/// until its own timestamps age out — i.e. until
+/// [`max_lifetime`](crate::LoginConfig::max_lifetime) or
+/// [`idle_timeout`](crate::LoginConfig::idle_timeout) elapses, or the access
+/// token expires with no usable refresh token. There is no way to cut it short
+/// server-side, because the server holds no state for it.
+///
+/// Mitigate by keeping `max_lifetime` and `idle_timeout` tight — the realistic
+/// blast radius of a stolen cookie is that window. If you need server-side
+/// revocation — immediate logout-everywhere, back-channel logout, admin
+/// session kill — use
+/// [`StoreBackedSessionStore`](crate::StoreBackedSessionStore) instead: its
+/// [`delete`](SessionDriver::delete) removes the record from the external
+/// store, so the bearer cookie is dead on the next request regardless of who
+/// holds it.
 pub struct CookieSessionStore<C = CookieSession> {
     cipher: SessionCipher,
+    /// The raw cipher behind [`cipher`](Self::cipher), retained so the store
+    /// can hand it back via
+    /// [`SessionDriver::session_aead_cipher`](crate::SessionDriver::session_aead_cipher)
+    /// without re-wrapping it in the v1 bundle envelope.
+    aead: Arc<dyn AeadCipher>,
     /// The configured cookie name, before any security prefix is applied.
     /// Retained so [`apply_cookie_secure`](SessionDriver::apply_cookie_secure)
     /// can recompute `cookie_name` once the engine supplies the deployment's
@@ -207,6 +234,7 @@ impl<C> CookieSessionStore<C> {
         let raw_cookie_name = cookie_name;
         let cookie_name = session_cookie_name(raw_cookie_name.clone(), secure, &cookie_path);
         Self {
+            aead: cipher.clone(),
             cipher: AeadV1Cipher::new(cipher),
             raw_cookie_name,
             cookie_name,
@@ -239,6 +267,20 @@ impl<C, S: cookie_store_builder::IsComplete> CookieSessionStoreBuilder<C, S> {
         enricher: impl SessionEnricher<SessionState, C> + 'static,
     ) -> CookieSessionStore<C> {
         self.build_internal(Box::new(enricher))
+    }
+
+    /// Finishes the builder with a synchronous claim-mapper: build the payload
+    /// from the [`SessionState`] seed and the [`CompletedLogin`] (e.g. copy ID
+    /// token claims) without I/O. For enrichment that must `await` — such as
+    /// the OIDC `UserInfo` endpoint — use
+    /// [`build_with_enricher`](Self::build_with_enricher) instead; for payloads
+    /// built from the seed alone, use [`build`](Self::build).
+    #[must_use]
+    pub fn build_with_claims<F>(self, f: F) -> CookieSessionStore<C>
+    where
+        F: Fn(SessionState, &CompletedLogin) -> Result<C, SessionError> + MaybeSendSync + 'static,
+    {
+        self.build_internal(Box::new(crate::enrich::ClaimsFn(f)))
     }
 }
 
@@ -302,8 +344,11 @@ impl<C: CookiePayload> CookieSessionStore<C> {
     }
 
     fn record_decrypt(&self, kid: Option<&str>, result: &DecryptResult) {
+        // The kid comes from the client-supplied sidecar cookie; bound it to a
+        // configured key (or "unknown") before it becomes a metrics label.
+        let label = normalize_kid_label(&*self.aead, &self.cookie_name, kid);
         if let Some(m) = &self.metrics {
-            m.record_decrypt(&self.cookie_name, kid, result);
+            m.record_decrypt(&self.cookie_name, label, result);
         }
     }
 
@@ -477,6 +522,10 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
         self.cookie_name = session_cookie_name(self.raw_cookie_name.clone(), secure, &self.cookie_path);
     }
 
+    fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
+        self.aead.clone()
+    }
+
     async fn create(
         &self,
         completed: CompletedLogin,
@@ -518,6 +567,9 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
         self.save_session(session, headers).await
     }
 
+    // Clearing chunk cookies is pure header construction with no I/O; the
+    // `async` is only here to satisfy the `SessionDriver` trait signature.
+    #[allow(clippy::unused_async_trait_impl)]
     async fn delete(
         &self,
         _session: &C,
@@ -1116,6 +1168,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_aead_cipher_returns_the_configured_cipher() {
+        // The accessor a convenience layer uses to default the login-state
+        // cipher: it must hand back the store's actual configured cipher
+        // (matched here by reported key id), not a re-wrapped or empty one.
+        use huskarl::core::crypto::cipher::AeadEncryptor as _;
+        let store = CookieSessionStore::<CookieSession>::builder()
+            .cipher(test_cipher_with_kid("v5").await)
+            .cookie_name("huskarl_session")
+            .cookie_path("/")
+            .build();
+        let cipher = SessionDriver::session_aead_cipher(&store);
+        assert_eq!(cipher.key_id().as_deref(), Some("v5"));
+    }
+
+    /// A completed login carrying an `email` profile claim, for exercising the
+    /// synchronous claim-mapper finisher.
+    fn completed_with_email(email: &str) -> CompletedLogin {
+        let token_response = huskarl::grant::core::RawTokenResponse::builder()
+            // A fixture token value, not a key — `SecretString::new` is the
+            // value wrapper, distinct from the `Secret` key-source layer.
+            .access_token(huskarl::core::secrets::SecretString::new("access-token"))
+            .token_type("Bearer")
+            .build()
+            .into_token_response(None, SystemTime::now())
+            .unwrap();
+        let mut claims = huskarl::token::id_token::IdTokenClaims::default();
+        claims.profile.email = Some(email.to_owned());
+        CompletedLogin::builder()
+            .token_response(token_response)
+            .id_token_claims(claims)
+            .build()
+    }
+
+    #[tokio::test]
+    async fn build_with_claims_maps_id_token_claims_into_session() {
+        // The synchronous finisher: no async enricher, just a closure that
+        // reads the completed login. EnrichedSession has no From<SessionState>,
+        // so this is the only no-I/O way to populate `email`.
+        let store = CookieSessionStore::<EnrichedSession>::builder()
+            .cipher(test_cipher().await)
+            .cookie_name("huskarl_session")
+            .cookie_path("/")
+            .build_with_claims(|state, completed| {
+                Ok(EnrichedSession {
+                    state,
+                    email: completed
+                        .id_token_claims()
+                        .and_then(|c| c.profile.email.clone())
+                        .ok_or("missing email claim")?,
+                })
+            });
+        assert_session_driver(&store);
+
+        let (session, cookies) = store
+            .create(
+                completed_with_email("user@example.com"),
+                Duration::from_hours(1),
+                &HeaderMap::new(),
+            )
+            .await
+            .expect("create succeeds");
+        assert_eq!(session.email, "user@example.com");
+
+        // The mapped session round-trips through the cookie the same as any
+        // other payload.
+        let req = request_cookies_from_set_cookies(&cookies);
+        let loaded = store.load_session(&req).await.expect("session loads");
+        assert_eq!(loaded.email, "user@example.com");
+    }
+
+    #[tokio::test]
+    async fn build_with_claims_error_fails_session_creation() {
+        // A claim-mapper that returns Err aborts session creation, propagating
+        // the error just like a failed async enricher.
+        let store = CookieSessionStore::<EnrichedSession>::builder()
+            .cipher(test_cipher().await)
+            .cookie_name("huskarl_session")
+            .cookie_path("/")
+            .build_with_claims(|_state, _completed| Err("enrichment boom".into()));
+        // The session types here aren't `Debug`, so assert on the `Err` arm
+        // directly rather than via `expect_err`.
+        let result = store
+            .create(
+                completed_with_email("user@example.com"),
+                Duration::from_hours(1),
+                &HeaderMap::new(),
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(e) if e.to_string().contains("enrichment boom")),
+            "enricher error must propagate",
+        );
+    }
+
+    #[tokio::test]
     async fn load_returns_none_when_no_cookies() {
         let store = test_store().await;
         assert!(store.load_session(&HeaderMap::new()).await.is_none());
@@ -1434,6 +1581,29 @@ mod tests {
         );
         store.load_session(&headers).await;
         assert_eq!(m.decrypts(), vec![(None, "payload_invalid")]);
+    }
+
+    #[tokio::test]
+    async fn metrics_load_forged_kid_is_normalized_to_unknown() {
+        // The sidecar is client-supplied: a session sealed under "v5" but
+        // carrying an attacker-chosen kid must not let that value reach the
+        // metrics label. The decrypt still succeeds (kid is a hint, not a
+        // filter), but the label collapses to "unknown".
+        let m = Arc::new(RecordingMetrics::default());
+        let store = CookieSessionStore::<CookieSession>::builder()
+            .cipher(test_cipher_with_kid("v5").await)
+            .cookie_name("huskarl_session")
+            .cookie_path("/")
+            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
+            .build();
+        let set_cookies = store
+            .save_session(&CookieSession(test_state()), &HeaderMap::new())
+            .await
+            .unwrap();
+        let mut req = request_cookies_from_set_cookies(&set_cookies);
+        override_kid_cookie(&mut req, &encode_kid("totally-bogus"));
+        store.load_session(&req).await;
+        assert_eq!(m.decrypts(), vec![(Some("unknown".to_owned()), "ok")]);
     }
 
     #[tokio::test]

@@ -18,9 +18,11 @@ where
         logout: &LogoutConfig,
         headers: &HeaderMap,
     ) -> LoginResponse {
-        // Logout is state-changing and session cookies are SameSite=Lax (sent
-        // on cross-site top-level navigations), so reject forged cross-site
-        // requests before touching the session.
+        // Logout is POST-only (enforced by the route dispatcher) and session
+        // cookies are SameSite=Lax, which already keeps them off cross-site
+        // POSTs — so cross-site forgery is blocked at the cookie layer. This
+        // Sec-Fetch-Site check is defense-in-depth: it also rejects a forged
+        // cross-site POST should the cookie ever be issued without SameSite=Lax.
         if is_cross_site_request(headers) {
             return self
                 .build_error_response(StatusCode::FORBIDDEN, "cross-site logout request rejected");
@@ -84,10 +86,15 @@ where
         let id_token_hint = loaded_session
             .and_then(|s| s.id_token())
             .map(huskarl::token::IdToken::token);
-        build_end_session_url(endpoint, id_token_hint, Some(post_logout.as_str())).unwrap_or_else(|e| {
-            log::error!("failed to build end_session URL: {e}");
-            post_logout.clone()
-        })
+        // Always send client_id: the built-in sessions don't store the
+        // id_token, so without it the OP can't identify the RP and will drop
+        // post_logout_redirect_uri (OIDC RP-Initiated Logout 1.0 §2).
+        let client_id = Some(self.grant.client_id());
+        build_end_session_url(endpoint, id_token_hint, client_id, Some(post_logout.as_str()))
+            .unwrap_or_else(|e| {
+                log::error!("failed to build end_session URL: {e}");
+                post_logout.clone()
+            })
     }
 
     /// Deletes the session via the driver and appends the returned cookie

@@ -50,10 +50,51 @@ use crate::{completed_login::CompletedLogin, session::SessionError};
 /// optional should catch their own errors and return a partially-populated
 /// session instead.
 ///
-/// # Mapping ID token claims
+/// # Mapping claims without I/O (the common case)
 ///
-/// The simplest enrichers need no I/O at all — they copy claims from the
-/// validated ID token into the session:
+/// When the session is built from the seed plus a few ID token claims and no
+/// network call, you don't implement this trait at all — pass a synchronous
+/// closure to the store builder's `build_with_claims` finisher. It receives
+/// the seed and the [`CompletedLogin`] and returns the session, with none of
+/// the `Box::pin(async move { … })` ceremony a full enricher needs:
+///
+/// ```
+/// use huskarl::core::crypto::cipher::AeadCipher;
+/// use huskarl_login::{CookieSessionStore, Session, SessionState};
+/// # struct MySession {
+/// #     state: SessionState,
+/// #     email: Option<String>,
+/// # }
+/// # impl Session for MySession {
+/// #     fn state(&self) -> &SessionState { &self.state }
+/// #     fn set_state(&mut self, state: SessionState) { self.state = state; }
+/// # }
+/// # fn attach(cipher: impl AeadCipher + 'static) -> CookieSessionStore<MySession> {
+/// let store = CookieSessionStore::<MySession>::builder()
+///     .cipher(cipher)
+///     .cookie_name("session")
+///     .cookie_path("/")
+///     .build_with_claims(|state, completed| {
+///         Ok(MySession {
+///             state,
+///             email: completed
+///                 .id_token_claims()
+///                 .and_then(|c| c.profile.email.clone()),
+///         })
+///     });
+/// # store
+/// # }
+/// ```
+///
+/// Returning `Err` from the closure fails session creation, exactly like a
+/// failing enricher. For non-standard claims, use `claims.extra.get("…")`.
+/// `StoreBackedSessionStore` has the same finisher; only the seed type changes
+/// (to [`PersistedSessionState`](crate::PersistedSessionState)).
+///
+/// # Implementing the trait directly
+///
+/// Implement `SessionEnricher` itself when you want a named, reusable enricher
+/// — the same no-I/O mapping as above, written as a type:
 ///
 /// ```
 /// use huskarl::core::platform::MaybeSendBoxFuture;
@@ -83,8 +124,6 @@ use crate::{completed_login::CompletedLogin, session::SessionError};
 ///     }
 /// }
 /// ```
-///
-/// For non-standard claims, use `claims.extra.get("…")`.
 ///
 /// # Calling the `UserInfo` endpoint
 ///
@@ -199,5 +238,34 @@ where
         _completed: &'a CompletedLogin,
     ) -> MaybeSendBoxFuture<'a, Result<S, SessionError>> {
         Box::pin(async move { Ok(seed.into()) })
+    }
+}
+
+/// Adapts a synchronous claim-mapping closure into a [`SessionEnricher`].
+///
+/// Bridges the gap between [`NoEnrichment`] (converts the seed via [`From`],
+/// never sees the [`CompletedLogin`]) and a hand-written async enricher (for
+/// enrichment that must `await`, e.g. the OIDC `UserInfo` endpoint): the
+/// closure *does* receive the completed login, so it can copy ID token claims
+/// into the session, but it runs synchronously — there is no
+/// `Box::pin(async move { … })` to write.
+///
+/// Constructed implicitly by the session-store builders' `build_with_claims`
+/// finisher; it is never named in application code.
+pub(crate) struct ClaimsFn<F>(pub(crate) F);
+
+impl<Seed, S, F> SessionEnricher<Seed, S> for ClaimsFn<F>
+where
+    Seed: MaybeSend + 'static,
+    F: Fn(Seed, &CompletedLogin) -> Result<S, SessionError> + MaybeSendSync + 'static,
+{
+    fn build_session<'a>(
+        &'a self,
+        seed: Seed,
+        completed: &'a CompletedLogin,
+    ) -> MaybeSendBoxFuture<'a, Result<S, SessionError>> {
+        // No `await` inside: the only value held across the (trivial) future
+        // is `seed`, hence the `Seed: MaybeSend` bound mirrors `NoEnrichment`.
+        Box::pin(async move { (self.0)(seed, completed) })
     }
 }
