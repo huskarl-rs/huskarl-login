@@ -105,6 +105,14 @@ pub enum ConfigError {
         /// Why the prefix was rejected.
         reason: &'static str,
     },
+    /// A duration setting holds a nonsensical value (e.g. zero, or a refresh
+    /// margin that meets or exceeds the assumed token lifetime).
+    InvalidDuration {
+        /// The name of the offending field.
+        field: &'static str,
+        /// Why the value was rejected.
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -127,6 +135,9 @@ impl std::fmt::Display for ConfigError {
             }
             Self::InvalidLoginCookiePrefix { prefix, reason } => {
                 write!(f, "invalid login_cookie_prefix {prefix:?}: {reason}")
+            }
+            Self::InvalidDuration { field, reason } => {
+                write!(f, "invalid {field}: {reason}")
             }
         }
     }
@@ -156,6 +167,43 @@ fn validate_path(
             path.to_owned(),
             "must not contain ASCII control characters",
         ));
+    }
+    Ok(())
+}
+
+/// Validates the lifetime/interval settings against each other. A zero value
+/// silently breaks the flow it governs (`default_token_lifetime` /
+/// `login_state_ttl` of zero expire on issue, `Some(ZERO)` `max_lifetime` locks
+/// every session out immediately), and a refresh margin at or above the assumed
+/// token lifetime classifies tokens as expiring the instant they're issued —
+/// refreshing on every request.
+fn validate_durations(
+    max_lifetime: Option<Duration>,
+    token_refresh_margin: Duration,
+    default_token_lifetime: Duration,
+    login_state_ttl: Duration,
+) -> Result<(), ConfigError> {
+    let zero = |field| ConfigError::InvalidDuration {
+        field,
+        reason: "must be greater than zero",
+    };
+    if default_token_lifetime.is_zero() {
+        return Err(zero("default_token_lifetime"));
+    }
+    if login_state_ttl.is_zero() {
+        return Err(zero("login_state_ttl"));
+    }
+    if max_lifetime == Some(Duration::ZERO) {
+        return Err(ConfigError::InvalidDuration {
+            field: "max_lifetime",
+            reason: "must be greater than zero (use None for no limit)",
+        });
+    }
+    if token_refresh_margin >= default_token_lifetime {
+        return Err(ConfigError::InvalidDuration {
+            field: "token_refresh_margin",
+            reason: "must be less than default_token_lifetime",
+        });
     }
     Ok(())
 }
@@ -474,6 +522,13 @@ impl LoginConfig {
                 reason: "must contain only ASCII letters, digits, '_', or '-'",
             });
         }
+        validate_durations(
+            max_lifetime,
+            token_refresh_margin,
+            default_token_lifetime,
+            login_state_ttl,
+        )?;
+
         let browser_callback_path =
             compute_browser_callback_path(&callback_path, strip_prefix.as_deref(), &base_url);
         // Single source of truth for cookie security: the browser-facing scheme.
@@ -532,6 +587,81 @@ mod tests {
     #[test]
     fn login_config_max_lifetime_defaults_none() {
         assert!(default_policy_config().max_lifetime.is_none());
+    }
+
+    #[test]
+    fn rejects_zero_default_token_lifetime() {
+        let err = LoginConfig::builder()
+            .callback_path("/callback".into())
+            .scopes(vec![])
+            .base_url("https://app.example.com".parse().unwrap())
+            .default_token_lifetime(Duration::ZERO)
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidDuration {
+                field: "default_token_lifetime",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_login_state_ttl() {
+        let err = LoginConfig::builder()
+            .callback_path("/callback".into())
+            .scopes(vec![])
+            .base_url("https://app.example.com".parse().unwrap())
+            .login_state_ttl(Duration::ZERO)
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidDuration {
+                field: "login_state_ttl",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_max_lifetime_but_allows_none() {
+        let err = LoginConfig::builder()
+            .callback_path("/callback".into())
+            .scopes(vec![])
+            .base_url("https://app.example.com".parse().unwrap())
+            .max_lifetime(Duration::ZERO)
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidDuration {
+                field: "max_lifetime",
+                ..
+            }
+        ));
+        // None (the default) stays valid — it means "no absolute cap".
+        assert!(default_policy_config().max_lifetime.is_none());
+    }
+
+    #[test]
+    fn rejects_refresh_margin_at_or_above_token_lifetime() {
+        let err = LoginConfig::builder()
+            .callback_path("/callback".into())
+            .scopes(vec![])
+            .base_url("https://app.example.com".parse().unwrap())
+            .default_token_lifetime(Duration::from_secs(60))
+            .token_refresh_margin(Duration::from_secs(60))
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidDuration {
+                field: "token_refresh_margin",
+                ..
+            }
+        ));
     }
 
     #[test]

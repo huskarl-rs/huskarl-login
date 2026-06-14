@@ -12,7 +12,7 @@ use std::{borrow::Cow, sync::Arc, time::Duration};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
 use huskarl::core::{
-    crypto::cipher::{AeadCipher, AeadEncryptor as _, AeadSealer as _, AeadV1Cipher, CipherMatch},
+    crypto::cipher::{AeadCipher, AeadSealer as _, CipherMatch},
     platform::{MaybeSend, MaybeSendSync, SystemTime},
 };
 use serde::{Deserialize, Serialize};
@@ -20,8 +20,7 @@ use uuid::Uuid;
 
 use crate::{
     cookie::{
-        DEFAULT_COOKIE_MAX_AGE, SessionCipher, cookie_attrs, encode_kid, get_cookie,
-        get_kid_cookie, kid_cookie_name, normalize_kid_label, session_cookie_name,
+        CookieSealer, DEFAULT_COOKIE_MAX_AGE, get_cookie, get_kid_cookie, kid_cookie_name,
         unseal_with_kid_fallback,
     },
     enrich::{NoEnrichment, SessionEnricher},
@@ -292,22 +291,9 @@ const UPDATE_MAX_ATTEMPTS: u32 = 5;
 pub struct StoreBackedSessionStore<E: ExternalSessionStore> {
     external: E,
     enricher: Box<dyn SessionEnricher<PersistedSessionState, E::SessionType>>,
-    cipher: SessionCipher,
-    /// The raw cipher behind [`cipher`](Self::cipher), retained so the store
-    /// can hand it back via
-    /// [`SessionDriver::session_aead_cipher`](crate::SessionDriver::session_aead_cipher)
-    /// without re-wrapping it in the v1 bundle envelope.
-    aead: Arc<dyn AeadCipher>,
-    /// The configured cookie name, before any security prefix is applied.
-    /// Retained so [`apply_cookie_secure`](SessionDriver::apply_cookie_secure)
-    /// can recompute `cookie_name` once the engine supplies the deployment's
-    /// `secure` flag.
-    raw_cookie_name: String,
-    cookie_name: String,
-    secure: bool,
-    cookie_path: String,
-    max_age: Duration,
-    metrics: Option<Arc<dyn SessionCookieMetrics>>,
+    /// Shared cookie-sealing machinery (cipher, cookie name/attrs, kid sidecar,
+    /// metrics) for the pointer cookie — see [`CookieSealer`].
+    sealer: CookieSealer,
     /// Optional server-side liveness (idle) tracking. `None` means idle timeout
     /// is not enforced and activity is not recorded. Attached post-construction
     /// via [`with_liveness`](Self::with_liveness) so it does not change the
@@ -339,24 +325,10 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         /// Optional metrics observer for encrypt/decrypt events.
         metrics: Option<Arc<dyn SessionCookieMetrics>>,
     ) -> Self {
-        // `secure` is supplied by the engine via `apply_cookie_secure` once it
-        // knows the deployment's `base_url` scheme. Until then default to the
-        // safe choice (secure, `__Host-` prefix); the engine re-derives the
-        // cookie name when it stamps the real value.
-        let secure = true;
-        let raw_cookie_name = cookie_name;
-        let cookie_name = session_cookie_name(raw_cookie_name.clone(), secure, &cookie_path);
         Self {
             external,
             enricher,
-            aead: cipher.clone(),
-            cipher: AeadV1Cipher::new(cipher),
-            raw_cookie_name,
-            cookie_name,
-            secure,
-            cookie_path,
-            max_age,
-            metrics,
+            sealer: CookieSealer::new(cipher, cookie_name, cookie_path, max_age, metrics),
             liveness: None,
         }
     }
@@ -415,7 +387,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     /// that will be used for the **next** seal operation — suitable for
     /// updating an active-key gauge from a reload callback.
     pub fn key_id(&self) -> Option<Cow<'_, str>> {
-        self.cipher.key_id()
+        self.sealer.key_id()
     }
 
     /// Attach server-side liveness (idle-timeout) tracking, backed by the given
@@ -503,18 +475,6 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         Err(Box::new(VersionConflict))
     }
 
-    fn base_cookie_attrs(&self) -> String {
-        cookie_attrs(self.secure, &self.cookie_path)
-    }
-
-    fn cookie_attrs(&self) -> String {
-        format!(
-            "{}; Max-Age={}",
-            self.base_cookie_attrs(),
-            self.max_age.as_secs()
-        )
-    }
-
     /// Encrypt the pointer cookie and emit it alongside the kid sidecar.
     ///
     /// The plaintext is the UUID's 16 raw bytes — not the 36-byte hyphenated
@@ -532,6 +492,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         session_key: Uuid,
     ) -> Result<Vec<HeaderValue>, SessionError> {
         let bundle = self
+            .sealer
             .cipher
             .seal(session_key.as_bytes(), b"session_ptr")
             .await
@@ -539,67 +500,53 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         // See cookie_session.rs for the rationale on reading `key_id()` from
         // the same cipher that just sealed the bundle: stable for single-key
         // ciphers; if multi-key sealers land, switch to `AeadCipherSelector`.
-        let kid = self.cipher.key_id();
-        if let Some(m) = &self.metrics {
-            m.record_encrypt(&self.cookie_name, kid.as_deref());
-        }
+        let kid = self.sealer.key_id();
+        self.sealer.record_encrypt(kid.as_deref());
         let cookie_value = URL_SAFE_NO_PAD.encode(&bundle);
-        let attrs = self.cookie_attrs();
+        let attrs = self.sealer.cookie_attrs();
         let pointer =
-            HeaderValue::from_str(&format!("{}={cookie_value}; {attrs}", self.cookie_name))
+            HeaderValue::from_str(&format!("{}={cookie_value}; {attrs}", self.sealer.cookie_name))
                 .map_err(to_session_err)?;
-        let kid_header = self.build_kid_header(kid.as_deref())?;
+        let kid_header = self.sealer.build_kid_header(kid.as_deref())?;
         Ok(vec![pointer, kid_header])
-    }
-
-    /// Builds the `Set-Cookie` for the kid sidecar (or a `Max-Age=0` clear
-    /// when no identity is available — see [`Self::pointer_cookie_headers`]).
-    fn build_kid_header(&self, kid: Option<&str>) -> Result<HeaderValue, SessionError> {
-        let name = kid_cookie_name(&self.cookie_name);
-        let value = match kid {
-            Some(k) => format!("{name}={}; {}", encode_kid(k), self.cookie_attrs()),
-            None => format!("{name}=; {}; Max-Age=0", self.base_cookie_attrs()),
-        };
-        HeaderValue::from_str(&value).map_err(to_session_err)
     }
 
     /// Read and decrypt the pointer cookie to get the session key.
     async fn read_pointer_cookie(&self, headers: &http::HeaderMap) -> Option<Uuid> {
-        let encoded = get_cookie(headers, &self.cookie_name)?;
+        let encoded = get_cookie(headers, &self.sealer.cookie_name)?;
 
         // A pointer-cookie-shaped value is present — record the outcome.
-        let kid = get_kid_cookie(headers, &self.cookie_name);
+        let kid = get_kid_cookie(headers, &self.sealer.cookie_name);
 
         let Ok(bundle) = URL_SAFE_NO_PAD.decode(encoded) else {
-            self.record_decrypt(kid.as_deref(), &DecryptResult::BadEncoding);
+            self.sealer
+                .record_decrypt(kid.as_deref(), &DecryptResult::BadEncoding);
             return None;
         };
         let cipher_match = kid
             .as_deref()
             .map(|k| CipherMatch::builder().kid(k).build());
-        let Some(plaintext) =
-            unseal_with_kid_fallback(&self.cipher, cipher_match.as_ref(), &bundle, b"session_ptr")
-                .await
+        let Some(plaintext) = unseal_with_kid_fallback(
+            &self.sealer.cipher,
+            cipher_match.as_ref(),
+            &bundle,
+            b"session_ptr",
+        )
+        .await
         else {
-            self.record_decrypt(kid.as_deref(), &DecryptResult::DecryptFailed);
+            self.sealer
+                .record_decrypt(kid.as_deref(), &DecryptResult::DecryptFailed);
             return None;
         };
         // Must be exactly 16 bytes (UUID); anything else is a corrupted cookie.
         if let Ok(bytes) = <[u8; 16]>::try_from(plaintext) {
-            self.record_decrypt(kid.as_deref(), &DecryptResult::Ok);
+            self.sealer
+                .record_decrypt(kid.as_deref(), &DecryptResult::Ok);
             Some(Uuid::from_bytes(bytes))
         } else {
-            self.record_decrypt(kid.as_deref(), &DecryptResult::PayloadInvalid);
+            self.sealer
+                .record_decrypt(kid.as_deref(), &DecryptResult::PayloadInvalid);
             None
-        }
-    }
-
-    fn record_decrypt(&self, kid: Option<&str>, result: &DecryptResult) {
-        // The kid comes from the client-supplied sidecar cookie; bound it to a
-        // configured key (or "unknown") before it becomes a metrics label.
-        let label = normalize_kid_label(&*self.aead, &self.cookie_name, kid);
-        if let Some(m) = &self.metrics {
-            m.record_decrypt(&self.cookie_name, label, result);
         }
     }
 }
@@ -668,12 +615,13 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             }
         }
         // Clear the pointer cookie and the kid sidecar.
-        let clear_attrs = format!("{}; Max-Age=0", self.base_cookie_attrs());
+        let clear_attrs = format!("{}; Max-Age=0", self.sealer.base_cookie_attrs());
         let mut headers = Vec::new();
-        if let Ok(v) = HeaderValue::from_str(&format!("{}=; {clear_attrs}", self.cookie_name)) {
+        if let Ok(v) = HeaderValue::from_str(&format!("{}=; {clear_attrs}", self.sealer.cookie_name))
+        {
             headers.push(v);
         }
-        let kid_name = kid_cookie_name(&self.cookie_name);
+        let kid_name = kid_cookie_name(&self.sealer.cookie_name);
         if let Ok(v) = HeaderValue::from_str(&format!("{kid_name}=; {clear_attrs}")) {
             headers.push(v);
         }
@@ -688,13 +636,11 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
     type LoadError = E::Error;
 
     fn apply_cookie_secure(&mut self, secure: bool) {
-        self.secure = secure;
-        self.cookie_name =
-            session_cookie_name(self.raw_cookie_name.clone(), secure, &self.cookie_path);
+        self.sealer.apply_secure(secure);
     }
 
     fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
-        self.aead.clone()
+        self.sealer.aead.clone()
     }
 
     async fn create(
@@ -781,10 +727,14 @@ mod tests {
         platform::MaybeSendBoxFuture,
         secrets::{Secret, SecretBytes, SecretOutput},
     };
+    use huskarl::core::crypto::cipher::AeadV1Cipher;
     use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
 
     use super::*;
-    use crate::session_state::{Session, SessionState};
+    use crate::{
+        cookie::encode_kid,
+        session_state::{Session, SessionState},
+    };
 
     #[derive(Clone)]
     struct TestSecret(SecretBytes);

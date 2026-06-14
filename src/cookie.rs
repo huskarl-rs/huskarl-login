@@ -13,15 +13,20 @@
 //! flow. No explicit format-versioning is needed because re-login already
 //! recovers gracefully.
 
-use std::{sync::Arc, time::Duration};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use http::header;
+use http::{HeaderValue, header};
 use huskarl::core::crypto::{
     KeyMatchStrength,
-    cipher::{AeadCipher, AeadUnsealer, AeadV1Cipher, CipherMatch},
+    cipher::{AeadCipher, AeadEncryptor as _, AeadUnsealer, AeadV1Cipher, CipherMatch},
 };
 use serde::{Serialize, de::DeserializeOwned};
+
+use crate::{
+    metrics::{DecryptResult, SessionCookieMetrics},
+    session::{SessionError, to_session_err},
+};
 
 /// The bundle cipher used for every cookie this crate seals: the v1 bundle
 /// format over a type-erased AEAD cipher. The format choice is an
@@ -139,6 +144,120 @@ pub(crate) fn session_cookie_name(name: String, secure: bool, path: &str) -> Str
 pub fn cookie_attrs(secure: bool, path: &str) -> String {
     let secure = if secure { "; Secure" } else { "" };
     format!("HttpOnly; SameSite=Lax; Path={path}{secure}")
+}
+
+/// The shared cookie-sealing machinery behind both built-in session stores
+/// ([`CookieSessionStore`](crate::CookieSessionStore) and
+/// [`StoreBackedSessionStore`](crate::StoreBackedSessionStore)).
+///
+/// Both stores seal a value (a chunked session payload, or a UUID pointer)
+/// under AEAD into a security-prefixed cookie, emit the kid sidecar, and record
+/// the same encrypt/decrypt metrics. Centralizing that state here keeps the two
+/// stores from drifting — a fix to a cookie security attribute or the kid
+/// sidecar lands in one place rather than two.
+pub(crate) struct CookieSealer {
+    /// The v1-bundle cipher used to seal/unseal cookie values.
+    pub(crate) cipher: SessionCipher,
+    /// The raw cipher behind [`cipher`](Self::cipher), retained so a store can
+    /// hand it back via
+    /// [`SessionDriver::session_aead_cipher`](crate::SessionDriver::session_aead_cipher)
+    /// without re-wrapping it in the v1 bundle envelope.
+    pub(crate) aead: Arc<dyn AeadCipher>,
+    /// The configured cookie name, before any security prefix is applied.
+    /// Retained so [`apply_secure`](Self::apply_secure) can recompute
+    /// `cookie_name` once the engine supplies the deployment's `secure` flag.
+    raw_cookie_name: String,
+    /// The security-prefixed cookie name actually emitted on the wire.
+    pub(crate) cookie_name: String,
+    /// Whether the deployment is HTTPS (drives the `Secure` attribute and the
+    /// `__Host-`/`__Secure-` name prefix).
+    pub(crate) secure: bool,
+    cookie_path: String,
+    max_age: Duration,
+    metrics: Option<Arc<dyn SessionCookieMetrics>>,
+}
+
+impl CookieSealer {
+    /// Wraps `cipher` in the v1 bundle format and derives the initial
+    /// (secure-by-default) cookie name. `secure` is re-stamped by the engine
+    /// via [`apply_secure`](Self::apply_secure) once it knows the `base_url`
+    /// scheme; until then the safe choice (secure, `__Host-` prefix) is used.
+    pub(crate) fn new(
+        cipher: Arc<dyn AeadCipher>,
+        cookie_name: String,
+        cookie_path: String,
+        max_age: Duration,
+        metrics: Option<Arc<dyn SessionCookieMetrics>>,
+    ) -> Self {
+        let secure = true;
+        let raw_cookie_name = cookie_name;
+        let cookie_name = session_cookie_name(raw_cookie_name.clone(), secure, &cookie_path);
+        Self {
+            aead: cipher.clone(),
+            cipher: AeadV1Cipher::new(cipher),
+            raw_cookie_name,
+            cookie_name,
+            secure,
+            cookie_path,
+            max_age,
+            metrics,
+        }
+    }
+
+    /// The active key's identity, if it has one. See
+    /// [`AeadEncryptor::key_id`](huskarl::core::crypto::cipher::AeadEncryptor::key_id).
+    pub(crate) fn key_id(&self) -> Option<Cow<'_, str>> {
+        self.cipher.key_id()
+    }
+
+    /// Re-derives `cookie_name` for the deployment's real `secure` flag.
+    pub(crate) fn apply_secure(&mut self, secure: bool) {
+        self.secure = secure;
+        self.cookie_name =
+            session_cookie_name(self.raw_cookie_name.clone(), secure, &self.cookie_path);
+    }
+
+    /// Cookie attributes without `Max-Age` — used for clears (which append
+    /// their own `Max-Age=0`).
+    pub(crate) fn base_cookie_attrs(&self) -> String {
+        cookie_attrs(self.secure, &self.cookie_path)
+    }
+
+    /// Full cookie attributes including this store's configured `Max-Age`.
+    pub(crate) fn cookie_attrs(&self) -> String {
+        format!("{}; Max-Age={}", self.base_cookie_attrs(), self.max_age.as_secs())
+    }
+
+    /// Builds the `Set-Cookie` for the kid sidecar. When `kid` is `Some`, the
+    /// value is the base64url-encoded identity; when `None`, a `Max-Age=0`
+    /// clear is emitted so a sidecar set under a previous (identity-bearing)
+    /// key doesn't linger after operators switch to a key source with no
+    /// natural identity.
+    pub(crate) fn build_kid_header(&self, kid: Option<&str>) -> Result<HeaderValue, SessionError> {
+        let name = kid_cookie_name(&self.cookie_name);
+        let value = match kid {
+            Some(k) => format!("{name}={}; {}", encode_kid(k), self.cookie_attrs()),
+            None => format!("{name}=; {}; Max-Age=0", self.base_cookie_attrs()),
+        };
+        HeaderValue::from_str(&value).map_err(to_session_err)
+    }
+
+    /// Records an encrypt event (active key id) if metrics are configured.
+    pub(crate) fn record_encrypt(&self, kid: Option<&str>) {
+        if let Some(m) = &self.metrics {
+            m.record_encrypt(&self.cookie_name, kid);
+        }
+    }
+
+    /// Records a decrypt outcome if metrics are configured, after bounding the
+    /// client-supplied kid to a configured key (or `"unknown"`) so it can't
+    /// inflate label cardinality.
+    pub(crate) fn record_decrypt(&self, kid: Option<&str>, result: &DecryptResult) {
+        let label = normalize_kid_label(&*self.aead, &self.cookie_name, kid);
+        if let Some(m) = &self.metrics {
+            m.record_decrypt(&self.cookie_name, label, result);
+        }
+    }
 }
 
 /// Suffix appended to a session cookie's base name to form its kid sidecar

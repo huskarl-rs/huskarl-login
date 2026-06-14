@@ -10,7 +10,7 @@ use std::{borrow::Cow, sync::Arc, time::Duration};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
 use huskarl::core::{
-    crypto::cipher::{AeadCipher, AeadEncryptor as _, AeadSealer as _, AeadV1Cipher, CipherMatch},
+    crypto::cipher::{AeadCipher, AeadSealer as _, CipherMatch},
     platform::MaybeSendSync,
 };
 use serde::{Deserialize, Serialize};
@@ -18,9 +18,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     completed_login::CompletedLogin,
     cookie::{
-        DEFAULT_COOKIE_MAX_AGE, SessionCipher, cookie_attrs, decode_payload, encode_kid,
-        encode_payload, get_kid_cookie, kid_cookie_name, normalize_kid_label, session_cookie_name,
-        unseal_with_kid_fallback,
+        CookieSealer, DEFAULT_COOKIE_MAX_AGE, decode_payload, encode_payload, get_kid_cookie,
+        kid_cookie_name, unseal_with_kid_fallback,
     },
     enrich::{NoEnrichment, SessionEnricher},
     metrics::{DecryptResult, SessionCookieMetrics},
@@ -187,22 +186,9 @@ impl From<SessionState> for CookieSession {
 /// store, so the bearer cookie is dead on the next request regardless of who
 /// holds it.
 pub struct CookieSessionStore<C = CookieSession> {
-    cipher: SessionCipher,
-    /// The raw cipher behind [`cipher`](Self::cipher), retained so the store
-    /// can hand it back via
-    /// [`SessionDriver::session_aead_cipher`](crate::SessionDriver::session_aead_cipher)
-    /// without re-wrapping it in the v1 bundle envelope.
-    aead: Arc<dyn AeadCipher>,
-    /// The configured cookie name, before any security prefix is applied.
-    /// Retained so [`apply_cookie_secure`](SessionDriver::apply_cookie_secure)
-    /// can recompute `cookie_name` once the engine supplies the deployment's
-    /// `secure` flag.
-    raw_cookie_name: String,
-    cookie_name: String,
-    secure: bool,
-    cookie_path: String,
-    max_age: Duration,
-    metrics: Option<Arc<dyn SessionCookieMetrics>>,
+    /// Shared cookie-sealing machinery (cipher, cookie name/attrs, kid sidecar,
+    /// metrics) — see [`CookieSealer`].
+    sealer: CookieSealer,
     enricher: Box<dyn SessionEnricher<SessionState, C>>,
 }
 
@@ -227,22 +213,8 @@ impl<C> CookieSessionStore<C> {
         /// Optional metrics observer for encrypt/decrypt events.
         metrics: Option<Arc<dyn SessionCookieMetrics>>,
     ) -> Self {
-        // `secure` is supplied by the engine via `apply_cookie_secure` once it
-        // knows the deployment's `base_url` scheme. Until then default to the
-        // safe choice (secure, `__Host-` prefix); the engine re-derives the
-        // cookie name when it stamps the real value.
-        let secure = true;
-        let raw_cookie_name = cookie_name;
-        let cookie_name = session_cookie_name(raw_cookie_name.clone(), secure, &cookie_path);
         Self {
-            aead: cipher.clone(),
-            cipher: AeadV1Cipher::new(cipher),
-            raw_cookie_name,
-            cookie_name,
-            secure,
-            cookie_path,
-            max_age,
-            metrics,
+            sealer: CookieSealer::new(cipher, cookie_name, cookie_path, max_age, metrics),
             enricher,
         }
     }
@@ -295,19 +267,7 @@ impl<C> CookieSessionStore<C> {
     /// updating an active-key gauge from a reload callback.
     #[must_use]
     pub fn key_id(&self) -> Option<Cow<'_, str>> {
-        self.cipher.key_id()
-    }
-
-    fn base_cookie_attrs(&self) -> String {
-        cookie_attrs(self.secure, &self.cookie_path)
-    }
-
-    fn cookie_attrs(&self) -> String {
-        format!(
-            "{}; Max-Age={}",
-            self.base_cookie_attrs(),
-            self.max_age.as_secs()
-        )
+        self.sealer.key_id()
     }
 }
 
@@ -319,37 +279,36 @@ impl<C: CookiePayload> CookieSessionStore<C> {
         let raw_encoded = reassemble_chunks(&chunks)?;
 
         // A session-cookie-shaped value is present — record the outcome.
-        let kid = get_kid_cookie(headers, &self.cookie_name);
+        let kid = get_kid_cookie(headers, &self.sealer.cookie_name);
 
         let Ok(bundle) = URL_SAFE_NO_PAD.decode(&raw_encoded) else {
-            self.record_decrypt(kid.as_deref(), &DecryptResult::BadEncoding);
+            self.sealer
+                .record_decrypt(kid.as_deref(), &DecryptResult::BadEncoding);
             return None;
         };
         let cipher_match = kid
             .as_deref()
             .map(|k| CipherMatch::builder().kid(k).build());
-        let Some(plaintext) =
-            unseal_with_kid_fallback(&self.cipher, cipher_match.as_ref(), &bundle, b"session")
-                .await
+        let Some(plaintext) = unseal_with_kid_fallback(
+            &self.sealer.cipher,
+            cipher_match.as_ref(),
+            &bundle,
+            b"session",
+        )
+        .await
         else {
-            self.record_decrypt(kid.as_deref(), &DecryptResult::DecryptFailed);
+            self.sealer
+                .record_decrypt(kid.as_deref(), &DecryptResult::DecryptFailed);
             return None;
         };
         if let Ok(session) = decode_payload(&plaintext) {
-            self.record_decrypt(kid.as_deref(), &DecryptResult::Ok);
+            self.sealer
+                .record_decrypt(kid.as_deref(), &DecryptResult::Ok);
             Some(session)
         } else {
-            self.record_decrypt(kid.as_deref(), &DecryptResult::PayloadInvalid);
+            self.sealer
+                .record_decrypt(kid.as_deref(), &DecryptResult::PayloadInvalid);
             None
-        }
-    }
-
-    fn record_decrypt(&self, kid: Option<&str>, result: &DecryptResult) {
-        // The kid comes from the client-supplied sidecar cookie; bound it to a
-        // configured key (or "unknown") before it becomes a metrics label.
-        let label = normalize_kid_label(&*self.aead, &self.cookie_name, kid);
-        if let Some(m) = &self.metrics {
-            m.record_decrypt(&self.cookie_name, label, result);
         }
     }
 
@@ -383,7 +342,7 @@ impl<C: CookiePayload> CookieSessionStore<C> {
     /// which needs to know which `{name}.N` slots the browser currently has
     /// but doesn't care about their values.
     fn parse_chunk_index(&self, name: &str) -> Option<usize> {
-        let suffix = name.trim().strip_prefix(&self.cookie_name)?;
+        let suffix = name.trim().strip_prefix(&self.sealer.cookie_name)?;
         suffix.strip_prefix('.')?.parse::<usize>().ok()
     }
 
@@ -413,6 +372,7 @@ impl<C: CookiePayload> CookieSessionStore<C> {
     ) -> Result<Vec<HeaderValue>, SessionError> {
         let payload = encode_payload(session)?;
         let bundle = self
+            .sealer
             .cipher
             .seal(&payload, b"session")
             .await
@@ -422,21 +382,19 @@ impl<C: CookiePayload> CookieSessionStore<C> {
         // if huskarl-login ever switches to a multi-key sealer that picks
         // per-call, this should move to a select-then-use pattern via
         // `AeadCipherSelector`.
-        let kid = self.cipher.key_id();
-        if let Some(m) = &self.metrics {
-            m.record_encrypt(&self.cookie_name, kid.as_deref());
-        }
+        let kid = self.sealer.key_id();
+        self.sealer.record_encrypt(kid.as_deref());
         let cookie_value = URL_SAFE_NO_PAD.encode(&bundle);
         let chunks = split_into_chunks(&cookie_value);
         let num_chunks = chunks.len();
 
-        let attrs = self.cookie_attrs();
+        let attrs = self.sealer.cookie_attrs();
         let mut headers = Vec::with_capacity(num_chunks + 2);
         for (i, chunk) in chunks.iter().enumerate() {
             headers.push(self.build_chunk_header(i, chunk, &attrs)?);
         }
         self.append_clears_for_leftover_chunks(&mut headers, num_chunks, request_headers);
-        headers.push(self.build_kid_header(kid.as_deref())?);
+        headers.push(self.sealer.build_kid_header(kid.as_deref())?);
         Ok(headers)
     }
 
@@ -449,22 +407,8 @@ impl<C: CookiePayload> CookieSessionStore<C> {
         chunk: &str,
         attrs: &str,
     ) -> Result<HeaderValue, SessionError> {
-        HeaderValue::from_str(&format!("{}.{i}={chunk}; {attrs}", self.cookie_name))
+        HeaderValue::from_str(&format!("{}.{i}={chunk}; {attrs}", self.sealer.cookie_name))
             .map_err(to_session_err)
-    }
-
-    /// Builds the `Set-Cookie` header for the kid sidecar. When `kid` is
-    /// `Some`, the value is the base64url-encoded identity; when `None`, a
-    /// `Max-Age=0` clear is emitted so that a sidecar set under a previous
-    /// (identity-bearing) key doesn't linger after operators switch to a key
-    /// source with no natural identity.
-    fn build_kid_header(&self, kid: Option<&str>) -> Result<HeaderValue, SessionError> {
-        let name = kid_cookie_name(&self.cookie_name);
-        let value = match kid {
-            Some(k) => format!("{name}={}; {}", encode_kid(k), self.cookie_attrs()),
-            None => format!("{name}=; {}; Max-Age=0", self.base_cookie_attrs()),
-        };
-        HeaderValue::from_str(&value).map_err(to_session_err)
     }
 
     /// Appends `Max-Age=0` clears for every chunk slot the browser sent that
@@ -477,8 +421,8 @@ impl<C: CookiePayload> CookieSessionStore<C> {
         num_chunks: usize,
         request_headers: &http::HeaderMap,
     ) {
-        let clear_attrs = format!("{}; Max-Age=0", self.base_cookie_attrs());
-        let cookie_name = &self.cookie_name;
+        let clear_attrs = format!("{}; Max-Age=0", self.sealer.base_cookie_attrs());
+        let cookie_name = &self.sealer.cookie_name;
         self.for_each_request_chunk_index(request_headers, |idx| {
             if idx >= num_chunks
                 && let Ok(v) =
@@ -490,8 +434,8 @@ impl<C: CookiePayload> CookieSessionStore<C> {
     }
 
     pub(crate) fn delete_headers(&self, request_headers: &http::HeaderMap) -> Vec<HeaderValue> {
-        let clear_attrs = format!("{}; Max-Age=0", self.base_cookie_attrs());
-        let cookie_name = &self.cookie_name;
+        let clear_attrs = format!("{}; Max-Age=0", self.sealer.base_cookie_attrs());
+        let cookie_name = &self.sealer.cookie_name;
         let mut headers = Vec::new();
         // Clear the kid sidecar unconditionally — cheap and avoids leaving a
         // stale hint that would just degrade the next request to trial-decrypt
@@ -519,13 +463,11 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
     type LoadError = std::convert::Infallible;
 
     fn apply_cookie_secure(&mut self, secure: bool) {
-        self.secure = secure;
-        self.cookie_name =
-            session_cookie_name(self.raw_cookie_name.clone(), secure, &self.cookie_path);
+        self.sealer.apply_secure(secure);
     }
 
     fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
-        self.aead.clone()
+        self.sealer.aead.clone()
     }
 
     async fn create(
@@ -570,12 +512,14 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
 }
 
 /// Splits the encoded session string into [`CHUNK_SIZE`]-byte slices. The
-/// input is URL-safe base64 (ASCII), so byte chunks are valid UTF-8.
+/// input is URL-safe base64 (ASCII), so every byte offset is a `char`
+/// boundary and slicing by byte range is always valid — no UTF-8 revalidation
+/// (or its panic path) is needed.
 fn split_into_chunks(cookie_value: &str) -> Vec<&str> {
-    cookie_value
-        .as_bytes()
-        .chunks(CHUNK_SIZE)
-        .map(|c| std::str::from_utf8(c).expect("base64 output is ASCII"))
+    let len = cookie_value.len();
+    (0..len)
+        .step_by(CHUNK_SIZE)
+        .map(|start| &cookie_value[start..(start + CHUNK_SIZE).min(len)])
         .collect()
 }
 
@@ -610,9 +554,11 @@ mod tests {
         platform::MaybeSendBoxFuture,
         secrets::{Secret, SecretBytes, SecretOutput},
     };
+    use huskarl::core::crypto::cipher::AeadV1Cipher;
     use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
 
     use super::*;
+    use crate::cookie::encode_kid;
     use crate::session_state::SessionState;
 
     // ── Cipher / fixtures ─────────────────────────────────────────────────
