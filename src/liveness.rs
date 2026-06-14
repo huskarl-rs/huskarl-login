@@ -70,9 +70,18 @@ const DEFAULT_TOUCH_MIN_INTERVAL: Duration = Duration::from_secs(3600);
 /// This trait is dyn-capable: [`StoreBackedSessionStore`](crate::StoreBackedSessionStore)
 /// holds it as `Box<dyn LivenessStore>`, so attaching one via
 /// [`with_liveness`](crate::StoreBackedSessionStore::with_liveness) does not
-/// change the store's type. Write each method body as
-/// `Box::pin(async move { ... })`, and convert store errors with `?` — they
-/// box into [`SessionError`].
+/// change the store's type. Being dyn-erased is also why these methods return
+/// the concrete [`SessionError`] rather than an associated `type Error` like
+/// [`ExternalSessionStore`](crate::ExternalSessionStore) — an associated type
+/// would make the trait object unnameable. Write each method body as
+/// `Box::pin(async move { ... })`, and wrap a backend failure with
+/// `SessionError::new(SessionErrorKind::Unavailable, err)`.
+///
+/// Because liveness fails open, an `Err` from any of these methods is
+/// **diagnostic only** — it is logged and then treated as an active session
+/// (see [`check_liveness`](crate::SessionDriver::check_liveness)). The framework
+/// never inspects the [`SessionErrorKind`](crate::SessionErrorKind), so the kind
+/// is advisory; `Unavailable` is the honest default.
 pub trait LivenessStore: MaybeSendSync {
     /// Returns the last activity instant recorded for `key`, or `None` when no
     /// entry exists.

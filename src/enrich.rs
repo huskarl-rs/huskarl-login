@@ -45,10 +45,11 @@ use crate::{completed_login::CompletedLogin, session::SessionError};
 /// `Box::pin(async move { ... })`.
 ///
 /// A failed enrichment fails session creation: the callback responds with a
-/// 500 and no session is established. [`SessionError`] is a boxed standard
-/// error, so `?` converts any error type. Enrichers that consider their data
-/// optional should catch their own errors and return a partially-populated
-/// session instead.
+/// 500 and no session is established. Build a [`SessionError`] with
+/// [`SessionError::new`] (a [`SessionErrorKind::Store`](crate::SessionErrorKind::Store) fault for a local
+/// mapping failure); a [`huskarl::core::Error`] from a `UserInfo` call converts
+/// with `?` directly. Enrichers that consider their data optional should catch
+/// their own errors and return a partially-populated session instead.
 ///
 /// # Mapping claims without I/O (the common case)
 ///
@@ -72,8 +73,8 @@ use crate::{completed_login::CompletedLogin, session::SessionError};
 /// # fn attach(cipher: impl AeadCipher + 'static) -> CookieSessionStore<MySession> {
 /// let store = CookieSessionStore::<MySession>::builder()
 ///     .cipher(cipher)
-///     .cookie_name("session")
-///     .cookie_path("/")
+///     .cookie_name("session".parse().unwrap())
+///     .cookie_path("/".parse().unwrap())
 ///     .build_with_claims(|state, completed| {
 ///         Ok(MySession {
 ///             state,
@@ -138,7 +139,8 @@ use crate::{completed_login::CompletedLogin, session::SessionError};
 ///     userinfo::UserInfoClient,
 /// };
 /// use huskarl_login::{
-///     CompletedLogin, CookieSessionStore, SessionEnricher, SessionError, SessionState,
+///     CompletedLogin, CookieSessionStore, SessionEnricher, SessionError, SessionErrorKind,
+///     SessionState,
 /// };
 /// # struct MySession {
 /// #     state: SessionState,
@@ -158,7 +160,9 @@ use crate::{completed_login::CompletedLogin, session::SessionError};
 ///         completed: &'a CompletedLogin,
 ///     ) -> MaybeSendBoxFuture<'a, Result<MySession, SessionError>> {
 ///         Box::pin(async move {
-///             let sub = seed.sub.clone().ok_or("no subject in session seed")?;
+///             let sub = seed.sub.clone().ok_or_else(|| {
+///                 SessionError::new(SessionErrorKind::Store, "no subject in session seed")
+///             })?;
 ///             let info = self
 ///                 .userinfo
 ///                 .get(
@@ -183,8 +187,8 @@ use crate::{completed_login::CompletedLogin, session::SessionError};
 /// # ) -> CookieSessionStore<MySession> {
 /// let store = CookieSessionStore::<MySession>::builder()
 ///     .cipher(cipher)
-///     .cookie_name("session")
-///     .cookie_path("/")
+///     .cookie_name("session".parse().unwrap())
+///     .cookie_path("/".parse().unwrap())
 ///     .build_with_enricher(UserInfoEnricher {
 ///         http_client,
 ///         userinfo,

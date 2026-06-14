@@ -9,7 +9,7 @@
 //! Methods that modify session state return `Vec<HeaderValue>` of Set-Cookie
 //! values. Framework integrations append them to the HTTP response.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use http::HeaderValue;
 use huskarl::core::{
@@ -19,25 +19,157 @@ use huskarl::core::{
 
 use crate::{completed_login::CompletedLogin, liveness::LivenessVerdict, session_state::Session};
 
-/// A boxed standard error type used by session store methods.
+/// A type-erased session-error cause.
 ///
-/// On non-WASM platforms this is `Box<dyn Error + Send + Sync>`; on WASM
-/// (assumed single-threaded) the `Send + Sync` requirement is dropped,
-/// mirroring `huskarl::core::platform`'s `MaybeSendSync`. Marker traits can't
-/// appear in trait objects, so the split is spelled out per platform.
+/// `Send + Sync` except on WASM (assumed single-threaded), mirroring
+/// `huskarl::core::platform`'s `MaybeSendSync` and `huskarl::core::BoxedSource`.
 #[cfg(not(target_arch = "wasm32"))]
-pub type SessionError = Box<dyn std::error::Error + Send + Sync>;
-/// A boxed standard error type used by session store methods.
+pub type BoxedSource = Box<dyn std::error::Error + Send + Sync + 'static>;
+/// A type-erased session-error cause.
 ///
-/// On non-WASM platforms this is `Box<dyn Error + Send + Sync>`; on WASM
-/// (assumed single-threaded) the `Send + Sync` requirement is dropped,
-/// mirroring `huskarl::core::platform`'s `MaybeSendSync`. Marker traits can't
-/// appear in trait objects, so the split is spelled out per platform.
+/// `Send + Sync` except on WASM (assumed single-threaded), mirroring
+/// `huskarl::core::platform`'s `MaybeSendSync` and `huskarl::core::BoxedSource`.
 #[cfg(target_arch = "wasm32")]
-pub type SessionError = Box<dyn std::error::Error>;
+pub type BoxedSource = Box<dyn std::error::Error + 'static>;
 
+/// A request-time session-store failure.
+///
+/// Follows the same model as [`huskarl::core::Error`]: one non-generic struct
+/// carrying a matchable [`SessionErrorKind`], optional context, and a
+/// type-erased cause. Programmatic handling goes through [`kind`](Self::kind)
+/// and [`is_retryable`](Self::is_retryable) — they are the stable contract;
+/// downcasting the [`source`](std::error::Error::source) is not supported API.
+#[derive(Debug)]
+pub struct SessionError {
+    kind: SessionErrorKind,
+    context: Option<String>,
+    source: Option<BoxedSource>,
+}
+
+/// Classification of a [`SessionError`].
+///
+/// Marked `#[non_exhaustive]`: match with a wildcard arm. The kinds map onto
+/// the dispositions an adapter cares about — retry (`Unavailable`), conflict
+/// (`Conflict`), gone (`Gone`), or a genuine fault (`Crypto`/`Store`).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionErrorKind {
+    /// The backing store is unreachable or failed transiently; retrying the
+    /// same operation may succeed. The only [retryable](SessionError::is_retryable)
+    /// kind. Adapters typically map this to `503 Service Unavailable`.
+    Unavailable,
+    /// A compare-and-swap retry budget was exhausted: the session was
+    /// concurrently rewritten on every attempt. Adapters typically map this to
+    /// `409 Conflict`.
+    Conflict,
+    /// The session vanished mid-operation (deleted or expired between load and
+    /// update). The engine treats this like a missing session — re-authentication.
+    Gone,
+    /// A cookie seal/unseal or other cryptographic operation failed. A genuine
+    /// fault, not retryable; adapters typically map this to `500`.
+    Crypto,
+    /// The store violated its contract: a deserialize failure, an invalid
+    /// header value, or other unexpected shape. A genuine fault, not retryable;
+    /// adapters typically map this to `500`.
+    Store,
+}
+
+impl SessionError {
+    /// Create an error of the given kind caused by `source`.
+    pub fn new(kind: SessionErrorKind, source: impl Into<BoxedSource>) -> Self {
+        Self {
+            kind,
+            context: None,
+            source: Some(source.into()),
+        }
+    }
+
+    /// The classification of this error.
+    #[must_use]
+    pub fn kind(&self) -> SessionErrorKind {
+        self.kind
+    }
+
+    /// If true, the failure is transient and the same operation may succeed if
+    /// re-attempted. Only [`SessionErrorKind::Unavailable`] is retryable.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(self.kind, SessionErrorKind::Unavailable)
+    }
+
+    /// Attach human-readable context about the failed operation. Shown as a
+    /// prefix in the `Display` output; layers outermost-first like
+    /// [`huskarl::core::Error::with_context`].
+    #[must_use]
+    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+        self.context = Some(match self.context {
+            Some(existing) => format!("{}: {existing}", context.into()),
+            None => context.into(),
+        });
+        self
+    }
+}
+
+impl From<SessionErrorKind> for SessionError {
+    fn from(kind: SessionErrorKind) -> Self {
+        Self {
+            kind,
+            context: None,
+            source: None,
+        }
+    }
+}
+
+impl From<huskarl::core::Error> for SessionError {
+    /// Carry a huskarl error (e.g. from a `UserInfo` call inside an enricher)
+    /// as a session error, preserving its retryability and concrete cause.
+    fn from(err: huskarl::core::Error) -> Self {
+        let kind = if err.is_retryable() {
+            SessionErrorKind::Unavailable
+        } else {
+            SessionErrorKind::Store
+        };
+        Self::new(kind, err)
+    }
+}
+
+impl fmt::Display for SessionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(context) = &self.context {
+            write!(f, "{context}: ")?;
+        }
+        self.kind.fmt(f)
+    }
+}
+
+impl fmt::Display for SessionErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unavailable => "session store unavailable",
+            Self::Conflict => "session update conflict",
+            Self::Gone => "session no longer exists",
+            Self::Crypto => "session cryptographic operation failed",
+            Self::Store => "session store failure",
+        })
+    }
+}
+
+impl std::error::Error for SessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// Box a store's own error as an [`Unavailable`](SessionErrorKind::Unavailable)
+/// session error — the default classification for an opaque backing-store
+/// failure, which is far more often transient (network, timeout) than a
+/// permanent fault. Framework sites that *know* the failure is a conflict,
+/// gone, or crypto/store fault construct [`SessionError::new`] with the precise
+/// kind instead.
 pub(crate) fn to_session_err(e: impl std::error::Error + MaybeSendSync + 'static) -> SessionError {
-    Box::new(e)
+    SessionError::new(SessionErrorKind::Unavailable, e)
 }
 
 /// Sealed trait marker module.

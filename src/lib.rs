@@ -65,19 +65,23 @@ mod store_session;
 mod test_support;
 
 pub use completed_login::CompletedLogin;
-pub use config::{ActivityPolicy, ConfigError, LoginConfig, LogoutConfig};
+pub use config::{
+    ActivityPolicy, ConfigError, InvalidRoutePath, LoginConfig, LogoutConfig, RoutePath,
+};
+pub use cookie::{CookieName, InvalidCookieName};
 pub use cookie_session::{
     CookiePayload, CookieSession, CookieSessionStore, CookieSessionStoreBuilder,
 };
 pub use engine::{DefaultPersistFailurePolicy, PersistFailurePolicy, TeardownReason};
 pub use enrich::{NoEnrichment, SessionEnricher};
 pub use error_page::{DefaultErrorPage, ErrorPage, ErrorPageResponse};
+pub use huskarl::core::EndpointUrl;
 pub use liveness::{LivenessConfig, LivenessStore, LivenessVerdict};
 pub use metrics::{
     DecryptResult, LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult,
     SessionCookieMetrics, normalize_as_error,
 };
-pub use session::{SessionDriver, SessionError};
+pub use session::{SessionDriver, SessionError, SessionErrorKind};
 pub use session_state::{Session, SessionState};
 pub use store_session::{
     ExternalSessionStore, PersistedSession, PersistedSessionState, SaveOutcome, SessionNotFound,

@@ -77,7 +77,7 @@ where
         loaded_session: Option<&SD::SessionType>,
     ) -> String {
         let post_logout = match &logout.post_logout_redirect_uri {
-            Some(uri) => uri.to_string(),
+            Some(uri) => uri.clone(),
             None => default_post_logout_redirect(&self.config),
         };
         let Some(endpoint) = &logout.end_session_endpoint else {
@@ -91,7 +91,7 @@ where
         // post_logout_redirect_uri (OIDC RP-Initiated Logout 1.0 §2).
         let client_id = Some(self.grant.client_id());
         build_end_session_url(
-            endpoint,
+            endpoint.as_uri(),
             id_token_hint,
             client_id,
             Some(post_logout.as_str()),
@@ -113,7 +113,7 @@ where
         match self.session_store.delete(session, request_headers).await {
             Ok(cookies) => set_cookies.extend(cookies),
             Err(e) => {
-                log::error!("failed to delete session on logout: {}", error_chain(&*e));
+                log::error!("failed to delete session on logout: {}", error_chain(&e));
             }
         }
     }

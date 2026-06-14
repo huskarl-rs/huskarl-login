@@ -28,6 +28,7 @@ use huskarl::{
     token::RefreshToken,
 };
 use rstest::rstest;
+use snafu::Snafu;
 
 use super::{
     LoadedSession, LoginEngine, TeardownReason, error_chain, is_cors_preflight,
@@ -35,7 +36,7 @@ use super::{
 };
 use crate::{
     ActivityPolicy, CompletedLogin, LivenessVerdict, LoginConfig, LogoutConfig, Session,
-    SessionDriver, SessionError, SessionState,
+    SessionDriver, SessionError, SessionErrorKind, SessionState,
     metrics::{LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult},
     session::sealed::Sealed,
     test_support::{header_map as headers, test_cipher},
@@ -43,16 +44,9 @@ use crate::{
 
 // ── HTTP doubles ──────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Snafu)]
+#[snafu(display("flaky transport error"))]
 struct FlakyError;
-
-impl std::fmt::Display for FlakyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("flaky transport error")
-    }
-}
-
-impl std::error::Error for FlakyError {}
 
 /// Fails every request with a transport error of the given retryability,
 /// counting calls. One refresh attempt makes exactly one token-endpoint
@@ -125,10 +119,8 @@ async fn test_grant(http_client: impl HttpClient + 'static) -> AuthorizationCode
         .client_id("client")
         .http_client(http_client)
         .client_auth(NoAuth)
-        .token_endpoint("https://auth.example.com/token")
-        .unwrap()
-        .authorization_endpoint("https://auth.example.com/authorize")
-        .unwrap()
+        .token_endpoint("https://auth.example.com/token".parse().unwrap())
+        .authorization_endpoint("https://auth.example.com/authorize".parse().unwrap())
         .redirect_uri("https://app.example.com/callback")
         .build()
         .await
@@ -142,12 +134,9 @@ async fn par_failing_grant() -> AuthorizationCodeGrant {
         .client_id("client")
         .http_client(FailingHttp::new(false).0)
         .client_auth(NoAuth)
-        .token_endpoint("https://auth.example.com/token")
-        .unwrap()
-        .authorization_endpoint("https://auth.example.com/authorize")
-        .unwrap()
-        .pushed_authorization_request_endpoint("https://auth.example.com/par")
-        .unwrap()
+        .token_endpoint("https://auth.example.com/token".parse().unwrap())
+        .authorization_endpoint("https://auth.example.com/authorize".parse().unwrap())
+        .pushed_authorization_request_endpoint("https://auth.example.com/par".parse().unwrap())
         .require_pushed_authorization_requests(true)
         .redirect_uri("https://app.example.com/callback")
         .build()
@@ -388,7 +377,10 @@ impl SessionDriver for MockSessionStore {
     }
     async fn save(&self, _: &MockSession, _: &HeaderMap) -> Result<Vec<HeaderValue>, SessionError> {
         if self.fail_save {
-            return Err(Box::new(StoreSaveError));
+            return Err(SessionError::new(
+                SessionErrorKind::Unavailable,
+                StoreSaveError,
+            ));
         }
         *self.save_called.lock().unwrap() = true;
         Ok(vec![HeaderValue::from_static(MOCK_SAVE_COOKIE)])
@@ -415,25 +407,15 @@ impl SessionDriver for MockSessionStore {
 
 /// Error returned by [`MockSessionStore::save`] when constructed via
 /// [`MockSessionStore::with_session_failing_save`].
-#[derive(Debug)]
+#[derive(Debug, Snafu)]
+#[snafu(display("store save error"))]
 struct StoreSaveError;
-impl std::fmt::Display for StoreSaveError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("store save error")
-    }
-}
-impl std::error::Error for StoreSaveError {}
 
 // ── ErrorSessionStore — load always fails ─────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Snafu)]
+#[snafu(display("store load error"))]
 struct StoreLoadError;
-impl std::fmt::Display for StoreLoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("store load error")
-    }
-}
-impl std::error::Error for StoreLoadError {}
 
 struct ErrorSessionStore;
 impl Sealed for ErrorSessionStore {}
@@ -489,7 +471,7 @@ fn config_with_logout() -> LoginConfig {
         .callback_path("/callback".to_owned())
         .scopes(vec![])
         .base_url("https://app.example.com".parse().unwrap())
-        .logout(LogoutConfig::builder().path("/logout").build())
+        .logout(LogoutConfig::builder().path("/logout").build().unwrap())
         .build()
         .unwrap()
 }
@@ -589,12 +571,21 @@ fn headers_with_login_cookie(state: &str, value: &str) -> HeaderMap {
 #[case::accept_xhtml_only(&[("accept", "application/xhtml+xml")], true)]
 #[case::accept_json(&[("accept", "application/json")], false)]
 #[case::no_relevant_headers(&[], false)]
+// Sec-Fetch-User is an affirmative navigation signal when Mode/Dest are absent
+// (e.g. stripped by an intermediary), rescuing the navigation before Accept.
+#[case::sec_fetch_user_activated(&[("sec-fetch-user", "?1")], true)]
+#[case::sec_fetch_user_rescues_over_accept_json(
+    &[("sec-fetch-user", "?1"), ("accept", "application/json")],
+    true
+)]
 // Precedence: an explicit XHR/CORS signal wins over a navigation-looking one.
 #[case::xhr_overrides_sec_fetch_navigate(
     &[("x-requested-with", "XMLHttpRequest"), ("sec-fetch-mode", "navigate")],
     false
 )]
 #[case::sec_fetch_mode_overrides_accept(&[("sec-fetch-mode", "cors"), ("accept", "text/html")], false)]
+// Mode/Dest take precedence over Sec-Fetch-User: a non-navigation Mode wins.
+#[case::sec_fetch_mode_overrides_user(&[("sec-fetch-mode", "cors"), ("sec-fetch-user", "?1")], false)]
 fn is_navigation_request_cases(#[case] pairs: &[(&str, &str)], #[case] expected: bool) {
     assert_eq!(is_navigation_request(&headers(pairs)), expected);
 }
@@ -630,8 +621,10 @@ async fn callback_path_is_handled() {
     let uri = "/callback".parse().unwrap();
     let resp = e
         .try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
-        .await;
-    assert!(resp.is_some());
+        .await
+        .expect("reserved /callback path must be claimed, not fall through");
+    // No code/state on the callback → 400, rather than a silent pass-through.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -640,8 +633,10 @@ async fn logout_path_is_handled_when_configured() {
     let uri = "/logout".parse().unwrap();
     let resp = e
         .try_handle_login_route(&Method::POST, &HeaderMap::new(), &uri)
-        .await;
-    assert!(resp.is_some());
+        .await
+        .expect("configured /logout path must be claimed, not fall through");
+    // No session present is not an error for logout: it still redirects.
+    assert_eq!(resp.status(), StatusCode::FOUND);
 }
 
 #[tokio::test]
@@ -1163,8 +1158,15 @@ async fn load_session_store_error_bubbles_up() {
         .session_store(ErrorSessionStore)
         .cipher(test_cipher().await)
         .build();
-    let err = e.load_session(&HeaderMap::new()).await;
-    assert!(err.is_err());
+    let err = e
+        .load_session(&HeaderMap::new())
+        .await
+        .expect_err("opaque store load failure must surface as an error");
+    // An opaque backing-store failure is classified `Unavailable` — the more
+    // often transient kind — so callers treat it as retryable rather than a
+    // hard 4xx/permanent fault.
+    assert_eq!(err.kind(), SessionErrorKind::Unavailable);
+    assert!(err.is_retryable());
 }
 
 // ── persist_session ───────────────────────────────────────────────────────
@@ -1359,8 +1361,9 @@ async fn logout_redirects_to_configured_post_logout_uri() {
         .logout(
             LogoutConfig::builder()
                 .path("/logout")
-                .post_logout_redirect_uri("https://app.example.com/signed-out".parse().unwrap())
-                .build(),
+                .post_logout_redirect_uri("https://app.example.com/signed-out")
+                .build()
+                .unwrap(),
         )
         .build()
         .unwrap();
@@ -1391,7 +1394,8 @@ async fn logout_end_session_url_includes_client_id_without_id_token() {
             LogoutConfig::builder()
                 .path("/logout")
                 .end_session_endpoint("https://auth.example.com/logout".parse().unwrap())
-                .build(),
+                .build()
+                .unwrap(),
         )
         .build()
         .unwrap();
@@ -1411,6 +1415,47 @@ async fn logout_end_session_url_includes_client_id_without_id_token() {
     assert!(loc.contains("client_id=client"), "got: {loc}");
     assert!(loc.contains("post_logout_redirect_uri="), "got: {loc}");
     assert!(!loc.contains("id_token_hint="), "got: {loc}");
+}
+
+#[tokio::test]
+async fn post_logout_redirect_uri_is_sent_exactly_not_normalized() {
+    // OIDC RP-Initiated Logout 1.0 §3 requires the OP to match
+    // post_logout_redirect_uri against the registered value byte-for-byte.
+    // An authority-only URL must NOT gain a trailing slash on the way to the
+    // wire (parsing through http::Uri would add one), or the OP drops it.
+    let config = LoginConfig::builder()
+        .callback_path("/callback".to_owned())
+        .scopes(vec![])
+        .base_url("https://app.example.com".parse().unwrap())
+        .logout(
+            LogoutConfig::builder()
+                .path("/logout")
+                .end_session_endpoint("https://auth.example.com/logout".parse().unwrap())
+                .post_logout_redirect_uri("https://app.example.com")
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    let e = engine_with_config(MockSessionStore::empty(), config).await;
+    let uri = "/logout".parse().unwrap();
+    let r = e
+        .try_handle_login_route(&Method::POST, &HeaderMap::new(), &uri)
+        .await
+        .expect("logout handled");
+    let loc = r
+        .headers()
+        .iter()
+        .find(|(n, _)| *n == http::header::LOCATION)
+        .map(|(_, v)| v.to_str().unwrap().to_owned())
+        .expect("location header");
+    // The exact bytes survive: encoded "https://app.example.com" with no
+    // trailing %2F. The normalized (buggy) form would end in "...com%2F".
+    assert!(
+        loc.ends_with("post_logout_redirect_uri=https%3A%2F%2Fapp.example.com"),
+        "got: {loc}"
+    );
+    assert!(!loc.contains("app.example.com%2F"), "got: {loc}");
 }
 
 #[tokio::test]
@@ -1481,6 +1526,40 @@ async fn future_created_at_clears_session() {
     );
     let store = MockSessionStore::with_session(session);
     let e = engine(store).await;
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    let (reason, _) = expect_cleared(loaded);
+    assert_eq!(reason, TeardownReason::ClockSkew);
+    assert!(e.session_store.delete_called());
+}
+
+#[tokio::test]
+async fn skew_just_under_limit_is_tolerated() {
+    // created_at 55s in the future — just inside MAX_CLOCK_SKEW (60s), so the
+    // session is served, not torn down. Together with
+    // `skew_just_over_limit_clears_session` this brackets the threshold to a
+    // few seconds, where `small_future_skew_is_tolerated` (10s) only proves
+    // it is somewhere above 10s.
+    let session = session_with(
+        SystemTime::now() + Duration::from_hours(1),
+        None,
+        SystemTime::now() + Duration::from_secs(55),
+    );
+    let e = engine(MockSessionStore::with_session(session)).await;
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    expect_active(loaded);
+    assert!(!e.session_store.delete_called());
+}
+
+#[tokio::test]
+async fn skew_just_over_limit_clears_session() {
+    // created_at 70s in the future — just past MAX_CLOCK_SKEW (60s), so the
+    // session is treated as clock-skew corrupted and cleared.
+    let session = session_with(
+        SystemTime::now() + Duration::from_hours(1),
+        None,
+        SystemTime::now() + Duration::from_secs(70),
+    );
+    let e = engine(MockSessionStore::with_session(session)).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let (reason, _) = expect_cleared(loaded);
     assert_eq!(reason, TeardownReason::ClockSkew);

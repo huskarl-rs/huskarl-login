@@ -17,13 +17,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     completed_login::CompletedLogin,
+    config::RoutePath,
     cookie::{
-        CookieSealer, DEFAULT_COOKIE_MAX_AGE, decode_payload, encode_payload, get_kid_cookie,
-        kid_cookie_name, unseal_with_kid_fallback,
+        CookieName, CookieSealer, DEFAULT_COOKIE_MAX_AGE, decode_payload, encode_payload,
+        get_kid_cookie, kid_cookie_name, unseal_with_kid_fallback,
     },
     enrich::{NoEnrichment, SessionEnricher},
     metrics::{DecryptResult, SessionCookieMetrics},
-    session::{SessionDriver, SessionError, to_session_err},
+    session::{SessionDriver, SessionError, SessionErrorKind},
     session_state::{Session, SessionState},
 };
 
@@ -202,8 +203,13 @@ impl<C> CookieSessionStore<C> {
         #[builder(finish_fn)] enricher: Box<dyn SessionEnricher<SessionState, C>>,
         #[builder(with = |cipher: impl AeadCipher + 'static| Arc::new(cipher) as Arc<dyn AeadCipher>)]
         cipher: Arc<dyn AeadCipher>,
-        #[builder(into)] cookie_name: String,
-        #[builder(into)] cookie_path: String,
+        /// Base name for the session cookie. A [`CookieName`], so its
+        /// `[A-Za-z0-9_-]` invariant is established at construction — e.g.
+        /// `"session".parse()?` or `CookieName::new("session")?`.
+        cookie_name: CookieName,
+        /// Cookie `Path` scope. A [`RoutePath`] (starts with `/`; no `;`, `?`,
+        /// `#`, or control chars) — e.g. `"/".parse()?` or `RoutePath::new("/")?`.
+        cookie_path: RoutePath,
         /// Defaults to 400 days — finite but generous enough that the cookie
         /// never expires before the server-side session does. If `max_lifetime`
         /// is configured in `LoginConfig`, pass it here so the browser discards
@@ -370,13 +376,14 @@ impl<C: CookiePayload> CookieSessionStore<C> {
         session: &C,
         request_headers: &http::HeaderMap,
     ) -> Result<Vec<HeaderValue>, SessionError> {
-        let payload = encode_payload(session)?;
+        let payload =
+            encode_payload(session).map_err(|e| SessionError::new(SessionErrorKind::Store, e))?;
         let bundle = self
             .sealer
             .cipher
             .seal(&payload, b"session")
             .await
-            .map_err(to_session_err)?;
+            .map_err(|e| SessionError::new(SessionErrorKind::Crypto, e))?;
         // Read the active key's identity from the same cipher that just sealed
         // the bundle. The cipher is fixed at construction so this is stable;
         // if huskarl-login ever switches to a multi-key sealer that picks
@@ -408,7 +415,7 @@ impl<C: CookiePayload> CookieSessionStore<C> {
         attrs: &str,
     ) -> Result<HeaderValue, SessionError> {
         HeaderValue::from_str(&format!("{}.{i}={chunk}; {attrs}", self.sealer.cookie_name))
-            .map_err(to_session_err)
+            .map_err(|e| SessionError::new(SessionErrorKind::Store, e))
     }
 
     /// Appends `Max-Age=0` clears for every chunk slot the browser sent that
@@ -554,7 +561,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        cookie::encode_kid,
+        config::InvalidRoutePath,
+        cookie::{InvalidCookieName, encode_kid},
         session_state::SessionState,
         test_support::{aes_key_with_kid, test_cipher, test_cipher_with_kid},
     };
@@ -572,9 +580,27 @@ mod tests {
     async fn test_store() -> CookieSessionStore<CookieSession> {
         CookieSessionStore::builder()
             .cipher(test_cipher().await)
-            .cookie_name("huskarl_session")
-            .cookie_path("/")
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build()
+    }
+
+    #[test]
+    fn cookie_path_rejects_unsafe_path() {
+        // The cookie_path lands in a Set-Cookie `Path` attribute, so a `;`
+        // (or control char) must be rejected when the `RoutePath` is built —
+        // the builder only accepts an already-validated `RoutePath`.
+        let result = "/bad;inject".parse::<RoutePath>();
+        assert!(matches!(result, Err(InvalidRoutePath { .. })));
+    }
+
+    #[test]
+    fn cookie_name_rejects_unsafe_name() {
+        // The cookie name is interpolated into `Set-Cookie` as `{name}=...`, so
+        // a `;` (or any non-token char) must be rejected when the `CookieName`
+        // is built — the builder only accepts an already-validated `CookieName`.
+        let result = "bad;name".parse::<CookieName>();
+        assert!(matches!(result, Err(InvalidCookieName { .. })));
     }
 
     /// Builds a `Cookie:` header from the `Set-Cookie` values a save produced,
@@ -682,8 +708,8 @@ mod tests {
     async fn save_emits_kid_set_when_cipher_has_identity() {
         let store = CookieSessionStore::<CookieSession>::builder()
             .cipher(test_cipher_with_kid("arn:aws:kms:us-east-1:111:key/abc").await)
-            .cookie_name("huskarl_session")
-            .cookie_path("/")
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build();
         let session = CookieSession(test_state());
         let cookies = store
@@ -702,8 +728,8 @@ mod tests {
     async fn save_then_load_roundtrips_with_kid_sidecar() {
         let store = CookieSessionStore::<CookieSession>::builder()
             .cipher(test_cipher_with_kid("test-kid").await)
-            .cookie_name("huskarl_session")
-            .cookie_path("/")
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build();
         let session = CookieSession(test_state());
         let set_cookies = store
@@ -730,8 +756,8 @@ mod tests {
         // the AEAD bundle authenticates regardless of the hint.
         let store = CookieSessionStore::<CookieSession>::builder()
             .cipher(test_cipher_with_kid("test-kid").await)
-            .cookie_name("huskarl_session")
-            .cookie_path("/")
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build();
         let session = CookieSession(test_state());
         let set_cookies = store
@@ -777,8 +803,8 @@ mod tests {
     async fn multi_key_store() -> CookieSessionStore<CookieSession> {
         CookieSessionStore::builder()
             .cipher(multi_key_cipher().await)
-            .cookie_name("huskarl_session")
-            .cookie_path("/")
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build()
     }
 
@@ -1024,8 +1050,8 @@ mod tests {
         // not compile — the enricher must be supplied at the finisher.
         let store = CookieSessionStore::<EnrichedSession>::builder()
             .cipher(test_cipher().await)
-            .cookie_name("huskarl_session")
-            .cookie_path("/")
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build_with_enricher(TestEnricher);
         assert_session_driver(&store);
 
@@ -1058,8 +1084,8 @@ mod tests {
         use huskarl::core::crypto::cipher::AeadEncryptor as _;
         let store = CookieSessionStore::<CookieSession>::builder()
             .cipher(test_cipher_with_kid("v5").await)
-            .cookie_name("huskarl_session")
-            .cookie_path("/")
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build();
         let cipher = SessionDriver::session_aead_cipher(&store);
         assert_eq!(cipher.key_id().as_deref(), Some("v5"));
@@ -1091,15 +1117,17 @@ mod tests {
         // so this is the only no-I/O way to populate `email`.
         let store = CookieSessionStore::<EnrichedSession>::builder()
             .cipher(test_cipher().await)
-            .cookie_name("huskarl_session")
-            .cookie_path("/")
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build_with_claims(|state, completed| {
                 Ok(EnrichedSession {
                     state,
                     email: completed
                         .id_token_claims()
                         .and_then(|c| c.profile.email.clone())
-                        .ok_or("missing email claim")?,
+                        .ok_or_else(|| {
+                            SessionError::new(SessionErrorKind::Store, "missing email claim")
+                        })?,
                 })
             });
         assert_session_driver(&store);
@@ -1127,9 +1155,14 @@ mod tests {
         // the error just like a failed async enricher.
         let store = CookieSessionStore::<EnrichedSession>::builder()
             .cipher(test_cipher().await)
-            .cookie_name("huskarl_session")
-            .cookie_path("/")
-            .build_with_claims(|_state, _completed| Err("enrichment boom".into()));
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .build_with_claims(|_state, _completed| {
+                Err(SessionError::new(
+                    SessionErrorKind::Store,
+                    "enrichment boom",
+                ))
+            });
         // The session types here aren't `Debug`, so assert on the `Err` arm
         // directly rather than via `expect_err`.
         let result = store
@@ -1140,7 +1173,10 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(&result, Err(e) if e.to_string().contains("enrichment boom")),
+            matches!(&result, Err(e)
+                if e.kind() == SessionErrorKind::Store
+                    && std::error::Error::source(e)
+                        .is_some_and(|s| s.to_string().contains("enrichment boom"))),
             "enricher error must propagate",
         );
     }
@@ -1355,8 +1391,8 @@ mod tests {
         let m = Arc::new(RecordingMetrics::default());
         let s = CookieSessionStore::builder()
             .cipher(test_cipher().await)
-            .cookie_name("huskarl_session")
-            .cookie_path("/")
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
         (s, m)
@@ -1377,8 +1413,8 @@ mod tests {
         let m = Arc::new(RecordingMetrics::default());
         let store = CookieSessionStore::<CookieSession>::builder()
             .cipher(test_cipher_with_kid("v5").await)
-            .cookie_name("huskarl_session")
-            .cookie_path("/")
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
         store
@@ -1439,8 +1475,8 @@ mod tests {
         let m = Arc::new(RecordingMetrics::default());
         let store = CookieSessionStore::<CookieSession>::builder()
             .cipher(test_cipher_with_kid("v5").await)
-            .cookie_name("huskarl_session")
-            .cookie_path("/")
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
         let set_cookies = store
@@ -1482,8 +1518,8 @@ mod tests {
         let m = Arc::new(RecordingMetrics::default());
         let store = CookieSessionStore::<CookieSession>::builder()
             .cipher(test_cipher_with_kid("v5").await)
-            .cookie_name("huskarl_session")
-            .cookie_path("/")
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
         let set_cookies = store
@@ -1501,8 +1537,8 @@ mod tests {
         let m = Arc::new(RecordingMetrics::default());
         let store = CookieSessionStore::<CookieSession>::builder()
             .cipher(test_cipher_with_kid("v5").await)
-            .cookie_name("huskarl_session")
-            .cookie_path("/")
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
         let set_cookies = store

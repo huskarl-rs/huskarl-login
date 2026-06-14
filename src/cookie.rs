@@ -22,10 +22,12 @@ use huskarl::core::crypto::{
     cipher::{AeadCipher, AeadEncryptor as _, AeadUnsealer, AeadV1Cipher, CipherMatch},
 };
 use serde::{Serialize, de::DeserializeOwned};
+use snafu::Snafu;
 
 use crate::{
+    config::RoutePath,
     metrics::{DecryptResult, SessionCookieMetrics},
-    session::{SessionError, to_session_err},
+    session::{SessionError, SessionErrorKind},
 };
 
 /// The bundle cipher used for every cookie this crate seals: the v1 bundle
@@ -128,11 +130,113 @@ pub(crate) fn login_state_cookie_name_prefix(secure: bool, path: &str, prefix: &
 /// who explicitly chose `__Host-`/`__Secure-` naming keep their exact name.
 /// Chunk (`{name}.N`) and kid sidecar (`{name}.kid`) cookies derive from the
 /// returned base name, so they inherit the prefix.
-pub(crate) fn session_cookie_name(name: String, secure: bool, path: &str) -> String {
+pub(crate) fn session_cookie_name(name: &str, secure: bool, path: &str) -> String {
     if secure && path == "/" && !name.starts_with("__Host-") && !name.starts_with("__Secure-") {
         format!("__Host-{name}")
     } else {
-        name
+        name.to_owned()
+    }
+}
+
+/// Error returned when a configured session cookie name is rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Snafu)]
+#[snafu(display("invalid cookie name {name:?}: {reason}"))]
+pub struct InvalidCookieName {
+    /// The offending name.
+    pub name: String,
+    /// Why the name was rejected.
+    pub reason: &'static str,
+}
+
+/// A validated session cookie base name: non-empty and restricted to
+/// `[A-Za-z0-9_-]`.
+///
+/// Carries the cookie-name-safety invariant in the type, so the sinks that
+/// interpolate it into `Set-Cookie` — the session cookie and its `{name}.N`
+/// chunk / `{name}.kid` sidecar derivatives — never re-check. Establishing the
+/// invariant once, at construction, means a new entry point that takes a
+/// `CookieName` inherits it for free rather than having to re-validate.
+///
+/// This is the cookie-name counterpart to
+/// [`RoutePath`] (the cookie-`Path` invariant).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CookieName(String);
+
+impl CookieName {
+    /// Validates `name` and wraps it.
+    ///
+    /// Restricts the name to `[A-Za-z0-9_-]`. That is a safe subset of the RFC
+    /// 6265 `cookie-name` token (it excludes every separator — `;`, `=`, space,
+    /// etc. — that would corrupt or inject into the `Set-Cookie` header), and
+    /// matches the rule on `login_cookie_prefix`. It also excludes `.`, which
+    /// the chunk (`{name}.N`) and kid-sidecar (`{name}.kid`) cookies use as a
+    /// namespace separator — so a base name can never collide with those.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidCookieName`] naming the offending value and why it was
+    /// rejected.
+    pub fn new(name: impl Into<String>) -> Result<Self, InvalidCookieName> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(InvalidCookieName {
+                name,
+                reason: "must not be empty",
+            });
+        }
+        if !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(InvalidCookieName {
+                name,
+                reason: "must contain only ASCII letters, digits, '_', or '-'",
+            });
+        }
+        Ok(Self(name))
+    }
+
+    /// The validated name as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CookieName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for CookieName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+// `TryFrom`, not `From`: validation is fallible. Mirrors [`CookieName::new`]
+// for `?`/`try_into()` callers.
+impl TryFrom<String> for CookieName {
+    type Error = InvalidCookieName;
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        Self::new(name)
+    }
+}
+
+impl TryFrom<&str> for CookieName {
+    type Error = InvalidCookieName;
+    fn try_from(name: &str) -> Result<Self, Self::Error> {
+        Self::new(name)
+    }
+}
+
+// Enables `"session".parse::<CookieName>()` and inference at call sites that
+// expect a `CookieName` (e.g. the `cookie_name` builder setters).
+impl std::str::FromStr for CookieName {
+    type Err = InvalidCookieName;
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::new(name)
     }
 }
 
@@ -166,13 +270,13 @@ pub(crate) struct CookieSealer {
     /// The configured cookie name, before any security prefix is applied.
     /// Retained so [`apply_secure`](Self::apply_secure) can recompute
     /// `cookie_name` once the engine supplies the deployment's `secure` flag.
-    raw_cookie_name: String,
+    raw_cookie_name: CookieName,
     /// The security-prefixed cookie name actually emitted on the wire.
     pub(crate) cookie_name: String,
     /// Whether the deployment is HTTPS (drives the `Secure` attribute and the
     /// `__Host-`/`__Secure-` name prefix).
     pub(crate) secure: bool,
-    cookie_path: String,
+    cookie_path: RoutePath,
     max_age: Duration,
     metrics: Option<Arc<dyn SessionCookieMetrics>>,
 }
@@ -184,14 +288,15 @@ impl CookieSealer {
     /// scheme; until then the safe choice (secure, `__Host-` prefix) is used.
     pub(crate) fn new(
         cipher: Arc<dyn AeadCipher>,
-        cookie_name: String,
-        cookie_path: String,
+        cookie_name: CookieName,
+        cookie_path: RoutePath,
         max_age: Duration,
         metrics: Option<Arc<dyn SessionCookieMetrics>>,
     ) -> Self {
         let secure = true;
         let raw_cookie_name = cookie_name;
-        let cookie_name = session_cookie_name(raw_cookie_name.clone(), secure, &cookie_path);
+        let cookie_name =
+            session_cookie_name(raw_cookie_name.as_str(), secure, cookie_path.as_str());
         Self {
             aead: cipher.clone(),
             cipher: AeadV1Cipher::new(cipher),
@@ -213,14 +318,17 @@ impl CookieSealer {
     /// Re-derives `cookie_name` for the deployment's real `secure` flag.
     pub(crate) fn apply_secure(&mut self, secure: bool) {
         self.secure = secure;
-        self.cookie_name =
-            session_cookie_name(self.raw_cookie_name.clone(), secure, &self.cookie_path);
+        self.cookie_name = session_cookie_name(
+            self.raw_cookie_name.as_str(),
+            secure,
+            self.cookie_path.as_str(),
+        );
     }
 
     /// Cookie attributes without `Max-Age` — used for clears (which append
     /// their own `Max-Age=0`).
     pub(crate) fn base_cookie_attrs(&self) -> String {
-        cookie_attrs(self.secure, &self.cookie_path)
+        cookie_attrs(self.secure, self.cookie_path.as_str())
     }
 
     /// Full cookie attributes including this store's configured `Max-Age`.
@@ -243,7 +351,7 @@ impl CookieSealer {
             Some(k) => format!("{name}={}; {}", encode_kid(k), self.cookie_attrs()),
             None => format!("{name}=; {}; Max-Age=0", self.base_cookie_attrs()),
         };
-        HeaderValue::from_str(&value).map_err(to_session_err)
+        HeaderValue::from_str(&value).map_err(|e| SessionError::new(SessionErrorKind::Store, e))
     }
 
     /// Records an encrypt event (active key id) if metrics are configured.
@@ -505,29 +613,55 @@ mod tests {
 
     #[test]
     fn session_cookie_name_prefixes_secure_root() {
-        assert_eq!(session_cookie_name("sess".into(), true, "/"), "__Host-sess");
+        assert_eq!(session_cookie_name("sess", true, "/"), "__Host-sess");
     }
 
     #[test]
     fn session_cookie_name_skips_insecure() {
-        assert_eq!(session_cookie_name("sess".into(), false, "/"), "sess");
+        assert_eq!(session_cookie_name("sess", false, "/"), "sess");
     }
 
     #[test]
     fn session_cookie_name_skips_subpath() {
-        assert_eq!(session_cookie_name("sess".into(), true, "/app"), "sess");
+        assert_eq!(session_cookie_name("sess", true, "/app"), "sess");
     }
 
     #[test]
     fn session_cookie_name_keeps_existing_prefix() {
+        assert_eq!(session_cookie_name("__Host-sess", true, "/"), "__Host-sess");
         assert_eq!(
-            session_cookie_name("__Host-sess".into(), true, "/"),
-            "__Host-sess"
-        );
-        assert_eq!(
-            session_cookie_name("__Secure-sess".into(), true, "/"),
+            session_cookie_name("__Secure-sess", true, "/"),
             "__Secure-sess"
         );
+    }
+
+    // -- CookieName tests --
+
+    #[test]
+    fn cookie_name_new_accepts_and_rejects() {
+        assert_eq!(
+            CookieName::new("huskarl_session").unwrap().as_str(),
+            "huskarl_session"
+        );
+        assert_eq!(
+            CookieName::new("__Host-sess").unwrap().as_str(),
+            "__Host-sess"
+        );
+        assert_eq!(CookieName::new("").unwrap_err().reason, "must not be empty");
+        // Separators that would corrupt/inject into Set-Cookie.
+        assert!(CookieName::new("bad;name").is_err());
+        assert!(CookieName::new("a=b").is_err());
+        assert!(CookieName::new("has space").is_err());
+        // `.` is reserved for the chunk/kid sidecar namespace.
+        assert!(CookieName::new("base.kid").is_err());
+    }
+
+    #[test]
+    fn cookie_name_try_from() {
+        assert!(CookieName::try_from("ok_name").is_ok());
+        assert!(CookieName::try_from("bad;x".to_owned()).is_err());
+        let n: CookieName = "scoped".try_into().unwrap();
+        assert_eq!(n.as_str(), "scoped");
     }
 
     // -- kid sidecar tests --

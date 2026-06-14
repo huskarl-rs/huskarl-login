@@ -39,8 +39,8 @@ where
         let cookie_name = login_state_cookie_name(
             &state,
             self.config.secure,
-            &self.config.browser_callback_path,
-            &self.config.login_cookie_prefix,
+            self.config.browser_callback_path.as_str(),
+            self.config.login_cookie_prefix.as_str(),
         );
         let Some(cookie_encoded) = get_cookie(headers, &cookie_name).map(str::to_owned) else {
             // No cookie to clear — either none was set, or the browser sent a
@@ -91,7 +91,7 @@ where
         {
             Ok(c) => c,
             Err(e) => {
-                log::error!("failed to create session: {}", error_chain(&*e));
+                log::error!("failed to create session: {}", error_chain(&e));
                 self.record_login_complete(&LoginCompleteResult::SessionCreateFailed, None);
                 return self.callback_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -186,7 +186,10 @@ where
     /// Returns `None` only if the name produces an invalid header value, which
     /// shouldn't happen for cookies we generated.
     pub(super) fn clear_login_state_cookie(&self, cookie_name: &str) -> Option<HeaderValue> {
-        let attrs = cookie_attrs(self.config.secure, &self.config.browser_callback_path);
+        let attrs = cookie_attrs(
+            self.config.secure,
+            self.config.browser_callback_path.as_str(),
+        );
         HeaderValue::from_str(&format!("{cookie_name}=; {attrs}; Max-Age=0")).ok()
     }
 

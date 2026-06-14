@@ -10,7 +10,7 @@ use huskarl::core::{
     platform::MaybeSendBoxFuture,
     secrets::{Secret, SecretBytes, SecretOutput},
 };
-use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
+use huskarl_crypto_native::aead::AesGcmKey;
 
 /// A [`Secret`] yielding fixed bytes and no key identity.
 #[derive(Clone)]
@@ -30,13 +30,9 @@ impl Secret for TestSecret {
 /// A 256-bit AES-GCM cipher over all-zero key bytes, reporting **no** key
 /// identity (the cipher's `key_id()` is `None`, so no kid sidecar is emitted).
 pub(crate) async fn test_cipher() -> AesGcmKey {
-    AesGcmKey::from_secret(
-        AesGcmKeyType::Aes256,
-        TestSecret(SecretBytes::new(vec![0u8; 32])),
-        |_| None,
-    )
-    .await
-    .unwrap()
+    AesGcmKey::from_secret(TestSecret(SecretBytes::new(vec![0u8; 32])), |_| None)
+        .await
+        .unwrap()
 }
 
 /// Like [`test_cipher`] but reports a fixed key identity `kid`, exercising the
@@ -51,11 +47,9 @@ pub(crate) async fn test_cipher_with_kid(kid: &str) -> AesGcmKey {
 /// set and once as the encryptor) — the shape multi-key rotation tests need.
 pub(crate) async fn aes_key_with_kid(kid: &str, byte: u8) -> AesGcmKey {
     let kid_owned = kid.to_owned();
-    AesGcmKey::from_secret(
-        AesGcmKeyType::Aes256,
-        TestSecret(SecretBytes::new(vec![byte; 32])),
-        move |_| Some(kid_owned.clone()),
-    )
+    AesGcmKey::from_secret(TestSecret(SecretBytes::new(vec![byte; 32])), move |_| {
+        Some(kid_owned.clone())
+    })
     .await
     .unwrap()
 }

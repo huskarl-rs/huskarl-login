@@ -18,6 +18,8 @@ use crate::engine::TeardownReason;
 /// Passed to [`SessionCookieMetrics::record_decrypt`] to indicate why
 /// decryption succeeded or failed. [`as_str`](Self::as_str) returns a
 /// `&'static str` suitable for use as a Prometheus label value.
+#[derive(strum::AsRefStr, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
 pub enum DecryptResult {
     /// The cookie was successfully decrypted and deserialized.
@@ -34,12 +36,7 @@ impl DecryptResult {
     /// Returns a `&'static str` suitable for use as a Prometheus label value.
     #[must_use]
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::BadEncoding => "bad_encoding",
-            Self::DecryptFailed => "decrypt_failed",
-            Self::PayloadInvalid => "payload_invalid",
-        }
+        self.into()
     }
 }
 
@@ -77,6 +74,8 @@ pub trait SessionCookieMetrics: MaybeSendSync + 'static {
 /// Outcome of a login redirect attempt.
 ///
 /// Passed to [`LoginEngineMetrics::record_login_start`].
+#[derive(strum::AsRefStr, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
 pub enum LoginStartResult {
     /// The redirect to the authorization server was produced successfully.
@@ -89,16 +88,15 @@ impl LoginStartResult {
     /// Returns a `&'static str` suitable for use as a Prometheus label value.
     #[must_use]
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Error => "error",
-        }
+        self.into()
     }
 }
 
 /// Outcome of processing an OAuth callback (token exchange and session creation).
 ///
 /// Passed to [`LoginEngineMetrics::record_login_complete`].
+#[derive(strum::AsRefStr, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
 pub enum LoginCompleteResult {
     /// Login completed successfully — a new session was created.
@@ -119,14 +117,7 @@ impl LoginCompleteResult {
     /// Returns a `&'static str` suitable for use as a Prometheus label value.
     #[must_use]
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::AsDenied => "as_denied",
-            Self::InvalidRequest => "invalid_request",
-            Self::StateInvalid => "state_invalid",
-            Self::TokenExchangeFailed => "token_exchange_failed",
-            Self::SessionCreateFailed => "session_create_failed",
-        }
+        self.into()
     }
 }
 
@@ -173,6 +164,8 @@ pub fn normalize_as_error(error: &str) -> &'static str {
 /// Outcome of a token refresh attempt.
 ///
 /// Passed to [`LoginEngineMetrics::record_refresh`].
+#[derive(strum::AsRefStr, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
 pub enum RefreshResult {
     /// The session had no refresh token — it was cleared.
@@ -193,12 +186,7 @@ impl RefreshResult {
     /// Returns a `&'static str` suitable for use as a Prometheus label value.
     #[must_use]
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::NoRefreshToken => "no_refresh_token",
-            Self::Ok => "ok",
-            Self::Failed => "failed",
-            Self::FailedRetained => "failed_retained",
-        }
+        self.into()
     }
 }
 

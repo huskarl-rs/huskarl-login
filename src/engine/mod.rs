@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     DefaultErrorPage, ErrorPage, LivenessVerdict, LoginConfig, Session, SessionDriver,
-    SessionError,
+    SessionError, SessionErrorKind,
     cookie::SessionCipher,
     metrics::{LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult},
 };
@@ -220,11 +220,33 @@ impl<S> LoadedSession<S> {
     }
 }
 
+// Manual `Debug` so the impl holds without `S: Debug` and never prints the
+// session payload (which can carry tokens/PII) — only the variant and its
+// non-secret metadata.
+impl<S> std::fmt::Debug for LoadedSession<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => f.write_str("Missing"),
+            Self::Cleared { reason, clears } => f
+                .debug_struct("Cleared")
+                .field("reason", reason)
+                .field("clears", &clears.len())
+                .finish(),
+            Self::Active { set_cookies, .. } => f
+                .debug_struct("Active")
+                .field("set_cookies", &set_cookies.len())
+                .finish_non_exhaustive(),
+            Self::ActivePending { .. } => f.debug_struct("ActivePending").finish_non_exhaustive(),
+        }
+    }
+}
+
 /// Why [`LoginEngine::load_session`] tore down a presented session.
 ///
 /// Carried on [`LoadedSession::Cleared`] and reported to
 /// [`LoginEngineMetrics::record_teardown`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::AsRefStr, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
 pub enum TeardownReason {
     /// [`LoginConfig::max_lifetime`](crate::LoginConfig::max_lifetime) exceeded.
@@ -249,14 +271,7 @@ impl TeardownReason {
     /// Returns a `&'static str` suitable for use as a Prometheus label value.
     #[must_use]
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::MaxLifetime => "max_lifetime",
-            Self::IdleTimeout => "idle_timeout",
-            Self::ClockSkew => "clock_skew",
-            Self::RefreshRejected => "refresh_rejected",
-            Self::RefreshUnavailable => "refresh_unavailable",
-            Self::NoRefreshToken => "no_refresh_token",
-        }
+        self.into()
     }
 }
 
@@ -276,23 +291,39 @@ pub trait PersistFailurePolicy: MaybeSendSync + 'static {
     /// Decide what to do after a [`LoadedSession::ActivePending`] save failed.
     ///
     /// Returning `Some(response)` replaces the inner handler's response; `None`
-    /// lets it pass through unchanged. `error` is the underlying store error.
-    fn handle(&self, error: &dyn std::error::Error) -> Option<LoginResponse>;
+    /// lets it pass through unchanged. `error` is the underlying store error;
+    /// downcast it to [`SessionError`] to branch on
+    /// [`kind`](SessionError::kind).
+    fn handle(&self, error: &(dyn std::error::Error + 'static)) -> Option<LoginResponse>;
 }
 
-/// Default policy: fail closed (503) when the refreshed-session save fails.
+/// Default policy: fail closed when the refreshed-session save fails.
 ///
 /// `ActivePending` only arises when the engine refreshed the access token but
 /// the eager persist inside [`LoginEngine::load_session`] failed; if the
 /// handler response is allowed through without persisting the new tokens the
 /// client is stranded on stale state — and with refresh-token rotation, often
-/// locked out entirely. A 503 forces a clean retry.
+/// locked out entirely. Replacing the response forces a clean retry.
+///
+/// The replacement status is derived from the error's [`SessionErrorKind`] when
+/// the error is a [`SessionError`]: a [`Conflict`](SessionErrorKind::Conflict)
+/// becomes `409`, a genuine [`Crypto`](SessionErrorKind::Crypto) or
+/// [`Store`](SessionErrorKind::Store) fault becomes `500`, and everything else
+/// (transient [`Unavailable`](SessionErrorKind::Unavailable), `Gone`, or a
+/// non-`SessionError` cause) falls back to `503`.
 pub struct DefaultPersistFailurePolicy;
 
 impl PersistFailurePolicy for DefaultPersistFailurePolicy {
-    fn handle(&self, _error: &dyn std::error::Error) -> Option<LoginResponse> {
+    fn handle(&self, error: &(dyn std::error::Error + 'static)) -> Option<LoginResponse> {
+        let status = match error.downcast_ref::<SessionError>().map(SessionError::kind) {
+            Some(SessionErrorKind::Conflict) => StatusCode::CONFLICT,
+            Some(SessionErrorKind::Crypto | SessionErrorKind::Store) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            _ => StatusCode::SERVICE_UNAVAILABLE,
+        };
         Some(LoginResponse::Rendered {
-            status: StatusCode::SERVICE_UNAVAILABLE,
+            status,
             headers: Vec::new(),
             body: Bytes::new(),
         })
@@ -415,14 +446,14 @@ where
         uri: &Uri,
     ) -> Option<LoginResponse> {
         let path = uri.path();
-        if path == self.config.callback_path {
+        if self.config.callback_path == path {
             if *method != Method::GET {
                 return Some(self.method_not_allowed("GET"));
             }
             return Some(self.handle_callback(uri, headers).await);
         }
         if let Some(logout) = &self.config.logout
-            && path == logout.path
+            && logout.path == path
         {
             if *method != Method::POST {
                 return Some(self.method_not_allowed("POST"));
@@ -518,7 +549,12 @@ where
         &self,
         headers: &HeaderMap,
     ) -> Result<LoadedSession<SD::SessionType>, SessionError> {
-        let Some(session) = self.session_store.load(headers).await? else {
+        let Some(session) = self
+            .session_store
+            .load(headers)
+            .await
+            .map_err(crate::session::to_session_err)?
+        else {
             return Ok(LoadedSession::Missing);
         };
 
@@ -584,7 +620,7 @@ where
             Err(e) => {
                 log::error!(
                     "failed to redirect to authorization server: {}",
-                    error_chain(&*e)
+                    error_chain(&e)
                 );
                 self.record_login_start(&LoginStartResult::Error);
                 self.build_error_response(
@@ -660,7 +696,7 @@ where
                         log::warn!(
                             "failed to eagerly persist refreshed session; deferring to \
                              post-response persist: {}",
-                            error_chain(&*e)
+                            error_chain(&e)
                         );
                         LoadedSession::ActivePending { session }
                     }
@@ -707,7 +743,7 @@ where
         match self.session_store.delete(session, headers).await {
             Ok(c) => c,
             Err(e) => {
-                log::error!("failed to delete session: {}", error_chain(&*e));
+                log::error!("failed to delete session: {}", error_chain(&e));
                 vec![]
             }
         }
@@ -912,6 +948,8 @@ static SEC_FETCH_DEST: LazyLock<HeaderName> =
     LazyLock::new(|| HeaderName::from_static("sec-fetch-dest"));
 static SEC_FETCH_SITE: LazyLock<HeaderName> =
     LazyLock::new(|| HeaderName::from_static("sec-fetch-site"));
+static SEC_FETCH_USER: LazyLock<HeaderName> =
+    LazyLock::new(|| HeaderName::from_static("sec-fetch-user"));
 static X_REQUESTED_WITH: LazyLock<HeaderName> =
     LazyLock::new(|| HeaderName::from_static("x-requested-with"));
 
@@ -934,7 +972,11 @@ pub fn is_cors_preflight(method: &Method, headers: &HeaderMap) -> bool {
 ///    is a top-level navigation.
 /// 3. `Sec-Fetch-Dest` — backup if `Sec-Fetch-Mode` is stripped by an
 ///    intermediary; only `document` is a page load.
-/// 4. `Accept` header — fallback for older clients; the presence of
+/// 4. `Sec-Fetch-User` — affirmative signal sent only on user-activated
+///    top-level navigations (always `?1`); a precise last-ditch rescue for a
+///    navigation whose `Sec-Fetch-Mode`/`Sec-Fetch-Dest` were stripped, before
+///    falling through to the weaker `Accept` heuristic.
+/// 5. `Accept` header — fallback for older clients; the presence of
 ///    `text/html` or `application/xhtml+xml` usually means a page load.
 pub fn is_navigation_request(headers: &HeaderMap) -> bool {
     // Classic XHR signal — never a top-level navigation.
@@ -951,6 +993,17 @@ pub fn is_navigation_request(headers: &HeaderMap) -> bool {
     }
     if let Some(dest) = headers.get(&*SEC_FETCH_DEST) {
         return dest.as_bytes() == b"document";
+    }
+
+    // Affirmative navigation signal: only sent on user-activated top-level
+    // navigations, always `?1`. Reached only when `Sec-Fetch-Mode`/`-Dest`
+    // were stripped, so its presence rescues such a navigation more precisely
+    // than the `Accept` heuristic below.
+    if headers
+        .get(&*SEC_FETCH_USER)
+        .is_some_and(|v| v.as_bytes() == b"?1")
+    {
+        return true;
     }
 
     // Fallback for older clients.

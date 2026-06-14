@@ -16,17 +16,19 @@ use huskarl::core::{
     platform::{MaybeSend, MaybeSendSync, SystemTime},
 };
 use serde::{Deserialize, Serialize};
+use snafu::Snafu;
 use uuid::Uuid;
 
 use crate::{
+    config::RoutePath,
     cookie::{
-        CookieSealer, DEFAULT_COOKIE_MAX_AGE, get_cookie, get_kid_cookie, kid_cookie_name,
-        unseal_with_kid_fallback,
+        CookieName, CookieSealer, DEFAULT_COOKIE_MAX_AGE, get_cookie, get_kid_cookie,
+        kid_cookie_name, unseal_with_kid_fallback,
     },
     enrich::{NoEnrichment, SessionEnricher},
     liveness::{LivenessConfig, LivenessStore, LivenessVerdict},
     metrics::{DecryptResult, SessionCookieMetrics},
-    session::{SessionDriver, SessionError, to_session_err},
+    session::{SessionDriver, SessionError, SessionErrorKind, to_session_err},
     session_state::{Session, SessionState},
 };
 
@@ -53,7 +55,19 @@ pub trait ExternalSessionStore: MaybeSendSync {
     /// future framework-managed fields).
     type SessionType: Session + PersistedSession + MaybeSendSync + 'static;
 
-    /// The error type returned by store operations.
+    /// The error type returned by store operations — your backend's own error
+    /// (e.g. `sqlx::Error`, `redis::RedisError`); the framework never asks you
+    /// to construct one of its types.
+    ///
+    /// This is the **transport/backend-failure channel only**. The two outcomes
+    /// the framework acts on are expressed *structurally*, not as errors, so do
+    /// not encode them here: a missing session is [`load`](Self::load) returning
+    /// `Ok(None)`, and a lost compare-and-swap is
+    /// [`compare_and_swap`](Self::compare_and_swap) returning
+    /// [`SaveOutcome::Conflict`]. An `Err` therefore means "I could not reach or
+    /// use the backend" — the framework boxes it into a
+    /// [`SessionErrorKind::Unavailable`](crate::SessionErrorKind::Unavailable)
+    /// (retryable; adapters surface `503`), which assumes a retry is plausible.
     type Error: std::error::Error + MaybeSendSync + 'static;
 
     /// Persist a newly created session.
@@ -141,30 +155,16 @@ pub enum SaveOutcome {
 
 /// [`StoreBackedSessionStore::update`] found no session for the key — it was
 /// deleted or expired before the update could run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
+#[snafu(display("session not found"))]
 pub struct SessionNotFound;
-
-impl std::fmt::Display for SessionNotFound {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("session not found")
-    }
-}
-
-impl std::error::Error for SessionNotFound {}
 
 /// [`StoreBackedSessionStore::update`] exhausted its retry budget — the session
 /// was concurrently rewritten on every attempt. The caller can retry the whole
 /// operation or surface a conflict (e.g. HTTP 409) to the client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
+#[snafu(display("session update conflict: the session was modified concurrently"))]
 pub struct VersionConflict;
-
-impl std::fmt::Display for VersionConflict {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("session update conflict: the session was modified concurrently")
-    }
-}
-
-impl std::error::Error for VersionConflict {}
 
 /// Framework-managed session state carried by every store-backed session.
 ///
@@ -315,8 +315,13 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         external: E,
         #[builder(with = |cipher: impl AeadCipher + 'static| Arc::new(cipher) as Arc<dyn AeadCipher>)]
         cipher: Arc<dyn AeadCipher>,
-        #[builder(into)] cookie_name: String,
-        #[builder(into)] cookie_path: String,
+        /// Base name for the session cookie. A [`CookieName`], so its
+        /// `[A-Za-z0-9_-]` invariant is established at construction — e.g.
+        /// `"session".parse()?` or `CookieName::new("session")?`.
+        cookie_name: CookieName,
+        /// Cookie `Path` scope. A [`RoutePath`] (starts with `/`; no `;`, `?`,
+        /// `#`, or control chars) — e.g. `"/".parse()?` or `RoutePath::new("/")?`.
+        cookie_path: RoutePath,
         /// Defaults to 400 days. If `max_lifetime` is configured in `LoginConfig`,
         /// pass it here so the browser discards the cookie when the session can
         /// no longer be valid.
@@ -435,10 +440,12 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     ///
     /// # Errors
     ///
-    /// - [`SessionNotFound`] if the key has no session (deleted/expired).
-    /// - [`VersionConflict`] if the retry budget is exhausted under sustained
-    ///   contention.
-    /// - the store's error (boxed into [`SessionError`]) on a transport failure.
+    /// - [`SessionErrorKind::Gone`] (sourced by [`SessionNotFound`]) if the key
+    ///   has no session (deleted/expired).
+    /// - [`SessionErrorKind::Conflict`] (sourced by [`VersionConflict`]) if the
+    ///   retry budget is exhausted under sustained contention.
+    /// - [`SessionErrorKind::Unavailable`] wrapping the store's own error on a
+    ///   transport failure.
     pub async fn update<F>(
         &self,
         session_key: Uuid,
@@ -454,7 +461,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
                 .await
                 .map_err(to_session_err)?
             else {
-                return Err(Box::new(SessionNotFound));
+                return Err(SessionError::new(SessionErrorKind::Gone, SessionNotFound));
             };
             let expected = session.persisted().version;
             mutate(&mut session);
@@ -472,7 +479,10 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
                 SaveOutcome::Conflict => {}
             }
         }
-        Err(Box::new(VersionConflict))
+        Err(SessionError::new(
+            SessionErrorKind::Conflict,
+            VersionConflict,
+        ))
     }
 
     /// Encrypt the pointer cookie and emit it alongside the kid sidecar.
@@ -839,8 +849,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session))
             .cipher(test_cipher().await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build_with_enricher(MinimalEnricher);
         assert_session_driver(&store);
     }
@@ -892,8 +902,8 @@ mod tests {
         StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session))
             .cipher(test_cipher().await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build()
             .with_liveness(liveness, config)
     }
@@ -904,8 +914,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session.clone()))
             .cipher(test_cipher().await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build();
 
         let verdict = store
@@ -998,7 +1008,12 @@ mod tests {
             &self,
             _key: Uuid,
         ) -> MaybeSendBoxFuture<'_, Result<Option<SystemTime>, SessionError>> {
-            Box::pin(async { Err("liveness backend down".into()) })
+            Box::pin(async {
+                Err(SessionError::new(
+                    SessionErrorKind::Unavailable,
+                    "liveness backend down",
+                ))
+            })
         }
         fn touch(
             &self,
@@ -1006,10 +1021,20 @@ mod tests {
             _now: SystemTime,
             _expire_at: Option<SystemTime>,
         ) -> MaybeSendBoxFuture<'_, Result<(), SessionError>> {
-            Box::pin(async { Err("liveness backend down".into()) })
+            Box::pin(async {
+                Err(SessionError::new(
+                    SessionErrorKind::Unavailable,
+                    "liveness backend down",
+                ))
+            })
         }
         fn clear(&self, _key: Uuid) -> MaybeSendBoxFuture<'_, Result<(), SessionError>> {
-            Box::pin(async { Err("liveness backend down".into()) })
+            Box::pin(async {
+                Err(SessionError::new(
+                    SessionErrorKind::Unavailable,
+                    "liveness backend down",
+                ))
+            })
         }
     }
 
@@ -1019,8 +1044,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session.clone()))
             .cipher(test_cipher().await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build()
             // A short idle timeout that *would* expire if the read succeeded.
             .with_liveness(
@@ -1133,8 +1158,8 @@ mod tests {
         StoreBackedSessionStore::builder()
             .external(external)
             .cipher(test_cipher().await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build()
     }
 
@@ -1193,7 +1218,7 @@ mod tests {
         let conflicted = result
             .as_ref()
             .err()
-            .is_some_and(|e| e.downcast_ref::<VersionConflict>().is_some());
+            .is_some_and(|e| e.kind() == SessionErrorKind::Conflict);
         assert!(
             conflicted,
             "expected VersionConflict under sustained conflict"
@@ -1213,7 +1238,7 @@ mod tests {
         let not_found = result
             .as_ref()
             .err()
-            .is_some_and(|e| e.downcast_ref::<SessionNotFound>().is_some());
+            .is_some_and(|e| e.kind() == SessionErrorKind::Gone);
         assert!(not_found, "expected SessionNotFound for a missing key");
     }
 
@@ -1224,8 +1249,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session.clone()))
             .cipher(test_cipher().await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build();
 
         // Seal a pointer cookie, then read it back through the request-side path.
@@ -1269,8 +1294,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session.clone()))
             .cipher(test_cipher_with_kid("kid-7").await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build();
 
         let headers_out = store
@@ -1304,8 +1329,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session))
             .cipher(cipher)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build();
 
         let headers_out = store.pointer_cookie_headers(original_key).await.unwrap();
@@ -1423,15 +1448,17 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(EnrichedExternalStore(inserted.clone()))
             .cipher(test_cipher().await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build_with_claims(|seed, completed| {
                 Ok(EnrichedStoreSession {
                     persisted: seed,
                     email: completed
                         .id_token_claims()
                         .and_then(|c| c.profile.email.clone())
-                        .ok_or("missing email claim")?,
+                        .ok_or_else(|| {
+                            SessionError::new(SessionErrorKind::Store, "missing email claim")
+                        })?,
                 })
             });
 
@@ -1459,9 +1486,14 @@ mod tests {
                 std::sync::Mutex::new(None),
             )))
             .cipher(test_cipher().await)
-            .cookie_name("session")
-            .cookie_path("/")
-            .build_with_claims(|_seed, _completed| Err("enrichment boom".into()));
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .build_with_claims(|_seed, _completed| {
+                Err(SessionError::new(
+                    SessionErrorKind::Store,
+                    "enrichment boom",
+                ))
+            });
         // The session types here aren't `Debug`, so assert on the `Err` arm
         // directly rather than via `expect_err`.
         let result = store
@@ -1471,7 +1503,10 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(&result, Err(e) if e.to_string().contains("enrichment boom")),
+            matches!(&result, Err(e)
+                if e.kind() == SessionErrorKind::Store
+                    && std::error::Error::source(e)
+                        .is_some_and(|s| s.to_string().contains("enrichment boom"))),
             "enricher error must propagate",
         );
     }
@@ -1486,8 +1521,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session))
             .cipher(test_cipher_with_kid("v5").await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build();
         let cipher = SessionDriver::session_aead_cipher(&store);
         assert_eq!(cipher.key_id().as_deref(), Some("v5"));
@@ -1499,8 +1534,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session.clone()))
             .cipher(test_cipher().await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build();
 
         let clears = store.delete_session(&session).await.unwrap();
@@ -1561,8 +1596,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(external)
             .cipher(test_cipher().await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
         store
@@ -1579,8 +1614,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(external)
             .cipher(test_cipher_with_kid("v5").await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
         store
@@ -1597,8 +1632,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(external)
             .cipher(test_cipher().await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
         store.read_pointer_cookie(&http::HeaderMap::new()).await;
@@ -1612,8 +1647,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(external)
             .cipher(test_cipher().await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
         let mut headers = http::HeaderMap::new();
@@ -1632,8 +1667,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(external)
             .cipher(test_cipher().await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
         let mut headers = http::HeaderMap::new();
@@ -1652,8 +1687,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(external)
             .cipher(test_cipher().await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
         // Seal 17 bytes under session_ptr AAD — AEAD passes but the UUID
@@ -1679,8 +1714,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(external)
             .cipher(test_cipher_with_kid("v5").await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
         let headers_out = store
@@ -1717,8 +1752,8 @@ mod tests {
         let store = StoreBackedSessionStore::builder()
             .external(external)
             .cipher(test_cipher_with_kid("v5").await)
-            .cookie_name("session")
-            .cookie_path("/")
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
             .build();
         let headers_out = store
