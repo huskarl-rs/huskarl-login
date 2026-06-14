@@ -172,12 +172,13 @@ impl From<SessionState> for CookieSession {
 /// browser; it cannot revoke a copy of the sealed cookie an attacker already
 /// captured (via XSS, a shared machine, or malware). Such a copy stays valid
 /// until its own timestamps age out — i.e. until
-/// [`max_lifetime`](crate::LoginConfig::max_lifetime) or
-/// [`idle_timeout`](crate::LoginConfig::idle_timeout) elapses, or the access
+/// [`max_lifetime`](crate::LoginConfig::max_lifetime) elapses, or the access
 /// token expires with no usable refresh token. There is no way to cut it short
-/// server-side, because the server holds no state for it.
+/// server-side, because the server holds no state for it. Cookie sessions have
+/// no idle timeout: idle enforcement is server-side only (see
+/// [`crate::liveness`]), and a stateless cookie has nothing to expire.
 ///
-/// Mitigate by keeping `max_lifetime` and `idle_timeout` tight — the realistic
+/// Mitigate by keeping `max_lifetime` tight — the realistic
 /// blast radius of a stolen cookie is that window. If you need server-side
 /// revocation — immediate logout-everywhere, back-channel logout, admin
 /// session kill — use
@@ -519,7 +520,8 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
 
     fn apply_cookie_secure(&mut self, secure: bool) {
         self.secure = secure;
-        self.cookie_name = session_cookie_name(self.raw_cookie_name.clone(), secure, &self.cookie_path);
+        self.cookie_name =
+            session_cookie_name(self.raw_cookie_name.clone(), secure, &self.cookie_path);
     }
 
     fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
@@ -550,22 +552,10 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
         self.save_session(session, headers).await
     }
 
-    /// Re-emits the chunked session cookies so that the updated `last_active`
-    /// timestamp reaches the browser. Cookie sessions have no server-side TTL,
-    /// so a touch is implemented as a full re-save.
-    ///
-    /// This means every `Touch` pays the cost of an AEAD seal + emitting the
-    /// session-cookie chunks on the response. Pair with a non-zero
-    /// [`touch_min_interval`](crate::LoginConfig::touch_min_interval) (e.g. a
-    /// fraction of [`idle_timeout`](crate::LoginConfig::idle_timeout)) so this
-    /// only fires periodically instead of on every authenticated request.
-    async fn touch(
-        &self,
-        session: &C,
-        headers: &http::HeaderMap,
-    ) -> Result<Vec<HeaderValue>, SessionError> {
-        self.save_session(session, headers).await
-    }
+    // Cookie sessions have no server-side liveness — they use the default
+    // `check_liveness` (`Untracked`) and `commit_touch` (no-op) from
+    // `SessionDriver`, so idle timeout is not enforced and activity is not
+    // recorded. Absolute `max_lifetime` (from `created_at`) still applies.
 
     // Clearing chunk cookies is pure header construction with no I/O; the
     // `async` is only here to satisfy the `SessionDriver` trait signature.
@@ -657,7 +647,6 @@ mod tests {
         SessionState::builder()
             .token_expiry(now + Duration::from_hours(1))
             .created_at(now)
-            .last_active(now)
             .build()
     }
 
@@ -709,7 +698,9 @@ mod tests {
     fn request_with_chunk_slots(n: usize) -> HeaderMap {
         let mut headers = HeaderMap::new();
         if n > 0 {
-            let pairs: Vec<String> = (0..n).map(|i| format!("__Host-huskarl_session.{i}=x")).collect();
+            let pairs: Vec<String> = (0..n)
+                .map(|i| format!("__Host-huskarl_session.{i}=x"))
+                .collect();
             headers.insert(http::header::COOKIE, pairs.join("; ").parse().unwrap());
         }
         headers
@@ -727,7 +718,10 @@ mod tests {
             .unwrap();
 
         let chunk0 = cookies[0].to_str().unwrap();
-        assert!(chunk0.starts_with("__Host-huskarl_session.0="), "got: {chunk0}");
+        assert!(
+            chunk0.starts_with("__Host-huskarl_session.0="),
+            "got: {chunk0}"
+        );
         let value = chunk0.split('=').nth(1).unwrap().split(';').next().unwrap();
         // URL-safe base64 has no ':' — chunk 0 is now raw payload, no prefix.
         assert!(
@@ -1015,7 +1009,8 @@ mod tests {
         for stale in 1..5 {
             let cleared = cookies.iter().any(|c| {
                 let s = c.to_str().unwrap();
-                s.starts_with(&format!("__Host-huskarl_session.{stale}=;")) && s.contains("Max-Age=0")
+                s.starts_with(&format!("__Host-huskarl_session.{stale}=;"))
+                    && s.contains("Max-Age=0")
             });
             assert!(cleared, "expected clear for stale slot .{stale}");
         }
@@ -1086,10 +1081,6 @@ mod tests {
         assert_eq!(
             secs(loaded.state().created_at),
             secs(original_state.created_at)
-        );
-        assert_eq!(
-            secs(loaded.state().last_active),
-            secs(original_state.last_active)
         );
     }
 
@@ -1371,7 +1362,10 @@ mod tests {
     #[tokio::test]
     async fn parse_chunk_pair_rejects_non_numeric_suffix() {
         let store = test_store().await;
-        assert_eq!(store.parse_chunk_pair("__Host-huskarl_session.abc=foo"), None);
+        assert_eq!(
+            store.parse_chunk_pair("__Host-huskarl_session.abc=foo"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1515,7 +1509,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::COOKIE,
-            "__Host-huskarl_session.0=not!!valid!!base64".parse().unwrap(),
+            "__Host-huskarl_session.0=not!!valid!!base64"
+                .parse()
+                .unwrap(),
         );
         store.load_session(&headers).await;
         assert_eq!(m.decrypts(), vec![(None, "bad_encoding")]);
@@ -1577,7 +1573,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::COOKIE,
-            format!("__Host-huskarl_session.0={encoded}").parse().unwrap(),
+            format!("__Host-huskarl_session.0={encoded}")
+                .parse()
+                .unwrap(),
         );
         store.load_session(&headers).await;
         assert_eq!(m.decrypts(), vec![(None, "payload_invalid")]);

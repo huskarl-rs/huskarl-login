@@ -31,14 +31,13 @@ use huskarl::{
 use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
 
 use super::{
-    LoadedSession, LoginEngine, SessionPersistence, TeardownReason, error_chain, is_cors_preflight,
+    LoadedSession, LoginEngine, TeardownReason, error_chain, is_cors_preflight,
     is_cross_site_request, is_navigation_request,
 };
 use crate::{
-    CompletedLogin, LoginConfig, LogoutConfig, Session, SessionDriver, SessionError, SessionState,
-    metrics::{
-        ActivityOutcome, LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult,
-    },
+    ActivityPolicy, CompletedLogin, LivenessVerdict, LoginConfig, LogoutConfig, Session,
+    SessionDriver, SessionError, SessionState,
+    metrics::{LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult},
     session::sealed::Sealed,
 };
 
@@ -201,14 +200,12 @@ fn session_with(
     token_expiry: SystemTime,
     refresh_token: Option<RefreshToken>,
     created_at: SystemTime,
-    last_active: SystemTime,
 ) -> MockSession {
     MockSession {
         state: crate::SessionState::builder()
             .token_expiry(token_expiry)
             .maybe_refresh_token(refresh_token)
             .created_at(created_at)
-            .last_active(last_active)
             .build(),
     }
 }
@@ -217,7 +214,6 @@ fn valid_session() -> MockSession {
     session_with(
         SystemTime::now() + Duration::from_hours(1),
         None,
-        SystemTime::now(),
         SystemTime::now(),
     )
 }
@@ -245,13 +241,10 @@ fn expect_active(loaded: LoadedSession<MockSession>) -> (MockSession, Vec<Header
     }
 }
 
-/// Unwraps [`LoadedSession::ActivePending`] into the session and owed persistence.
-fn expect_pending(loaded: LoadedSession<MockSession>) -> (MockSession, SessionPersistence) {
+/// Unwraps [`LoadedSession::ActivePending`] into the session.
+fn expect_pending(loaded: LoadedSession<MockSession>) -> MockSession {
     match loaded {
-        LoadedSession::ActivePending {
-            session,
-            persistence,
-        } => (session, persistence),
+        LoadedSession::ActivePending { session } => session,
         other => unreachable!("expected ActivePending, got {}", variant_name(&other)),
     }
 }
@@ -314,9 +307,17 @@ impl AeadDecryptor for NoopCipher {
 struct MockSessionStore {
     session: Mutex<Option<MockSession>>,
     save_called: Mutex<bool>,
-    touch_called: Mutex<bool>,
     delete_called: Mutex<bool>,
     fail_save: bool,
+    /// Liveness verdict returned by [`SessionDriver::check_liveness`], so a
+    /// test can drive the engine's verdict-mapping without re-implementing the
+    /// idle/throttle logic (which is tested elsewhere).
+    verdict: LivenessVerdict,
+    /// Records the `record_activity` flag the engine passes to
+    /// [`SessionDriver::check_liveness`], so a test can assert the
+    /// [`ActivityPolicy`](crate::ActivityPolicy) classification reaches the
+    /// store.
+    last_record_activity: Mutex<Option<bool>>,
     /// Records the value the engine stamps via
     /// [`SessionDriver::apply_cookie_secure`], so a test can assert the
     /// deployment cookie-security policy reaches the store.
@@ -332,9 +333,10 @@ impl MockSessionStore {
         Self {
             session: Mutex::new(Some(s)),
             save_called: Mutex::new(false),
-            touch_called: Mutex::new(false),
             delete_called: Mutex::new(false),
             fail_save: false,
+            verdict: LivenessVerdict::Untracked,
+            last_record_activity: Mutex::new(None),
             applied_secure: Mutex::new(None),
         }
     }
@@ -344,21 +346,30 @@ impl MockSessionStore {
             ..Self::with_session(s)
         }
     }
+    /// [`with_session`](Self::with_session) plus a fixed liveness verdict.
+    fn with_session_and_verdict(s: MockSession, v: LivenessVerdict) -> Self {
+        Self::with_session(s).with_verdict(v)
+    }
+    fn with_verdict(mut self, v: LivenessVerdict) -> Self {
+        self.verdict = v;
+        self
+    }
     fn empty() -> Self {
         Self {
             session: Mutex::new(None),
             save_called: Mutex::new(false),
-            touch_called: Mutex::new(false),
             delete_called: Mutex::new(false),
             fail_save: false,
+            verdict: LivenessVerdict::Untracked,
+            last_record_activity: Mutex::new(None),
             applied_secure: Mutex::new(None),
         }
     }
+    fn last_record_activity(&self) -> Option<bool> {
+        *self.last_record_activity.lock().unwrap()
+    }
     fn save_called(&self) -> bool {
         *self.save_called.lock().unwrap()
-    }
-    fn touch_called(&self) -> bool {
-        *self.touch_called.lock().unwrap()
     }
     fn delete_called(&self) -> bool {
         *self.delete_called.lock().unwrap()
@@ -408,13 +419,15 @@ impl SessionDriver for MockSessionStore {
         *self.save_called.lock().unwrap() = true;
         Ok(vec![HeaderValue::from_static(MOCK_SAVE_COOKIE)])
     }
-    async fn touch(
+    async fn check_liveness(
         &self,
         _: &MockSession,
-        _: &HeaderMap,
-    ) -> Result<Vec<HeaderValue>, SessionError> {
-        *self.touch_called.lock().unwrap() = true;
-        Ok(vec![])
+        _: SystemTime,
+        record_activity: bool,
+        _: Option<SystemTime>,
+    ) -> Result<LivenessVerdict, SessionError> {
+        *self.last_record_activity.lock().unwrap() = Some(record_activity);
+        Ok(self.verdict)
     }
     async fn delete(
         &self,
@@ -475,13 +488,6 @@ impl SessionDriver for ErrorSessionStore {
         Err(StoreLoadError)
     }
     async fn save(&self, _: &MockSession, _: &HeaderMap) -> Result<Vec<HeaderValue>, SessionError> {
-        unimplemented!()
-    }
-    async fn touch(
-        &self,
-        _: &MockSession,
-        _: &HeaderMap,
-    ) -> Result<Vec<HeaderValue>, SessionError> {
         unimplemented!()
     }
     async fn delete(
@@ -922,9 +928,9 @@ async fn load_session_empty_store_returns_missing() {
 }
 
 #[tokio::test]
-async fn load_session_valid_returns_active_when_recently_active() {
-    // last_active is "now" — well within the default 1h touch_min_interval,
-    // so nothing is owed post-response.
+async fn untracked_verdict_yields_active() {
+    // The default driver verdict is `Untracked` (no liveness tracking), so the
+    // engine returns `Active` with nothing owed post-response.
     let e = engine(MockSessionStore::with_session(valid_session())).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let (_session, set_cookies) = expect_active(loaded);
@@ -932,74 +938,16 @@ async fn load_session_valid_returns_active_when_recently_active() {
 }
 
 #[tokio::test]
-async fn load_session_valid_returns_touch_when_interval_elapsed() {
-    // last_active is 2h ago — past the default 1h touch_min_interval.
-    let session = session_with(
-        SystemTime::now() + Duration::from_hours(1),
-        None,
-        SystemTime::now() - Duration::from_hours(2),
-        SystemTime::now() - Duration::from_hours(2),
-    );
-    let e = engine(MockSessionStore::with_session(session)).await;
-    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (_session, persistence) = expect_pending(loaded);
-    assert!(matches!(persistence, SessionPersistence::Touch));
-}
-
-#[tokio::test]
-async fn touch_min_interval_skips_recent_activity() {
-    // last_active is "now" — well within a 60s touch_min_interval.
-    let config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
-        .scopes(vec![])
-        .base_url("https://app.example.com".parse().unwrap())
-        .touch_min_interval(Duration::from_mins(1))
-        .build()
-        .unwrap();
-    let e = engine_with_config(MockSessionStore::with_session(valid_session()), config).await;
-    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    assert!(matches!(loaded, LoadedSession::Active { .. }));
-}
-
-#[tokio::test]
-async fn touch_min_interval_touches_after_interval_elapsed() {
-    // last_active is 120s ago — exceeds a 60s touch_min_interval.
-    let session = session_with(
-        SystemTime::now() + Duration::from_hours(1),
-        None,
-        SystemTime::now() - Duration::from_mins(2),
-        SystemTime::now() - Duration::from_mins(2),
-    );
-    let config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
-        .scopes(vec![])
-        .base_url("https://app.example.com".parse().unwrap())
-        .touch_min_interval(Duration::from_mins(1))
-        .build()
-        .unwrap();
-    let e = engine_with_config(MockSessionStore::with_session(session), config).await;
-    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (_, persistence) = expect_pending(loaded);
-    assert!(matches!(persistence, SessionPersistence::Touch));
-}
-
-#[tokio::test]
-async fn active_session_owes_no_persistence() {
-    // A throttled activity update surfaces as `Active` — there is no persist
-    // call for the adapter to make, and the store saw no write during load.
-    let config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
-        .scopes(vec![])
-        .base_url("https://app.example.com".parse().unwrap())
-        .touch_min_interval(Duration::from_mins(1))
-        .build()
-        .unwrap();
-    let e = engine_with_config(MockSessionStore::with_session(valid_session()), config).await;
+async fn active_verdict_yields_active() {
+    // The driver reports the session is active (a throttled touch), so the
+    // engine returns `Active` and the store sees no write during load.
+    let store =
+        MockSessionStore::with_session_and_verdict(valid_session(), LivenessVerdict::Active);
+    let e = engine(store).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let (_session, set_cookies) = expect_active(loaded);
     assert!(set_cookies.is_empty());
     assert!(!e.session_store.save_called());
-    assert!(!e.session_store.touch_called());
 }
 
 #[tokio::test]
@@ -1101,7 +1049,6 @@ async fn max_lifetime_expired_clears_session() {
         SystemTime::now() + Duration::from_hours(1),
         None,
         SystemTime::now() - Duration::from_secs(7201),
-        SystemTime::now(),
     );
     let config = LoginConfig::builder()
         .callback_path("/callback".to_owned())
@@ -1119,21 +1066,11 @@ async fn max_lifetime_expired_clears_session() {
 
 #[tokio::test]
 async fn idle_timeout_expired_clears_session() {
-    let session = session_with(
-        SystemTime::now() + Duration::from_hours(1),
-        None,
-        SystemTime::now(),
-        SystemTime::now() - Duration::from_secs(1801),
-    );
-    let config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
-        .scopes(vec![])
-        .base_url("https://app.example.com".parse().unwrap())
-        .idle_timeout(Duration::from_mins(15))
-        .build()
-        .unwrap();
-    let store = MockSessionStore::with_session(session);
-    let e = engine_with_config(store, config).await;
+    // The driver's liveness check returns `Expired`; the engine tears the
+    // session down with an `IdleTimeout` reason.
+    let store =
+        MockSessionStore::with_session_and_verdict(valid_session(), LivenessVerdict::Expired);
+    let e = engine(store).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let (reason, _) = expect_cleared(loaded);
     assert_eq!(reason, TeardownReason::IdleTimeout);
@@ -1141,11 +1078,69 @@ async fn idle_timeout_expired_clears_session() {
 }
 
 #[tokio::test]
+async fn activity_policy_first_party_excludes_cross_site_fetch() {
+    // Default config is `ActivityPolicy::FirstParty`. A cross-site, non-navigation
+    // request must reach the store as a non-activity check.
+    let store =
+        MockSessionStore::with_session_and_verdict(valid_session(), LivenessVerdict::Active);
+    let e = engine(store).await;
+    let h = headers(&[("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "cors")]);
+    let _ = e.load_session(&h).await.unwrap();
+    assert_eq!(e.session_store.last_record_activity(), Some(false));
+}
+
+#[tokio::test]
+async fn activity_policy_first_party_counts_cross_site_navigation() {
+    // A genuine inbound link click is cross-site *and* a navigation — it counts.
+    let store =
+        MockSessionStore::with_session_and_verdict(valid_session(), LivenessVerdict::Active);
+    let e = engine(store).await;
+    let h = headers(&[
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-mode", "navigate"),
+    ]);
+    let _ = e.load_session(&h).await.unwrap();
+    assert_eq!(e.session_store.last_record_activity(), Some(true));
+}
+
+#[tokio::test]
+async fn activity_policy_first_party_counts_same_origin_fetch() {
+    let store =
+        MockSessionStore::with_session_and_verdict(valid_session(), LivenessVerdict::Active);
+    let e = engine(store).await;
+    let h = headers(&[
+        ("sec-fetch-site", "same-origin"),
+        ("sec-fetch-mode", "cors"),
+    ]);
+    let _ = e.load_session(&h).await.unwrap();
+    assert_eq!(e.session_store.last_record_activity(), Some(true));
+}
+
+#[tokio::test]
+async fn activity_policy_navigations_only_excludes_same_origin_fetch() {
+    let config = LoginConfig::builder()
+        .callback_path("/callback".to_owned())
+        .scopes(vec![])
+        .base_url("https://app.example.com".parse().unwrap())
+        .activity_policy(ActivityPolicy::NavigationsOnly)
+        .build()
+        .unwrap();
+    let store =
+        MockSessionStore::with_session_and_verdict(valid_session(), LivenessVerdict::Active);
+    let e = engine_with_config(store, config).await;
+    let h = headers(&[
+        ("sec-fetch-site", "same-origin"),
+        ("sec-fetch-mode", "cors"),
+    ]);
+    let _ = e.load_session(&h).await.unwrap();
+    assert_eq!(e.session_store.last_record_activity(), Some(false));
+}
+
+#[tokio::test]
 async fn token_expired_no_refresh_token_clears_session() {
     let session = session_with(
         SystemTime::now() - Duration::from_mins(1),
         None,
-        SystemTime::now(),
         SystemTime::now(),
     );
     let store = MockSessionStore::with_session(session);
@@ -1162,7 +1157,6 @@ async fn token_expired_refresh_fails_clears_session() {
     let session = session_with(
         SystemTime::now() - Duration::from_mins(1),
         Some(RefreshToken::new(SecretString::new("test_refresh"), None)),
-        SystemTime::now(),
         SystemTime::now(),
     );
     let store = MockSessionStore::with_session(session);
@@ -1186,7 +1180,6 @@ fn refreshable_session(token_expiry: SystemTime) -> MockSession {
     session_with(
         token_expiry,
         Some(RefreshToken::new(SecretString::new("test_refresh"), None)),
-        SystemTime::now(),
         SystemTime::now(),
     )
 }
@@ -1263,8 +1256,7 @@ async fn refresh_success_with_failing_save_defers_persistence() {
         .cipher(test_cipher().await)
         .build();
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (session, persistence) = expect_pending(loaded);
-    assert_eq!(persistence, SessionPersistence::Save);
+    let session = expect_pending(loaded);
     // The refresh itself was applied — only persistence is outstanding.
     assert!(session.token_expiry() > SystemTime::now() + Duration::from_mins(30));
 }
@@ -1278,8 +1270,8 @@ async fn transient_refresh_failure_with_valid_token_retains_session() {
     let session = refreshable_session(SystemTime::now() + Duration::from_secs(15));
     let (e, calls) = engine_with_failing_refresh(true, session).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    // last_active is fresh, so the throttled activity update owes nothing —
-    // the retained session comes back `Active`.
+    // The default driver verdict is `Untracked`, so the retained session comes
+    // back `Active` with nothing owed.
     let (_session, set_cookies) = expect_active(loaded);
     assert!(set_cookies.is_empty());
     assert!(!e.session_store.delete_called());
@@ -1331,23 +1323,8 @@ async fn persist_save_calls_store_save() {
     let e = engine(MockSessionStore::with_session(valid_session())).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let (session, _) = expect_active(loaded);
-    e.persist_session(&session, SessionPersistence::Save, &api_headers())
-        .await
-        .unwrap();
+    e.persist_session(&session, &api_headers()).await.unwrap();
     assert!(e.session_store.save_called());
-    assert!(!e.session_store.touch_called());
-}
-
-#[tokio::test]
-async fn persist_touch_calls_store_touch() {
-    let e = engine(MockSessionStore::with_session(valid_session())).await;
-    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (session, _) = expect_active(loaded);
-    e.persist_session(&session, SessionPersistence::Touch, &api_headers())
-        .await
-        .unwrap();
-    assert!(e.session_store.touch_called());
-    assert!(!e.session_store.save_called());
 }
 
 // ── Callback handler ──────────────────────────────────────────────────────
@@ -1602,7 +1579,9 @@ async fn logout_rejects_cross_site_request_without_deleting_session() {
         .expect("logout handled");
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
     assert!(
-        !r.headers().iter().any(|(n, _)| *n == http::header::LOCATION),
+        !r.headers()
+            .iter()
+            .any(|(n, _)| *n == http::header::LOCATION),
         "cross-site logout must not redirect"
     );
     assert!(!e.session_store.delete_called());
@@ -1629,11 +1608,10 @@ async fn logout_allows_same_origin_request() {
 
 #[tokio::test]
 async fn small_future_skew_is_tolerated() {
-    // last_active 10s in the future — within MAX_CLOCK_SKEW.
+    // created_at 10s in the future — within MAX_CLOCK_SKEW.
     let session = session_with(
         SystemTime::now() + Duration::from_hours(1),
         None,
-        SystemTime::now(),
         SystemTime::now() + Duration::from_secs(10),
     );
     let e = engine(MockSessionStore::with_session(session)).await;
@@ -1648,24 +1626,6 @@ async fn future_created_at_clears_session() {
     let session = session_with(
         SystemTime::now() + Duration::from_hours(1),
         None,
-        SystemTime::now() + Duration::from_hours(1),
-        SystemTime::now(),
-    );
-    let store = MockSessionStore::with_session(session);
-    let e = engine(store).await;
-    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (reason, _) = expect_cleared(loaded);
-    assert_eq!(reason, TeardownReason::ClockSkew);
-    assert!(e.session_store.delete_called());
-}
-
-#[tokio::test]
-async fn future_last_active_clears_session() {
-    // last_active 1 hour in the future — well past MAX_CLOCK_SKEW.
-    let session = session_with(
-        SystemTime::now() + Duration::from_hours(1),
-        None,
-        SystemTime::now(),
         SystemTime::now() + Duration::from_hours(1),
     );
     let store = MockSessionStore::with_session(session);
@@ -1689,9 +1649,6 @@ enum MetricCall {
     },
     Refresh {
         result: &'static str,
-    },
-    Activity {
-        outcome: &'static str,
     },
     Teardown {
         reason: &'static str,
@@ -1727,11 +1684,6 @@ impl LoginEngineMetrics for TestEngineMetrics {
             .lock()
             .unwrap()
             .push(MetricCall::Refresh { result: r.as_str() });
-    }
-    fn record_activity(&self, o: &ActivityOutcome) {
-        self.calls.lock().unwrap().push(MetricCall::Activity {
-            outcome: o.as_str(),
-        });
     }
     fn record_teardown(&self, r: &TeardownReason) {
         self.calls
@@ -1935,7 +1887,6 @@ async fn metrics_refresh_no_refresh_token_when_none_available() {
         SystemTime::now() - Duration::from_mins(1),
         None,
         SystemTime::now(),
-        SystemTime::now(),
     );
     let (e, m) = engine_with_metrics(MockSessionStore::with_session(session)).await;
     let _ = e.load_session(&HeaderMap::new()).await.unwrap();
@@ -1959,7 +1910,6 @@ async fn metrics_refresh_failed_when_grant_refresh_fails() {
         SystemTime::now() - Duration::from_mins(1),
         Some(RefreshToken::new(SecretString::new("test_refresh"), None)),
         SystemTime::now(),
-        SystemTime::now(),
     );
     let (e, m) = engine_with_metrics(MockSessionStore::with_session(session)).await;
     let _ = e.load_session(&HeaderMap::new()).await.unwrap();
@@ -1980,23 +1930,12 @@ async fn metrics_refresh_failed_when_grant_refresh_fails() {
 #[tokio::test]
 async fn metrics_teardown_on_idle_timeout() {
     let m = Arc::new(TestEngineMetrics::default());
-    let session = session_with(
-        SystemTime::now() + Duration::from_hours(1),
-        None,
-        SystemTime::now(),
-        SystemTime::now() - Duration::from_secs(1801),
-    );
-    let config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
-        .scopes(vec![])
-        .base_url("https://app.example.com".parse().unwrap())
-        .idle_timeout(Duration::from_mins(15))
-        .build()
-        .unwrap();
+    let store =
+        MockSessionStore::with_session_and_verdict(valid_session(), LivenessVerdict::Expired);
     let e = LoginEngine::builder()
-        .config(config)
+        .config(default_config())
         .grant(test_grant(FailingHttp::new(false).0).await)
-        .session_store(MockSessionStore::with_session(session))
+        .session_store(store)
         .cipher(test_cipher().await)
         .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
         .build();
@@ -2016,21 +1955,22 @@ async fn metrics_refresh_failed_retained_on_transient_failure_with_valid_token()
     let e = LoginEngine::builder()
         .config(default_config())
         .grant(test_grant(FailingHttp::new(true).0).await)
-        .session_store(MockSessionStore::with_session(session))
+        .session_store(MockSessionStore::with_session_and_verdict(
+            session,
+            LivenessVerdict::Active,
+        ))
         .cipher(test_cipher().await)
         .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
         .build();
     let _ = e.load_session(&HeaderMap::new()).await.unwrap();
-    // The retained session goes through the normal activity path, so a
-    // (throttled) activity outcome follows the refresh outcome.
+    // The transient-retention path retains the session as-is without
+    // re-evaluating liveness, so only the refresh outcome is recorded — no
+    // activity metric, even though the driver would have reported `Active`.
     assert_eq!(
         m.calls(),
-        vec![
-            MetricCall::Refresh {
-                result: "failed_retained"
-            },
-            MetricCall::Activity { outcome: "skip" },
-        ]
+        vec![MetricCall::Refresh {
+            result: "failed_retained"
+        }]
     );
 }
 
@@ -2047,26 +1987,4 @@ async fn metrics_refresh_ok_on_successful_refresh() {
         .build();
     let _ = e.load_session(&HeaderMap::new()).await.unwrap();
     assert_eq!(m.calls(), vec![MetricCall::Refresh { result: "ok" }]);
-}
-
-// ── Activity metrics ──────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn metrics_activity_skip_when_recently_active() {
-    let (e, m) = engine_with_metrics(MockSessionStore::with_session(valid_session())).await;
-    let _ = e.load_session(&HeaderMap::new()).await.unwrap();
-    assert_eq!(m.calls(), vec![MetricCall::Activity { outcome: "skip" }]);
-}
-
-#[tokio::test]
-async fn metrics_activity_touch_when_interval_elapsed() {
-    let session = session_with(
-        SystemTime::now() + Duration::from_hours(1),
-        None,
-        SystemTime::now() - Duration::from_hours(2),
-        SystemTime::now() - Duration::from_hours(2),
-    );
-    let (e, m) = engine_with_metrics(MockSessionStore::with_session(session)).await;
-    let _ = e.load_session(&HeaderMap::new()).await.unwrap();
-    assert_eq!(m.calls(), vec![MetricCall::Activity { outcome: "touch" }]);
 }

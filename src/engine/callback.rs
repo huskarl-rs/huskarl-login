@@ -31,8 +31,7 @@ where
             }
             CallbackParse::Missing => {
                 self.record_login_complete(&LoginCompleteResult::InvalidRequest, None);
-                return self
-                    .build_error_response(StatusCode::BAD_REQUEST, "missing code or state");
+                return self.build_error_response(StatusCode::BAD_REQUEST, "missing code or state");
             }
         };
 
@@ -194,7 +193,12 @@ where
     /// Builds an error response for a failed callback and appends a
     /// `Set-Cookie` that clears the located login-state cookie, so a stale
     /// flow cannot be replayed.
-    fn callback_error(&self, status: StatusCode, message: &str, cookie_name: &str) -> LoginResponse {
+    fn callback_error(
+        &self,
+        status: StatusCode,
+        message: &str,
+        cookie_name: &str,
+    ) -> LoginResponse {
         let mut resp = self.build_error_response(status, message);
         if let Some(v) = self.clear_login_state_cookie(cookie_name) {
             resp.push_rendered_header(header::SET_COOKIE, v);

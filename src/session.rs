@@ -12,9 +12,12 @@
 use std::sync::Arc;
 
 use http::HeaderValue;
-use huskarl::core::{crypto::cipher::AeadCipher, platform::{MaybeSend, MaybeSendSync}};
+use huskarl::core::{
+    crypto::cipher::AeadCipher,
+    platform::{MaybeSend, MaybeSendSync, SystemTime},
+};
 
-use crate::{completed_login::CompletedLogin, session_state::Session};
+use crate::{completed_login::CompletedLogin, liveness::LivenessVerdict, session_state::Session};
 
 /// A boxed standard error type used by session store methods.
 ///
@@ -137,25 +140,39 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
         headers: &http::HeaderMap,
     ) -> impl Future<Output = Result<Vec<HeaderValue>, SessionError>> + MaybeSend;
 
-    /// Record a lightweight touch — persist the updated `last_active`
-    /// timestamp and (where applicable) extend the storage TTL, returning any
-    /// `Set-Cookie` header values.
+    /// Evaluate session liveness for this request, recording the activity as a
+    /// side effect when `record_activity` is set.
     ///
-    /// The engine throttles how often this is called via
-    /// [`LoginConfig::touch_min_interval`](crate::LoginConfig::touch_min_interval).
-    /// Implementations should still treat each call as potentially expensive
-    /// and avoid extra work when nothing changed.
+    /// Liveness is **server-side only**, so the default implementation returns
+    /// [`LivenessVerdict::Untracked`] — cookie sessions and store-backed
+    /// sessions without a [`LivenessStore`](crate::LivenessStore) neither
+    /// enforce an idle timeout nor record activity. `StoreBackedSessionStore`
+    /// overrides this when liveness is configured: it reads `last_active` and
+    /// returns the [`LivenessConfig`](crate::LivenessConfig) idle verdict
+    /// (always, so idle expiry is enforced on every request), and — only when
+    /// `record_activity` is `true` and the session is live — records activity
+    /// via the store's (throttled) `touch`, best-effort. It fails open: a read
+    /// error or missing entry yields [`LivenessVerdict::Active`], so a liveness
+    /// outage never tears sessions down. The engine acts only on
+    /// [`LivenessVerdict::Expired`].
     ///
-    /// `CookieSessionStore` implements this as a full re-save (so `last_active`
-    /// reaches the browser), since cookie sessions have no server-side TTL.
-    /// `StoreBackedSessionStore` extends the external record's TTL and returns
-    /// no cookies, since the pointer cookie's value is unchanged.
-    fn touch(
+    /// `record_activity` is the engine's per-request
+    /// [`ActivityPolicy`](crate::ActivityPolicy) classification — e.g. a
+    /// cross-site embed or background poll may be excluded so it doesn't keep an
+    /// abandoned session alive.
+    ///
+    /// `expire_at` is the session's absolute deadline (`created_at +
+    /// max_lifetime`, or `None` when unbounded), passed through to the liveness
+    /// store so its entry expires exactly when the session can no longer be
+    /// valid.
+    fn check_liveness(
         &self,
         _session: &Self::SessionType,
-        _headers: &http::HeaderMap,
-    ) -> impl Future<Output = Result<Vec<HeaderValue>, SessionError>> + MaybeSend {
-        async { Ok(vec![]) }
+        _now: SystemTime,
+        _record_activity: bool,
+        _expire_at: Option<SystemTime>,
+    ) -> impl Future<Output = Result<LivenessVerdict, SessionError>> + MaybeSend {
+        async { Ok(LivenessVerdict::Untracked) }
     }
 
     /// Delete a session, returning `Set-Cookie` header values that clear

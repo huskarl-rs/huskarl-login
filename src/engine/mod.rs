@@ -38,11 +38,10 @@ use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DefaultErrorPage, ErrorPage, LoginConfig, Session, SessionDriver, SessionError,
+    DefaultErrorPage, ErrorPage, LivenessVerdict, LoginConfig, Session, SessionDriver,
+    SessionError,
     cookie::SessionCipher,
-    metrics::{
-        ActivityOutcome, LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult,
-    },
+    metrics::{LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult},
 };
 
 mod callback;
@@ -199,17 +198,15 @@ pub enum LoadedSession<S> {
         /// caching* note.
         set_cookies: Vec<HeaderValue>,
     },
-    /// Authenticated, with persistence owed after the inner handler responds
-    /// — pass `persistence` to [`LoginEngine::persist_session`].
+    /// Authenticated, with a save owed after the inner handler responds —
+    /// call [`LoginEngine::persist_session`].
     ///
-    /// Never carries cookies: a pending save produces its cookies when it
-    /// runs.
+    /// Only arises when the eager persist of a refreshed session failed; the
+    /// post-response save (and its [`PersistFailurePolicy`]) is the retry.
+    /// Never carries cookies: the save produces its cookies when it runs.
     ActivePending {
         /// The loaded session.
         session: S,
-        /// The owed operation: an activity touch, or the retry of a failed
-        /// eager refresh persist.
-        persistence: SessionPersistence,
     },
 }
 
@@ -218,7 +215,7 @@ impl<S> LoadedSession<S> {
     pub fn session(&self) -> Option<&S> {
         match self {
             Self::Missing | Self::Cleared { .. } => None,
-            Self::Active { session, .. } | Self::ActivePending { session, .. } => Some(session),
+            Self::Active { session, .. } | Self::ActivePending { session } => Some(session),
         }
     }
 }
@@ -232,7 +229,9 @@ impl<S> LoadedSession<S> {
 pub enum TeardownReason {
     /// [`LoginConfig::max_lifetime`](crate::LoginConfig::max_lifetime) exceeded.
     MaxLifetime,
-    /// [`LoginConfig::idle_timeout`](crate::LoginConfig::idle_timeout) exceeded.
+    /// Idle timeout exceeded — the server-side liveness verdict was
+    /// [`crate::LivenessVerdict::Expired`]. See
+    /// [`LivenessConfig::idle_timeout`](crate::LivenessConfig::idle_timeout).
     IdleTimeout,
     /// Session timestamps too far in the future — corrupt or forged.
     ClockSkew,
@@ -261,25 +260,8 @@ impl TeardownReason {
     }
 }
 
-/// Persistence owed to the session store after the inner service responds.
-///
-/// The steady state owes nothing — that is [`LoadedSession::Active`] — so
-/// this only appears on [`LoadedSession::ActivePending`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionPersistence {
-    /// The session has unpersisted changes — call save.
-    ///
-    /// The engine persists refreshed sessions eagerly inside
-    /// [`LoginEngine::load_session`], so `Save` only appears when that
-    /// eager persist failed: the post-response persist call (and its
-    /// [`PersistFailurePolicy`]) serves as the retry.
-    Save,
-    /// Record activity — call touch.
-    Touch,
-}
-
-/// Decides how a framework adapter should react when persisting the session
-/// fails *after* the inner handler has already produced a response.
+/// Decides how a framework adapter should react when the post-response save of
+/// a refreshed session fails.
 ///
 /// Return `Some(LoginResponse)` to replace the handler's response, or `None`
 /// to let it pass through unchanged.
@@ -291,45 +273,29 @@ pub enum SessionPersistence {
 /// response will cause well-behaved clients to retry — design handlers
 /// accordingly.
 pub trait PersistFailurePolicy: MaybeSendSync + 'static {
-    /// Decide what to do after a persist failure.
+    /// Decide what to do after a [`LoadedSession::ActivePending`] save failed.
     ///
     /// Returning `Some(response)` replaces the inner handler's response; `None`
-    /// lets it pass through unchanged. `persistence` indicates which operation
-    /// failed (save/touch); `error` is the underlying store error.
-    fn handle(
-        &self,
-        persistence: SessionPersistence,
-        error: &dyn std::error::Error,
-    ) -> Option<LoginResponse>;
+    /// lets it pass through unchanged. `error` is the underlying store error.
+    fn handle(&self, error: &dyn std::error::Error) -> Option<LoginResponse>;
 }
 
-/// Default policy: fail closed on [`SessionPersistence::Save`] (token refresh)
-/// and fail open on [`SessionPersistence::Touch`].
+/// Default policy: fail closed (503) when the refreshed-session save fails.
 ///
-/// `Save` is the path where the engine refreshed the access token but the
-/// eager persist inside [`LoginEngine::load_session`] failed; if the handler
-/// response is allowed through without persisting the new tokens the client
-/// is stranded on stale state — and with refresh-token rotation, often
+/// `ActivePending` only arises when the engine refreshed the access token but
+/// the eager persist inside [`LoginEngine::load_session`] failed; if the
+/// handler response is allowed through without persisting the new tokens the
+/// client is stranded on stale state — and with refresh-token rotation, often
 /// locked out entirely. A 503 forces a clean retry.
-///
-/// `Touch` only updates the session's last-active timestamp. Losing one is
-/// cheap and not worth a 5xx over a transient store blip.
 pub struct DefaultPersistFailurePolicy;
 
 impl PersistFailurePolicy for DefaultPersistFailurePolicy {
-    fn handle(
-        &self,
-        persistence: SessionPersistence,
-        _error: &dyn std::error::Error,
-    ) -> Option<LoginResponse> {
-        match persistence {
-            SessionPersistence::Save => Some(LoginResponse::Rendered {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                headers: Vec::new(),
-                body: Bytes::new(),
-            }),
-            SessionPersistence::Touch => None,
-        }
+    fn handle(&self, _error: &dyn std::error::Error) -> Option<LoginResponse> {
+        Some(LoginResponse::Rendered {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            headers: Vec::new(),
+            body: Bytes::new(),
+        })
     }
 }
 
@@ -493,9 +459,8 @@ where
     /// the rotated token and lock the session out. The session is then
     /// returned as [`LoadedSession::Active`] with the re-sealed session
     /// cookies in its `set_cookies`. If the eager persist fails, the session
-    /// is returned as [`LoadedSession::ActivePending`] with
-    /// [`SessionPersistence::Save`] so the post-response persist (and its
-    /// [`PersistFailurePolicy`]) acts as the retry.
+    /// is returned as [`LoadedSession::ActivePending`] so the post-response
+    /// persist (and its [`PersistFailurePolicy`]) acts as the retry.
     ///
     /// # Concurrent refresh and refresh-token rotation
     ///
@@ -565,11 +530,40 @@ where
             return Ok(LoadedSession::Cleared { reason, clears });
         }
 
+        // Server-side liveness. `check_liveness` returns the idle verdict
+        // (always, so expiry is enforced) and, when this request counts as
+        // activity under the configured `ActivityPolicy`, records it as a side
+        // effect (throttled in the store). It is `Untracked` for cookie sessions
+        // and store-backed sessions without a liveness store, and fails open so
+        // an outage never expires a session. The engine acts only on `Expired`.
+        let record_activity = self.config.activity_policy.counts_as_activity(headers);
+        // Absolute deadline handed to the liveness store so its entry expires
+        // exactly when the session can no longer be valid (never on a sliding
+        // idle TTL, which would break fail-open).
+        let expire_at = self
+            .config
+            .max_lifetime
+            .map(|max| session.created_at() + max);
+        if self
+            .session_store
+            .check_liveness(&session, now, record_activity, expire_at)
+            .await?
+            == LivenessVerdict::Expired
+        {
+            let clears = self.delete_best_effort(&session, headers).await;
+            let reason = TeardownReason::IdleTimeout;
+            self.record_teardown(reason);
+            return Ok(LoadedSession::Cleared { reason, clears });
+        }
+
         if now + self.config.token_refresh_margin >= session.token_expiry() {
             return Ok(self.refresh_or_clear(session, headers).await);
         }
 
-        Ok(self.touch_or_skip(session, now))
+        Ok(LoadedSession::Active {
+            session,
+            set_cookies: vec![],
+        })
     }
 
     /// Produces a response that asks the client to authenticate.
@@ -602,16 +596,18 @@ where
     }
 
     /// Returns the reason the session should be torn down rather than served
-    /// — clock-skew corruption, absolute lifetime exceeded, or idle past
-    /// timeout — or `None` when the session is still good.
+    /// — clock-skew corruption or absolute lifetime exceeded — or `None` when
+    /// the session is still good by these absolute checks.
+    ///
+    /// Idle timeout is handled separately, server-side, via
+    /// [`SessionDriver::check_liveness`]; it is not enforced here because
+    /// `last_active` is no longer carried on the session.
     fn session_teardown_reason(
         &self,
         session: &SD::SessionType,
         now: SystemTime,
     ) -> Option<TeardownReason> {
-        if is_too_far_future(session.created_at(), now)
-            || is_too_far_future(session.last_active(), now)
-        {
+        if is_too_far_future(session.created_at(), now) {
             log::warn!("session timestamps are too far in the future — treating as expired");
             return Some(TeardownReason::ClockSkew);
         }
@@ -619,11 +615,6 @@ where
             && elapsed_since(session.created_at(), now) > max_lifetime
         {
             return Some(TeardownReason::MaxLifetime);
-        }
-        if let Some(idle_timeout) = self.config.idle_timeout
-            && elapsed_since(session.last_active(), now) > idle_timeout
-        {
-            return Some(TeardownReason::IdleTimeout);
         }
         None
     }
@@ -671,10 +662,7 @@ where
                              post-response persist: {}",
                             error_chain(&*e)
                         );
-                        LoadedSession::ActivePending {
-                            session,
-                            persistence: SessionPersistence::Save,
-                        }
+                        LoadedSession::ActivePending { session }
                     }
                 }
             }
@@ -687,7 +675,12 @@ where
                     error_chain(&e)
                 );
                 self.record_refresh(&RefreshResult::FailedRetained);
-                self.touch_or_skip(session, SystemTime::now())
+                // Rare transient path — retain as-is without an activity touch;
+                // the next request re-evaluates liveness.
+                LoadedSession::Active {
+                    session,
+                    set_cookies: vec![],
+                }
             }
             Err(e) => {
                 log::error!("token refresh failed: {}", error_chain(&e));
@@ -752,30 +745,6 @@ where
         }
     }
 
-    /// Records activity (subject to `touch_min_interval` throttling) and
-    /// wraps the session in the matching state: an elapsed interval owes the
-    /// store a touch, a throttled request owes nothing.
-    fn touch_or_skip(
-        &self,
-        mut session: SD::SessionType,
-        now: SystemTime,
-    ) -> LoadedSession<SD::SessionType> {
-        if elapsed_since(session.last_active(), now) >= self.config.touch_min_interval {
-            session.record_activity();
-            self.record_activity(&ActivityOutcome::Touch);
-            LoadedSession::ActivePending {
-                session,
-                persistence: SessionPersistence::Touch,
-            }
-        } else {
-            self.record_activity(&ActivityOutcome::Skip);
-            LoadedSession::Active {
-                session,
-                set_cookies: vec![],
-            }
-        }
-    }
-
     fn record_login_start(&self, result: &LoginStartResult) {
         if let Some(m) = &self.metrics {
             m.record_login_start(result);
@@ -794,19 +763,13 @@ where
         }
     }
 
-    fn record_activity(&self, outcome: &ActivityOutcome) {
-        if let Some(m) = &self.metrics {
-            m.record_activity(outcome);
-        }
-    }
-
     fn record_teardown(&self, reason: TeardownReason) {
         if let Some(m) = &self.metrics {
             m.record_teardown(&reason);
         }
     }
 
-    /// Settles the persistence owed by a [`LoadedSession::ActivePending`]
+    /// Saves the session owed by a [`LoadedSession::ActivePending`]
     /// after the inner service has responded.
     ///
     /// Returns `Set-Cookie` header values to append to the response.
@@ -826,13 +789,9 @@ where
     pub async fn persist_session(
         &self,
         session: &SD::SessionType,
-        persistence: SessionPersistence,
         request_headers: &HeaderMap,
     ) -> Result<Vec<HeaderValue>, SessionError> {
-        match persistence {
-            SessionPersistence::Save => self.session_store.save(session, request_headers).await,
-            SessionPersistence::Touch => self.session_store.touch(session, request_headers).await,
-        }
+        self.session_store.save(session, request_headers).await
     }
 
     /// Deletes a session, returning `Set-Cookie` header values that clear
@@ -864,21 +823,6 @@ where
         request_headers: &HeaderMap,
     ) -> Result<Vec<HeaderValue>, SessionError> {
         self.session_store.save(session, request_headers).await
-    }
-
-    /// Touches a session (TTL extension), returning `Set-Cookie` header values.
-    /// See [`persist_session`](Self::persist_session) for the role of `request_headers`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SessionError`] if the underlying session store fails to
-    /// touch the session.
-    pub async fn touch_session(
-        &self,
-        session: &SD::SessionType,
-        request_headers: &HeaderMap,
-    ) -> Result<Vec<HeaderValue>, SessionError> {
-        self.session_store.touch(session, request_headers).await
     }
 
     /// Renders an error response through the configured [`ErrorPage`].
@@ -939,9 +883,9 @@ fn refresh_retry_delay(attempt: u32) -> Duration {
 
 /// Maximum tolerated clock skew when validating session timestamps.
 ///
-/// A session whose `created_at` or `last_active` is more than this far ahead
-/// of the server's wall clock is treated as corrupted and expired, rather
-/// than silently bypassing the `max_lifetime` / `idle_timeout` checks.
+/// A session whose `created_at` is more than this far ahead of the server's
+/// wall clock is treated as corrupted and expired, rather than silently
+/// bypassing the `max_lifetime` check.
 ///
 /// Sized to absorb realistic NTP drift and short-lived clock jumps without
 /// false-positives.

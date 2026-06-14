@@ -11,9 +11,13 @@
 //! have default implementations.
 //!
 //! State is never mutated in place. Events like [`refreshed`](SessionState::refreshed)
-//! and [`with_activity`](SessionState::with_activity) produce a new `SessionState`
-//! value, which is then set back via the trait. This matches the
-//! load->transform->save model required for distributed session stores.
+//! produce a new `SessionState` value, which is then set back via the trait.
+//! This matches the load->transform->save model required for distributed
+//! session stores.
+//!
+//! Liveness (`last_active` / idle-timeout) is deliberately *not* part of this
+//! state — it is tracked separately and server-side only; see
+//! [`crate::liveness`].
 
 use huskarl::{
     core::{
@@ -29,8 +33,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// Session types embed it and implement [`Session`] by providing read access
 /// and a replacement method. State changes are produced by event methods
-/// ([`refreshed`](Self::refreshed), [`with_activity`](Self::with_activity))
-/// that return a new value rather than mutating in place.
+/// ([`refreshed`](Self::refreshed)) that return a new value rather than
+/// mutating in place.
 ///
 /// The struct is `#[non_exhaustive]` so new fields can be added in a minor
 /// release. For OAuth flows the framework constructs it from the completed
@@ -61,9 +65,6 @@ pub struct SessionState {
     /// When the session was created (initial login).
     #[serde(with = "unix_secs")]
     pub created_at: SystemTime,
-    /// When the session was last active (last request that used this session).
-    #[serde(with = "unix_secs")]
-    pub last_active: SystemTime,
 }
 
 impl SessionState {
@@ -92,7 +93,6 @@ impl SessionState {
             sub,
             sid,
             created_at: now,
-            last_active: now,
         }
     }
 
@@ -117,15 +117,6 @@ impl SessionState {
             new.refresh_token = Some(rt.clone());
         }
 
-        new.last_active = now;
-        new
-    }
-
-    /// Produces a new `SessionState` with the last-active timestamp set to now.
-    #[must_use]
-    pub fn with_activity(&self) -> Self {
-        let mut new = self.clone();
-        new.last_active = SystemTime::now();
         new
     }
 }
@@ -190,24 +181,11 @@ pub trait Session {
         self.state().created_at
     }
 
-    /// When the session was last active (last request that used this session).
-    fn last_active(&self) -> SystemTime {
-        self.state().last_active
-    }
-
     /// Apply tokens from a refresh response.
     ///
     /// Produces a new [`SessionState`] via [`SessionState::refreshed`] and sets it.
     fn apply_refresh(&mut self, token_response: &TokenResponse, default_lifetime: Duration) {
         let new_state = self.state().refreshed(token_response, default_lifetime);
-        self.set_state(new_state);
-    }
-
-    /// Record that the session was active.
-    ///
-    /// Produces a new [`SessionState`] via [`SessionState::with_activity`] and sets it.
-    fn record_activity(&mut self) {
-        let new_state = self.state().with_activity();
         self.set_state(new_state);
     }
 }

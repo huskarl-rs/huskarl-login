@@ -48,6 +48,7 @@
 
 pub mod cookie;
 pub mod engine;
+pub mod liveness;
 pub mod metrics;
 pub mod session;
 pub mod url;
@@ -61,20 +62,21 @@ mod session_state;
 mod store_session;
 
 pub use completed_login::CompletedLogin;
-pub use config::{ConfigError, LoginConfig, LogoutConfig};
+pub use config::{ActivityPolicy, ConfigError, LoginConfig, LogoutConfig};
 pub use cookie_session::{
     CookiePayload, CookieSession, CookieSessionStore, CookieSessionStoreBuilder,
 };
 pub use engine::{DefaultPersistFailurePolicy, PersistFailurePolicy, TeardownReason};
 pub use enrich::{NoEnrichment, SessionEnricher};
 pub use error_page::{DefaultErrorPage, ErrorPage, ErrorPageResponse};
+pub use liveness::{LivenessConfig, LivenessStore, LivenessVerdict};
 pub use metrics::{
-    ActivityOutcome, DecryptResult, LoginCompleteResult, LoginEngineMetrics, LoginStartResult,
-    RefreshResult, SessionCookieMetrics, normalize_as_error,
+    DecryptResult, LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult,
+    SessionCookieMetrics, normalize_as_error,
 };
 pub use session::{SessionDriver, SessionError};
 pub use session_state::{Session, SessionState};
 pub use store_session::{
-    ExternalSessionStore, PersistedSession, PersistedSessionState, StoreBackedSessionStore,
-    StoreBackedSessionStoreBuilder,
+    ExternalSessionStore, PersistedSession, PersistedSessionState, SaveOutcome, SessionNotFound,
+    StoreBackedSessionStore, StoreBackedSessionStoreBuilder, VersionConflict,
 };

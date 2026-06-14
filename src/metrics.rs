@@ -202,30 +202,6 @@ impl RefreshResult {
     }
 }
 
-/// Outcome of session activity recording for an authenticated request.
-///
-/// Passed to [`LoginEngineMetrics::record_activity`]. The ratio of
-/// [`Touch`](Self::Touch) to [`Skip`](Self::Skip) outcomes is the effective
-/// touch rate; use it to tune [`LoginConfig::touch_min_interval`](crate::LoginConfig::touch_min_interval).
-#[non_exhaustive]
-pub enum ActivityOutcome {
-    /// The session's `last_active` timestamp was updated (touch interval elapsed).
-    Touch,
-    /// Activity was not recorded — the touch interval has not yet elapsed.
-    Skip,
-}
-
-impl ActivityOutcome {
-    /// Returns a `&'static str` suitable for use as a Prometheus label value.
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Touch => "touch",
-            Self::Skip => "skip",
-        }
-    }
-}
-
 /// Observer for [`LoginEngine`](crate::engine::LoginEngine) events.
 ///
 /// Implement this trait to record login-flow metrics to a backend of your
@@ -254,13 +230,6 @@ pub trait LoginEngineMetrics: MaybeSendSync + 'static {
     /// Called whenever a session is loaded and the access token is at or near
     /// expiry — whether or not a refresh token is available.
     fn record_refresh(&self, result: &RefreshResult);
-
-    /// Record session activity recording outcome for an authenticated request.
-    ///
-    /// Called when a valid (non-expiring) session is loaded. The ratio of
-    /// [`Touch`](ActivityOutcome::Touch) to [`Skip`](ActivityOutcome::Skip)
-    /// outcomes reflects the effective touch rate.
-    fn record_activity(&self, outcome: &ActivityOutcome);
 
     /// Record the teardown of a presented session — why
     /// [`load_session`](crate::engine::LoginEngine::load_session) dropped it

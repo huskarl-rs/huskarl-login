@@ -194,9 +194,7 @@ mod tests {
 
     #[test]
     fn end_session_url_preserves_existing_query() {
-        let endpoint: http::Uri = "https://auth.example.com/logout?foo=bar"
-            .parse()
-            .unwrap();
+        let endpoint: http::Uri = "https://auth.example.com/logout?foo=bar".parse().unwrap();
         let url =
             build_end_session_url(&endpoint, None, None, Some("https://app.example.com/")).unwrap();
         assert!(url.contains("foo=bar"));

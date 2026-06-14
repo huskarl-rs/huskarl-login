@@ -7,6 +7,58 @@
 
 use std::time::Duration;
 
+use http::HeaderMap;
+
+use crate::engine::{is_cross_site_request, is_navigation_request};
+
+/// Which requests count as user "activity" for server-side liveness tracking.
+///
+/// Idle timeout should approximate "the human stopped interacting," but not
+/// every authenticated request reflects a human: background polling, prefetch,
+/// service-worker fetches, and cross-site embeds all generate traffic that
+/// would otherwise keep an abandoned session alive. This policy classifies each
+/// request — from its fetch-metadata headers — as activity or not; only
+/// activity advances `last_active`. Idle *expiry* is enforced on every request
+/// regardless of this policy.
+///
+/// Defaults to [`FirstParty`](Self::FirstParty).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ActivityPolicy {
+    /// Only top-level browser navigations count (`Sec-Fetch-Mode: navigate` or
+    /// `Sec-Fetch-Dest: document`). Tightest idle semantics — suitable for
+    /// multi-page apps, but breaks fetch-driven SPAs: an active user who only
+    /// triggers XHR/fetch generates no navigations and would idle out.
+    NavigationsOnly,
+    /// First-party requests count: everything *except* cross-site requests that
+    /// are not themselves top-level navigations. Excludes cross-site embeds,
+    /// beacons, and other origins' CORS calls, while still counting same-origin
+    /// SPA fetches and genuine inbound link navigations. Requests without
+    /// fetch-metadata (older clients, non-browser agents) are treated as
+    /// first-party and count.
+    ///
+    /// Note: this cannot distinguish same-origin background polling from human
+    /// interaction — the browser sends no user-activation signal on fetch — so
+    /// a continuously-polling SPA still registers as active.
+    #[default]
+    FirstParty,
+    /// Every authenticated request counts as activity.
+    AllRequests,
+}
+
+impl ActivityPolicy {
+    /// Returns whether a request with these headers should advance the
+    /// session's `last_active` timestamp under this policy.
+    #[must_use]
+    pub fn counts_as_activity(self, headers: &HeaderMap) -> bool {
+        match self {
+            Self::NavigationsOnly => is_navigation_request(headers),
+            Self::FirstParty => !is_cross_site_request(headers) || is_navigation_request(headers),
+            Self::AllRequests => true,
+        }
+    }
+}
+
 /// Errors that can occur when building a [`LoginConfig`].
 #[derive(Debug)]
 #[non_exhaustive]
@@ -245,16 +297,17 @@ pub struct LoginConfig {
     pub secure: bool,
     /// Absolute session cap. Sessions older than this are expired regardless
     /// of activity. `None` means no limit.
-    pub max_lifetime: Option<Duration>,
-    /// Kill session after inactivity. `None` means no idle timeout.
     ///
-    /// Inactivity is measured against the session's *persisted* `last_active`
-    /// timestamp, which is updated at most once per
-    /// [`touch_min_interval`](Self::touch_min_interval) so that steady
-    /// traffic doesn't write to the session backend on every request. Pick
-    /// an idle timeout comfortably above `touch_min_interval` and the
-    /// skipped updates never matter.
-    pub idle_timeout: Option<Duration>,
+    /// This is the only lifetime bound enforced for cookie sessions. Idle
+    /// timeout is server-side only and configured separately on the liveness
+    /// store — see [`LivenessConfig`](crate::LivenessConfig) and
+    /// [`StoreBackedSessionStore::with_liveness`](crate::StoreBackedSessionStore::with_liveness).
+    pub max_lifetime: Option<Duration>,
+    /// Which requests count as user activity for server-side liveness tracking.
+    ///
+    /// Only affects sessions with a liveness store; idle expiry is always
+    /// enforced regardless. Defaults to [`ActivityPolicy::FirstParty`].
+    pub activity_policy: ActivityPolicy,
     /// How early to refresh before actual token expiry.
     ///
     /// When a request arrives within this margin of the access token's expiry,
@@ -283,19 +336,6 @@ pub struct LoginConfig {
     ///
     /// Defaults to 600 seconds (10 minutes).
     pub login_state_ttl: Duration,
-    /// Minimum interval between activity "touches" for an active session.
-    ///
-    /// On each authenticated request, the middleware updates `last_active` and
-    /// asks the adapter to persist it (`SessionPersistence::Touch`) — but only
-    /// if `last_active` is older than this interval. For cookie sessions a
-    /// touch re-encrypts the session and emits `Set-Cookie`; for store-backed
-    /// sessions it is one write to the external store.
-    ///
-    /// The skipped activity is lost — pick a value comfortably below
-    /// [`idle_timeout`](Self::idle_timeout) so idle expiry still fires on time.
-    ///
-    /// Defaults to 1 hour.
-    pub touch_min_interval: Duration,
     /// Canonical client-facing base URL of this application
     /// (e.g. `"https://app.example.com"` or `"https://app.example.com/base"`).
     ///
@@ -344,10 +384,10 @@ impl LoginConfig {
         scopes: Vec<String>,
         /// Absolute session cap. `None` means no limit.
         max_lifetime: Option<Duration>,
-        /// Kill session after inactivity. `None` means no idle timeout.
-        /// Pick a value comfortably above `touch_min_interval` — see
-        /// [`LoginConfig::idle_timeout`].
-        idle_timeout: Option<Duration>,
+        /// Which requests count as user activity for liveness. Defaults to
+        /// [`ActivityPolicy::FirstParty`].
+        #[builder(default)]
+        activity_policy: ActivityPolicy,
         /// How early to refresh before actual token expiry. Defaults to 30 seconds.
         #[builder(default = Duration::from_secs(30))]
         token_refresh_margin: Duration,
@@ -358,9 +398,6 @@ impl LoginConfig {
         /// Lifetime of the per-flow login-state cookie. Defaults to 10 minutes.
         #[builder(default = Duration::from_mins(10))]
         login_state_ttl: Duration,
-        /// Minimum interval between activity touches. Defaults to 1 hour.
-        #[builder(default = Duration::from_hours(1))]
-        touch_min_interval: Duration,
         /// Canonical client-facing base URL (e.g. `"https://app.example.com"`).
         base_url: http::Uri,
         /// Path prefix added by a front proxy to strip before constructing the original URL.
@@ -389,9 +426,8 @@ impl LoginConfig {
             })?;
         }
         if let Some(ref logout) = logout {
-            validate_path(&logout.path, |path, reason| ConfigError::InvalidLogoutPath {
-                path,
-                reason,
+            validate_path(&logout.path, |path, reason| {
+                ConfigError::InvalidLogoutPath { path, reason }
             })?;
             if let Some(ref uri) = logout.post_logout_redirect_uri
                 && (uri.scheme().is_none() || uri.authority().is_none())
@@ -449,11 +485,10 @@ impl LoginConfig {
             scopes,
             secure,
             max_lifetime,
-            idle_timeout,
+            activity_policy,
             token_refresh_margin,
             default_token_lifetime,
             login_state_ttl,
-            touch_min_interval,
             base_url,
             strip_prefix,
             logout,
@@ -500,8 +535,95 @@ mod tests {
     }
 
     #[test]
-    fn login_config_idle_timeout_defaults_none() {
-        assert!(default_policy_config().idle_timeout.is_none());
+    fn login_config_activity_policy_defaults_first_party() {
+        assert_eq!(
+            default_policy_config().activity_policy,
+            ActivityPolicy::FirstParty
+        );
+    }
+
+    fn req(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn first_party_counts_same_origin_fetch() {
+        let h = req(&[
+            ("sec-fetch-site", "same-origin"),
+            ("sec-fetch-mode", "cors"),
+        ]);
+        assert!(ActivityPolicy::FirstParty.counts_as_activity(&h));
+    }
+
+    #[test]
+    fn first_party_excludes_cross_site_fetch() {
+        let h = req(&[("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "cors")]);
+        assert!(!ActivityPolicy::FirstParty.counts_as_activity(&h));
+    }
+
+    #[test]
+    fn first_party_counts_cross_site_navigation() {
+        // A genuine inbound link click — cross-site but a top-level navigation.
+        let h = req(&[
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", "navigate"),
+        ]);
+        assert!(ActivityPolicy::FirstParty.counts_as_activity(&h));
+    }
+
+    #[test]
+    fn first_party_counts_requests_without_fetch_metadata() {
+        // Non-browser / legacy client: treated as first-party, counts.
+        assert!(ActivityPolicy::FirstParty.counts_as_activity(&http::HeaderMap::new()));
+    }
+
+    #[test]
+    fn navigations_only_excludes_same_origin_fetch() {
+        let h = req(&[
+            ("sec-fetch-site", "same-origin"),
+            ("sec-fetch-mode", "cors"),
+        ]);
+        assert!(!ActivityPolicy::NavigationsOnly.counts_as_activity(&h));
+    }
+
+    #[test]
+    fn navigations_only_counts_navigation() {
+        let h = req(&[("sec-fetch-mode", "navigate")]);
+        assert!(ActivityPolicy::NavigationsOnly.counts_as_activity(&h));
+    }
+
+    #[test]
+    fn all_requests_counts_cross_site_fetch() {
+        let h = req(&[("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "cors")]);
+        assert!(ActivityPolicy::AllRequests.counts_as_activity(&h));
+    }
+
+    #[test]
+    fn first_party_counts_legacy_xhr_without_fetch_metadata() {
+        // An old browser / jQuery XHR sends no Sec-Fetch-* — it cannot be
+        // classified cross-site, so an active user on such a client must still
+        // count as activity and never idle out under the default policy.
+        let h = req(&[
+            ("x-requested-with", "XMLHttpRequest"),
+            ("accept", "application/json"),
+        ]);
+        assert!(ActivityPolicy::FirstParty.counts_as_activity(&h));
+    }
+
+    #[test]
+    fn navigations_only_counts_legacy_navigation_via_accept() {
+        // Even the strict policy must keep counting genuine page loads from
+        // old browsers: with no Sec-Fetch-*, `Accept: text/html` is the
+        // navigation signal.
+        let h = req(&[("accept", "text/html,application/xhtml+xml")]);
+        assert!(ActivityPolicy::NavigationsOnly.counts_as_activity(&h));
     }
 
     #[test]
@@ -529,33 +651,21 @@ mod tests {
     }
 
     #[test]
-    fn login_config_touch_min_interval_defaults_one_hour() {
-        assert_eq!(
-            default_policy_config().touch_min_interval,
-            Duration::from_hours(1)
-        );
-    }
-
-    #[test]
     fn login_config_lifetime_fields_override() {
         let config = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
             .base_url("https://app.example.com".parse().unwrap())
             .max_lifetime(Duration::from_hours(1))
-            .idle_timeout(Duration::from_mins(15))
             .token_refresh_margin(Duration::from_mins(1))
             .default_token_lifetime(Duration::from_hours(2))
             .login_state_ttl(Duration::from_mins(30))
-            .touch_min_interval(Duration::from_mins(1))
             .build()
             .unwrap();
         assert_eq!(config.max_lifetime, Some(Duration::from_hours(1)));
-        assert_eq!(config.idle_timeout, Some(Duration::from_mins(15)));
         assert_eq!(config.token_refresh_margin, Duration::from_mins(1));
         assert_eq!(config.default_token_lifetime, Duration::from_hours(2));
         assert_eq!(config.login_state_ttl, Duration::from_mins(30));
-        assert_eq!(config.touch_min_interval, Duration::from_mins(1));
     }
 
     #[test]

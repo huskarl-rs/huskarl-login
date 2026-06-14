@@ -90,11 +90,16 @@ where
         // id_token, so without it the OP can't identify the RP and will drop
         // post_logout_redirect_uri (OIDC RP-Initiated Logout 1.0 §2).
         let client_id = Some(self.grant.client_id());
-        build_end_session_url(endpoint, id_token_hint, client_id, Some(post_logout.as_str()))
-            .unwrap_or_else(|e| {
-                log::error!("failed to build end_session URL: {e}");
-                post_logout.clone()
-            })
+        build_end_session_url(
+            endpoint,
+            id_token_hint,
+            client_id,
+            Some(post_logout.as_str()),
+        )
+        .unwrap_or_else(|e| {
+            log::error!("failed to build end_session URL: {e}");
+            post_logout.clone()
+        })
     }
 
     /// Deletes the session via the driver and appends the returned cookie

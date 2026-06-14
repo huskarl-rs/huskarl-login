@@ -382,10 +382,7 @@ mod tests {
 
     #[test]
     fn session_cookie_name_prefixes_secure_root() {
-        assert_eq!(
-            session_cookie_name("sess".into(), true, "/"),
-            "__Host-sess"
-        );
+        assert_eq!(session_cookie_name("sess".into(), true, "/"), "__Host-sess");
     }
 
     #[test]

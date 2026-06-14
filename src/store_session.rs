@@ -13,7 +13,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
 use huskarl::core::{
     crypto::cipher::{AeadCipher, AeadEncryptor as _, AeadSealer as _, AeadV1Cipher, CipherMatch},
-    platform::{MaybeSend, MaybeSendSync},
+    platform::{MaybeSend, MaybeSendSync, SystemTime},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -25,6 +25,7 @@ use crate::{
         unseal_with_kid_fallback,
     },
     enrich::{NoEnrichment, SessionEnricher},
+    liveness::{LivenessConfig, LivenessStore, LivenessVerdict},
     metrics::{DecryptResult, SessionCookieMetrics},
     session::{SessionDriver, SessionError, to_session_err},
     session_state::{Session, SessionState},
@@ -78,35 +79,49 @@ pub trait ExternalSessionStore: MaybeSendSync {
         session_key: Uuid,
     ) -> impl Future<Output = Result<Option<Self::SessionType>, Self::Error>> + MaybeSend;
 
-    /// Save a session. Called when the session has been mutated (e.g. after a
-    /// token refresh).
+    /// Save a session unconditionally, advancing the stored
+    /// [`version`](PersistedSessionState::version).
+    ///
+    /// This is the *last-writer-wins* path used for ambient writes (e.g. the
+    /// engine persisting refreshed tokens); a concurrent writer's changes can
+    /// be overwritten. For mutations that must not be lost under concurrency,
+    /// use [`StoreBackedSessionStore::update`], which goes through
+    /// [`compare_and_swap`](Self::compare_and_swap). Bumping the version here
+    /// (typically `version + 1`) is what lets a concurrent `update` notice this
+    /// write and retry.
+    ///
+    /// Set the record's storage TTL to the deployment's `max_lifetime` (the
+    /// absolute session cap). Idle expiry is no longer this store's concern —
+    /// activity is tracked separately by a [`LivenessStore`](crate::LivenessStore),
+    /// so there is nothing to extend here per-request.
     fn save(
         &self,
         session: &Self::SessionType,
     ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 
-    /// Persist the session's updated `last_active` timestamp and (where
-    /// applicable) extend the storage TTL.
+    /// Save `session` only if the stored
+    /// [`version`](PersistedSessionState::version) still equals `expected`,
+    /// advancing it on success. Returns [`SaveOutcome::Conflict`] (no write)
+    /// when another writer has since advanced the version.
     ///
-    /// The engine throttles these calls via
-    /// [`touch_min_interval`](crate::LoginConfig::touch_min_interval): a
-    /// request only triggers a touch once that much time has passed since
-    /// the last persisted activity, so steady traffic costs one backend
-    /// write per interval — not one per request. Implementations should not
-    /// need to throttle further.
+    /// This is the compare-and-swap primitive behind
+    /// [`StoreBackedSessionStore::update`]; the retry loop lives there, so an
+    /// implementation only needs the conditional write:
     ///
-    /// The persisted `last_active` is what
-    /// [`idle_timeout`](crate::LoginConfig::idle_timeout) is enforced
-    /// against, so idle expiry is accurate to `touch_min_interval`. An
-    /// implementation that extends the TTL without persisting `last_active`
-    /// degrades that accuracy: the timestamp then only advances on
-    /// [`save`](Self::save) (login and token refresh), and the engine may
-    /// tear down a continuously active session once `idle_timeout` elapses
-    /// after the last refresh.
-    fn touch(
+    /// - SQL: `UPDATE … SET data = ?, version = version + 1 WHERE key = ? AND version = ?`
+    ///   — zero rows affected means [`Conflict`](SaveOutcome::Conflict).
+    /// - Dynamo: a conditional write with `ConditionExpression: version = :expected`.
+    /// - Mongo: `findOneAndUpdate({key, version}, {$set, $inc: {version: 1}})`.
+    /// - Redis: `WATCH` the key (or a small Lua CAS).
+    ///
+    /// The version is compared by **equality only** (never ordered), so a
+    /// `version + 1` that wraps is harmless — see
+    /// [`PersistedSessionState::version`].
+    fn compare_and_swap(
         &self,
         session: &Self::SessionType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
+        expected: i32,
+    ) -> impl Future<Output = Result<SaveOutcome, Self::Error>> + MaybeSend;
 
     /// Delete a session.
     fn delete(
@@ -114,6 +129,43 @@ pub trait ExternalSessionStore: MaybeSendSync {
         session: &Self::SessionType,
     ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 }
+
+/// Outcome of [`ExternalSessionStore::compare_and_swap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveOutcome {
+    /// The version matched; the session was written and the version advanced.
+    Committed,
+    /// Another writer advanced the version first; nothing was written. The
+    /// caller should reload and retry.
+    Conflict,
+}
+
+/// [`StoreBackedSessionStore::update`] found no session for the key — it was
+/// deleted or expired before the update could run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionNotFound;
+
+impl std::fmt::Display for SessionNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session not found")
+    }
+}
+
+impl std::error::Error for SessionNotFound {}
+
+/// [`StoreBackedSessionStore::update`] exhausted its retry budget — the session
+/// was concurrently rewritten on every attempt. The caller can retry the whole
+/// operation or surface a conflict (e.g. HTTP 409) to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionConflict;
+
+impl std::fmt::Display for VersionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session update conflict: the session was modified concurrently")
+    }
+}
+
+impl std::error::Error for VersionConflict {}
 
 /// Framework-managed session state carried by every store-backed session.
 ///
@@ -137,6 +189,18 @@ pub struct PersistedSessionState {
     pub session_key: Uuid,
     /// Shared token and timing state. See [`SessionState`] for the field set.
     pub state: SessionState,
+    /// Optimistic-concurrency version, advanced on every write. `0` at insert;
+    /// set by the store on [`load`](ExternalSessionStore::load).
+    ///
+    /// Used by [`StoreBackedSessionStore::update`] to detect a concurrent
+    /// writer: the update reloads and replays its mutation when the stored
+    /// version no longer matches the one it loaded. Compared **by equality
+    /// only**, never ordered — so its signedness is immaterial and the
+    /// `wrapping_add` increment (unreachable short of 2³¹ writes to one session)
+    /// is harmless.
+    #[serde(default)]
+    #[builder(default)]
+    pub version: i32,
 }
 
 impl Session for PersistedSessionState {
@@ -193,6 +257,11 @@ fn generate_session_key() -> Uuid {
     Uuid::now_v7()
 }
 
+/// Attempts an optimistic [`update`](StoreBackedSessionStore::update) makes
+/// before giving up with [`VersionConflict`]. Five absorbs realistic
+/// contention; sustained failure past it signals a hot key worth surfacing.
+const UPDATE_MAX_ATTEMPTS: u32 = 5;
+
 /// A session store that keeps an encrypted pointer cookie in the browser and
 /// stores session data in an external [`ExternalSessionStore`].
 ///
@@ -239,6 +308,11 @@ pub struct StoreBackedSessionStore<E: ExternalSessionStore> {
     cookie_path: String,
     max_age: Duration,
     metrics: Option<Arc<dyn SessionCookieMetrics>>,
+    /// Optional server-side liveness (idle) tracking. `None` means idle timeout
+    /// is not enforced and activity is not recorded. Attached post-construction
+    /// via [`with_liveness`](Self::with_liveness) so it does not change the
+    /// store's type.
+    liveness: Option<(Box<dyn LivenessStore>, LivenessConfig)>,
 }
 
 #[bon::bon]
@@ -283,6 +357,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             cookie_path,
             max_age,
             metrics,
+            liveness: None,
         }
     }
 }
@@ -320,7 +395,10 @@ impl<E: ExternalSessionStore, S: store_builder::IsComplete> StoreBackedSessionSt
     #[must_use]
     pub fn build_with_claims<F>(self, f: F) -> StoreBackedSessionStore<E>
     where
-        F: Fn(PersistedSessionState, &crate::CompletedLogin) -> Result<E::SessionType, SessionError>
+        F: Fn(
+                PersistedSessionState,
+                &crate::CompletedLogin,
+            ) -> Result<E::SessionType, SessionError>
             + MaybeSendSync
             + 'static,
     {
@@ -338,6 +416,91 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     /// updating an active-key gauge from a reload callback.
     pub fn key_id(&self) -> Option<Cow<'_, str>> {
         self.cipher.key_id()
+    }
+
+    /// Attach server-side liveness (idle-timeout) tracking, backed by the given
+    /// [`LivenessStore`] and configured by `config`.
+    ///
+    /// Liveness is server-side only and keyed by the session's `Uuid`, so it is
+    /// available only on store-backed sessions — there is no cookie-session
+    /// equivalent. The store may be a different (cheaper) backend than the
+    /// session store; see [`crate::liveness`] for the fail-open / monotonic
+    /// contract. Returns `self` so it chains after the builder, without changing
+    /// the store's type.
+    #[must_use]
+    pub fn with_liveness(
+        mut self,
+        store: impl LivenessStore + 'static,
+        config: LivenessConfig,
+    ) -> Self {
+        self.liveness = Some((Box::new(store), config));
+        self
+    }
+
+    /// Atomically apply `mutate` to the stored session, retrying on concurrent
+    /// writes (optimistic concurrency control).
+    ///
+    /// Loads the session, runs `mutate` on it, and writes it back only if no
+    /// other writer changed it in between (via
+    /// [`compare_and_swap`](ExternalSessionStore::compare_and_swap)). On a
+    /// conflict it reloads the latest state and **runs `mutate` again**, so the
+    /// concurrent change is preserved rather than clobbered. Returns the
+    /// committed session.
+    ///
+    /// Use this for any session mutation that must not be lost under
+    /// concurrency — step-up state, stored tokens, counters, app data touched by
+    /// more than one request. Ambient writes (the engine persisting refreshed
+    /// tokens) go through [`save`](ExternalSessionStore::save) and remain
+    /// last-writer-wins.
+    ///
+    /// # The closure must be replayable
+    ///
+    /// `mutate` may run more than once, each time against freshly-loaded state,
+    /// so it must compute the new state *from the session it is given* — set a
+    /// field, append to the loaded collection, recompute from current values.
+    /// It must not apply a value captured before the load or accumulate across
+    /// calls, or a retry will produce the wrong result.
+    ///
+    /// # Errors
+    ///
+    /// - [`SessionNotFound`] if the key has no session (deleted/expired).
+    /// - [`VersionConflict`] if the retry budget is exhausted under sustained
+    ///   contention.
+    /// - the store's error (boxed into [`SessionError`]) on a transport failure.
+    pub async fn update<F>(
+        &self,
+        session_key: Uuid,
+        mutate: F,
+    ) -> Result<E::SessionType, SessionError>
+    where
+        F: Fn(&mut E::SessionType) + MaybeSend,
+    {
+        for _ in 0..UPDATE_MAX_ATTEMPTS {
+            let Some(mut session) = self
+                .external
+                .load(session_key)
+                .await
+                .map_err(to_session_err)?
+            else {
+                return Err(Box::new(SessionNotFound));
+            };
+            let expected = session.persisted().version;
+            mutate(&mut session);
+            // Advance the version on the session so stores that persist it from
+            // the record's body see the new value; column-based stores that do
+            // `version + 1` arrive at the same value (stored == expected).
+            session.persisted_mut().version = expected.wrapping_add(1);
+            match self
+                .external
+                .compare_and_swap(&session, expected)
+                .await
+                .map_err(to_session_err)?
+            {
+                SaveOutcome::Committed => return Ok(session),
+                SaveOutcome::Conflict => {}
+            }
+        }
+        Err(Box::new(VersionConflict))
     }
 
     fn base_cookie_attrs(&self) -> String {
@@ -452,6 +615,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         let seed = PersistedSessionState {
             session_key: generate_session_key(),
             state: SessionState::from_completed(completed, default_lifetime),
+            version: 0,
         };
 
         let session = self.enricher.build_session(seed, completed).await?;
@@ -487,14 +651,6 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         Ok(vec![])
     }
 
-    pub(crate) async fn touch_session(
-        &self,
-        session: &E::SessionType,
-    ) -> Result<Vec<HeaderValue>, SessionError> {
-        self.external.touch(session).await.map_err(to_session_err)?;
-        Ok(vec![])
-    }
-
     pub(crate) async fn delete_session(
         &self,
         session: &E::SessionType,
@@ -503,6 +659,14 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             .delete(session)
             .await
             .map_err(to_session_err)?;
+        // Best-effort: drop the liveness entry too. A failure here just leaves a
+        // stale entry that expires under its own TTL; it must not fail logout.
+        if let Some((liveness, _)) = &self.liveness {
+            let key = session.persisted().session_key;
+            if let Err(e) = liveness.clear(key).await {
+                log::warn!("failed to clear liveness entry on delete: {e}");
+            }
+        }
         // Clear the pointer cookie and the kid sidecar.
         let clear_attrs = format!("{}; Max-Age=0", self.base_cookie_attrs());
         let mut headers = Vec::new();
@@ -525,7 +689,8 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
 
     fn apply_cookie_secure(&mut self, secure: bool) {
         self.secure = secure;
-        self.cookie_name = session_cookie_name(self.raw_cookie_name.clone(), secure, &self.cookie_path);
+        self.cookie_name =
+            session_cookie_name(self.raw_cookie_name.clone(), secure, &self.cookie_path);
     }
 
     fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
@@ -553,12 +718,49 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
         self.save_session(session).await
     }
 
-    async fn touch(
+    async fn check_liveness(
         &self,
         session: &E::SessionType,
-        _headers: &http::HeaderMap,
-    ) -> Result<Vec<HeaderValue>, SessionError> {
-        self.touch_session(session).await
+        now: SystemTime,
+        record_activity: bool,
+        expire_at: Option<SystemTime>,
+    ) -> Result<LivenessVerdict, SessionError> {
+        let Some((liveness, config)) = &self.liveness else {
+            return Ok(LivenessVerdict::Untracked);
+        };
+        let key = session.persisted().session_key;
+        // Fail open: a read failure must not tear the session down (and leaves
+        // us without a timestamp to throttle against, so we skip the write).
+        // Idle enforcement degrades to `max_lifetime` until the store recovers.
+        let last_active = match liveness.last_active(key).await {
+            Ok(last_active) => last_active,
+            Err(e) => {
+                log::warn!("liveness read failed; treating session as active: {e}");
+                return Ok(LivenessVerdict::Active);
+            }
+        };
+        let verdict = config.verdict(last_active, now);
+
+        // Record activity for a live request, throttled against the persisted
+        // `last_active` (so steady traffic is one write per `touch_min_interval`,
+        // shared across servers). Skipped when the engine classified this
+        // request as non-activity (cross-site embed, background poll, …). The
+        // write is best-effort and monotonic — a failure just delays the next
+        // advance.
+        let due = match last_active {
+            None => true, // no entry yet — establish one
+            Some(prev) => {
+                now.duration_since(prev).unwrap_or(Duration::ZERO) >= config.touch_min_interval
+            }
+        };
+        if record_activity
+            && verdict == LivenessVerdict::Active
+            && due
+            && let Err(e) = liveness.touch(key, now, expire_at).await
+        {
+            log::warn!("liveness touch failed (best-effort): {e}");
+        }
+        Ok(verdict)
     }
 
     async fn delete(
@@ -662,8 +864,12 @@ mod tests {
             Ok(())
         }
 
-        async fn touch(&self, _: &MinimalSession) -> Result<(), Infallible> {
-            Ok(())
+        async fn compare_and_swap(
+            &self,
+            _: &MinimalSession,
+            _: i32,
+        ) -> Result<SaveOutcome, Infallible> {
+            Ok(SaveOutcome::Committed)
         }
 
         async fn delete(&self, _: &MinimalSession) -> Result<(), Infallible> {
@@ -679,8 +885,8 @@ mod tests {
                 state: SessionState::builder()
                     .token_expiry(now + std::time::Duration::from_hours(1))
                     .created_at(now)
-                    .last_active(now)
                     .build(),
+                version: 0,
             },
         }
     }
@@ -717,8 +923,61 @@ mod tests {
         assert_session_driver(&store);
     }
 
+    /// In-memory [`LivenessStore`] that records every write, shareable so a test
+    /// can inspect the entries after handing a clone to `with_liveness`.
+    #[derive(Clone, Default)]
+    struct FakeLiveness {
+        entries: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, SystemTime>>>,
+    }
+
+    impl FakeLiveness {
+        fn set(&self, key: Uuid, at: SystemTime) {
+            self.entries.lock().unwrap().insert(key, at);
+        }
+        fn get(&self, key: Uuid) -> Option<SystemTime> {
+            self.entries.lock().unwrap().get(&key).copied()
+        }
+    }
+
+    impl LivenessStore for FakeLiveness {
+        fn last_active(
+            &self,
+            key: Uuid,
+        ) -> MaybeSendBoxFuture<'_, Result<Option<SystemTime>, SessionError>> {
+            let v = self.get(key);
+            Box::pin(async move { Ok(v) })
+        }
+        fn touch(
+            &self,
+            key: Uuid,
+            now: SystemTime,
+            _expire_at: Option<SystemTime>,
+        ) -> MaybeSendBoxFuture<'_, Result<(), SessionError>> {
+            self.set(key, now);
+            Box::pin(async move { Ok(()) })
+        }
+        fn clear(&self, key: Uuid) -> MaybeSendBoxFuture<'_, Result<(), SessionError>> {
+            self.entries.lock().unwrap().remove(&key);
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    async fn liveness_store(
+        session: MinimalSession,
+        liveness: FakeLiveness,
+        config: LivenessConfig,
+    ) -> StoreBackedSessionStore<MinimalExternalStore> {
+        StoreBackedSessionStore::builder()
+            .external(MinimalExternalStore(session))
+            .cipher(test_cipher().await)
+            .cookie_name("session")
+            .cookie_path("/")
+            .build()
+            .with_liveness(liveness, config)
+    }
+
     #[tokio::test]
-    async fn touch_returns_no_cookies() {
+    async fn without_liveness_is_untracked() {
         let session = test_session();
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session.clone()))
@@ -727,12 +986,313 @@ mod tests {
             .cookie_path("/")
             .build();
 
-        let headers = store.touch_session(&session).await.unwrap();
+        let verdict = store
+            .check_liveness(&session, SystemTime::now(), true, None)
+            .await
+            .unwrap();
+        assert_eq!(verdict, LivenessVerdict::Untracked);
+    }
 
-        assert!(
-            headers.is_empty(),
-            "touch should not re-emit the pointer cookie"
+    #[tokio::test]
+    async fn liveness_active_and_records_activity_on_check() {
+        let session = test_session();
+        let key = session.persisted.session_key;
+        let liveness = FakeLiveness::default();
+        let store =
+            liveness_store(session.clone(), liveness.clone(), LivenessConfig::default()).await;
+
+        // No entry yet → fail-open Active, and check_liveness records activity
+        // (the store throttles; this raw fake writes every time).
+        let now = SystemTime::now();
+        assert_eq!(
+            store
+                .check_liveness(&session, now, true, None)
+                .await
+                .unwrap(),
+            LivenessVerdict::Active
         );
+        assert_eq!(
+            liveness.get(key),
+            Some(now),
+            "check_liveness records activity as a side effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_does_not_record_when_not_activity() {
+        let session = test_session();
+        let key = session.persisted.session_key;
+        let liveness = FakeLiveness::default();
+        let store =
+            liveness_store(session.clone(), liveness.clone(), LivenessConfig::default()).await;
+
+        // Non-activity request (record_activity = false): still Active (idle is
+        // enforced), but last_active is not advanced.
+        assert_eq!(
+            store
+                .check_liveness(&session, SystemTime::now(), false, None)
+                .await
+                .unwrap(),
+            LivenessVerdict::Active
+        );
+        assert!(
+            liveness.get(key).is_none(),
+            "a non-activity request must not advance last_active"
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_idle_past_timeout_expires_and_does_not_record() {
+        let session = test_session();
+        let key = session.persisted.session_key;
+        let liveness = FakeLiveness::default();
+        let config = LivenessConfig::builder()
+            .idle_timeout(Duration::from_secs(60))
+            .build();
+        let store = liveness_store(session.clone(), liveness.clone(), config).await;
+
+        let now = SystemTime::now();
+        let stale = now - Duration::from_secs(120);
+        liveness.set(key, stale);
+        assert_eq!(
+            store
+                .check_liveness(&session, now, true, None)
+                .await
+                .unwrap(),
+            LivenessVerdict::Expired
+        );
+        // An expired session is being torn down — no activity is recorded.
+        assert_eq!(
+            liveness.get(key),
+            Some(stale),
+            "expired check must not touch"
+        );
+    }
+
+    /// A [`LivenessStore`] whose reads always fail, to exercise fail-open.
+    struct FailingLiveness;
+    impl LivenessStore for FailingLiveness {
+        fn last_active(
+            &self,
+            _key: Uuid,
+        ) -> MaybeSendBoxFuture<'_, Result<Option<SystemTime>, SessionError>> {
+            Box::pin(async { Err("liveness backend down".into()) })
+        }
+        fn touch(
+            &self,
+            _key: Uuid,
+            _now: SystemTime,
+            _expire_at: Option<SystemTime>,
+        ) -> MaybeSendBoxFuture<'_, Result<(), SessionError>> {
+            Box::pin(async { Err("liveness backend down".into()) })
+        }
+        fn clear(&self, _key: Uuid) -> MaybeSendBoxFuture<'_, Result<(), SessionError>> {
+            Box::pin(async { Err("liveness backend down".into()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn liveness_read_failure_fails_open() {
+        let session = test_session();
+        let store = StoreBackedSessionStore::builder()
+            .external(MinimalExternalStore(session.clone()))
+            .cipher(test_cipher().await)
+            .cookie_name("session")
+            .cookie_path("/")
+            .build()
+            // A short idle timeout that *would* expire if the read succeeded.
+            .with_liveness(
+                FailingLiveness,
+                LivenessConfig::builder()
+                    .idle_timeout(Duration::from_secs(1))
+                    .build(),
+            );
+
+        // Read errors must never expire a session — fail open to Active. The
+        // subsequent (also failing) activity touch is swallowed best-effort, so
+        // check_liveness still returns Ok.
+        assert_eq!(
+            store
+                .check_liveness(&session, SystemTime::now(), true, None)
+                .await
+                .unwrap(),
+            LivenessVerdict::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_cleared_on_delete() {
+        let session = test_session();
+        let key = session.persisted.session_key;
+        let liveness = FakeLiveness::default();
+        let store =
+            liveness_store(session.clone(), liveness.clone(), LivenessConfig::default()).await;
+
+        liveness.set(key, SystemTime::now());
+        store
+            .delete(&session, &http::HeaderMap::new())
+            .await
+            .unwrap();
+        assert!(
+            liveness.get(key).is_none(),
+            "delete clears the liveness entry"
+        );
+    }
+
+    // ── Optimistic update (OCC) ───────────────────────────────────────────
+
+    /// A stateful external store that honours [`compare_and_swap`] versioning,
+    /// so the [`StoreBackedSessionStore::update`] retry loop can be exercised.
+    struct VersioningStore {
+        stored: std::sync::Mutex<Option<MinimalSession>>,
+        /// When `true`, every `compare_and_swap` reports a conflict.
+        always_conflict: bool,
+        /// A simulated concurrent writer applied just before the first
+        /// `compare_and_swap`, to force one conflict-then-retry.
+        inject_once: std::sync::Mutex<Option<fn(&mut MinimalSession)>>,
+    }
+
+    impl VersioningStore {
+        fn with(session: MinimalSession) -> Self {
+            Self {
+                stored: std::sync::Mutex::new(Some(session)),
+                always_conflict: false,
+                inject_once: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    impl ExternalSessionStore for VersioningStore {
+        type SessionType = MinimalSession;
+        type Error = Infallible;
+
+        async fn insert(&self, s: &MinimalSession) -> Result<(), Infallible> {
+            *self.stored.lock().unwrap() = Some(s.clone());
+            Ok(())
+        }
+        async fn load(&self, _: Uuid) -> Result<Option<MinimalSession>, Infallible> {
+            Ok(self.stored.lock().unwrap().clone())
+        }
+        async fn save(&self, s: &MinimalSession) -> Result<(), Infallible> {
+            *self.stored.lock().unwrap() = Some(s.clone());
+            Ok(())
+        }
+        async fn compare_and_swap(
+            &self,
+            s: &MinimalSession,
+            expected: i32,
+        ) -> Result<SaveOutcome, Infallible> {
+            if self.always_conflict {
+                return Ok(SaveOutcome::Conflict);
+            }
+            let mut stored = self.stored.lock().unwrap();
+            // A concurrent writer landing just before our CAS.
+            if let Some(inject) = self.inject_once.lock().unwrap().take()
+                && let Some(cur) = stored.as_mut()
+            {
+                inject(cur);
+            }
+            match stored.as_ref() {
+                Some(cur) if cur.persisted.version == expected => {
+                    *stored = Some(s.clone());
+                    Ok(SaveOutcome::Committed)
+                }
+                _ => Ok(SaveOutcome::Conflict),
+            }
+        }
+        async fn delete(&self, _: &MinimalSession) -> Result<(), Infallible> {
+            *self.stored.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    async fn store_over(external: VersioningStore) -> StoreBackedSessionStore<VersioningStore> {
+        StoreBackedSessionStore::builder()
+            .external(external)
+            .cipher(test_cipher().await)
+            .cookie_name("session")
+            .cookie_path("/")
+            .build()
+    }
+
+    #[tokio::test]
+    async fn update_applies_mutation_and_bumps_version() {
+        let session = test_session();
+        let key = session.persisted.session_key;
+        let store = store_over(VersioningStore::with(session)).await;
+
+        let updated = store
+            .update(key, |s| s.persisted.state.sub = Some("mine".to_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(updated.persisted.state.sub.as_deref(), Some("mine"));
+        assert_eq!(updated.persisted.version, 1);
+    }
+
+    #[tokio::test]
+    async fn update_retries_and_preserves_concurrent_change() {
+        let session = test_session(); // version 0
+        let key = session.persisted.session_key;
+        let mut ext = VersioningStore::with(session);
+        // A concurrent writer bumps to v1 and sets `sid` just before our first CAS.
+        *ext.inject_once.get_mut().unwrap() = Some(|s| {
+            s.persisted.version = s.persisted.version.wrapping_add(1);
+            s.persisted.state.sid = Some("concurrent".to_owned());
+        });
+        let store = store_over(ext).await;
+
+        let updated = store
+            .update(key, |s| s.persisted.state.sub = Some("mine".to_owned()))
+            .await
+            .unwrap();
+
+        // The first CAS conflicts; the reload + replay keeps BOTH changes.
+        assert_eq!(updated.persisted.state.sub.as_deref(), Some("mine"));
+        assert_eq!(updated.persisted.state.sid.as_deref(), Some("concurrent"));
+        assert_eq!(updated.persisted.version, 2);
+    }
+
+    #[tokio::test]
+    async fn update_exhausts_retries_with_version_conflict() {
+        let session = test_session();
+        let key = session.persisted.session_key;
+        let ext = VersioningStore {
+            stored: std::sync::Mutex::new(Some(session)),
+            always_conflict: true,
+            inject_once: std::sync::Mutex::new(None),
+        };
+        let store = store_over(ext).await;
+
+        let result = store
+            .update(key, |s| s.persisted.state.sub = Some("x".to_owned()))
+            .await;
+        let conflicted = result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.downcast_ref::<VersionConflict>().is_some());
+        assert!(
+            conflicted,
+            "expected VersionConflict under sustained conflict"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_missing_session_is_not_found() {
+        let ext = VersioningStore {
+            stored: std::sync::Mutex::new(None),
+            always_conflict: false,
+            inject_once: std::sync::Mutex::new(None),
+        };
+        let store = store_over(ext).await;
+
+        let result = store.update(Uuid::now_v7(), |_| {}).await;
+        let not_found = result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.downcast_ref::<SessionNotFound>().is_some());
+        assert!(not_found, "expected SessionNotFound for a missing key");
     }
 
     #[tokio::test]
@@ -867,8 +1427,8 @@ mod tests {
                 "__Host-session={pointer_value}; __Host-session.kid={}",
                 encode_kid("v1")
             )
-                .parse()
-                .unwrap(),
+            .parse()
+            .unwrap(),
         );
         assert_eq!(store.read_pointer_cookie(&req).await, Some(original_key));
     }
@@ -923,8 +1483,12 @@ mod tests {
         async fn save(&self, _: &EnrichedStoreSession) -> Result<(), Infallible> {
             Ok(())
         }
-        async fn touch(&self, _: &EnrichedStoreSession) -> Result<(), Infallible> {
-            Ok(())
+        async fn compare_and_swap(
+            &self,
+            _: &EnrichedStoreSession,
+            _: i32,
+        ) -> Result<SaveOutcome, Infallible> {
+            Ok(SaveOutcome::Committed)
         }
         async fn delete(&self, _: &EnrichedStoreSession) -> Result<(), Infallible> {
             Ok(())
@@ -971,20 +1535,28 @@ mod tests {
             });
 
         let (session, cookies) = store
-            .create_session(&completed_with_email("user@example.com"), Duration::from_hours(1))
+            .create_session(
+                &completed_with_email("user@example.com"),
+                Duration::from_hours(1),
+            )
             .await
             .expect("create succeeds");
         assert_eq!(session.email, "user@example.com");
         // The enriched session reached the external store, and a pointer
         // cookie was emitted.
-        assert_eq!(inserted.lock().unwrap().as_deref(), Some("user@example.com"));
+        assert_eq!(
+            inserted.lock().unwrap().as_deref(),
+            Some("user@example.com")
+        );
         assert!(!cookies.is_empty(), "pointer cookie emitted");
     }
 
     #[tokio::test]
     async fn build_with_claims_error_fails_session_creation() {
         let store = StoreBackedSessionStore::builder()
-            .external(EnrichedExternalStore(std::sync::Arc::new(std::sync::Mutex::new(None))))
+            .external(EnrichedExternalStore(std::sync::Arc::new(
+                std::sync::Mutex::new(None),
+            )))
             .cipher(test_cipher().await)
             .cookie_name("session")
             .cookie_path("/")
@@ -992,7 +1564,10 @@ mod tests {
         // The session types here aren't `Debug`, so assert on the `Err` arm
         // directly rather than via `expect_err`.
         let result = store
-            .create_session(&completed_with_email("user@example.com"), Duration::from_hours(1))
+            .create_session(
+                &completed_with_email("user@example.com"),
+                Duration::from_hours(1),
+            )
             .await;
         assert!(
             matches!(&result, Err(e) if e.to_string().contains("enrichment boom")),

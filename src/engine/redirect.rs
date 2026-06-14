@@ -70,5 +70,4 @@ where
             "{cookie_name}={cookie_value}; {attrs}; Max-Age={max_age}"
         ))?)
     }
-
 }
