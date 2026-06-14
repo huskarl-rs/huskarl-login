@@ -225,7 +225,11 @@ impl CookieSealer {
 
     /// Full cookie attributes including this store's configured `Max-Age`.
     pub(crate) fn cookie_attrs(&self) -> String {
-        format!("{}; Max-Age={}", self.base_cookie_attrs(), self.max_age.as_secs())
+        format!(
+            "{}; Max-Age={}",
+            self.base_cookie_attrs(),
+            self.max_age.as_secs()
+        )
     }
 
     /// Builds the `Set-Cookie` for the kid sidecar. When `kid` is `Some`, the

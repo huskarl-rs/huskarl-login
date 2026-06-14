@@ -33,5 +33,6 @@ uuid = { version = "1", features = ["v7", "serde", "js"] }
 hex = "0.4"
 huskarl-crypto-native = { version = "0.8.0-pre.0", path = "../huskarl/huskarl-crypto-native" }
 rand = "0.10"
+rstest = "0.26.1"
 tokio = { version = "1", features = ["full"] }
 url = "2"

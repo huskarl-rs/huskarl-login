@@ -9,7 +9,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use huskarl::{
     core::{
         Error, ErrorKind,
@@ -23,12 +23,11 @@ use huskarl::{
         },
         http::{HttpClient, HttpResponse, Idempotency},
         platform::MaybeSendBoxFuture,
-        secrets::{Secret, SecretBytes, SecretOutput},
     },
     grant::authorization_code::{AuthorizationCodeGrant, PendingState},
     token::RefreshToken,
 };
-use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
+use rstest::rstest;
 
 use super::{
     LoadedSession, LoginEngine, TeardownReason, error_chain, is_cors_preflight,
@@ -39,33 +38,8 @@ use crate::{
     SessionDriver, SessionError, SessionState,
     metrics::{LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult},
     session::sealed::Sealed,
+    test_support::{header_map as headers, test_cipher},
 };
-
-// ── TestSecret / cipher ───────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct TestSecret(SecretBytes);
-
-impl Secret for TestSecret {
-    type Output = SecretBytes;
-    fn get_secret_value(&self) -> MaybeSendBoxFuture<'_, Result<SecretOutput<SecretBytes>, Error>> {
-        let out = SecretOutput {
-            value: self.0.clone(),
-            identity: None,
-        };
-        Box::pin(async move { Ok(out) })
-    }
-}
-
-async fn test_cipher() -> AesGcmKey {
-    AesGcmKey::from_secret(
-        AesGcmKeyType::Aes256,
-        TestSecret(SecretBytes::new(vec![0u8; 32])),
-        |_| None,
-    )
-    .await
-    .unwrap()
-}
 
 // ── HTTP doubles ──────────────────────────────────────────────────────────
 
@@ -558,17 +532,6 @@ async fn engine_stamps_store_insecure_from_http_base_url() {
 
 // ── Header / URI helpers ──────────────────────────────────────────────────
 
-fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
-    let mut map = HeaderMap::new();
-    for (name, value) in pairs {
-        map.insert(
-            HeaderName::from_bytes(name.as_bytes()).unwrap(),
-            HeaderValue::from_str(value).unwrap(),
-        );
-    }
-    map
-}
-
 fn nav_headers() -> HeaderMap {
     headers(&[("sec-fetch-mode", "navigate")])
 }
@@ -613,152 +576,40 @@ fn headers_with_login_cookie(state: &str, value: &str) -> HeaderMap {
 
 // ── is_navigation_request ─────────────────────────────────────────────────
 
-#[test]
-fn xhr_header_returns_false() {
-    assert!(!is_navigation_request(&headers(&[(
-        "x-requested-with",
-        "XMLHttpRequest"
-    )])));
-}
-
-#[test]
-fn xhr_header_is_case_insensitive() {
-    assert!(!is_navigation_request(&headers(&[(
-        "x-requested-with",
-        "xmlhttprequest"
-    )])));
-}
-
-#[test]
-fn sec_fetch_mode_navigate_returns_true() {
-    assert!(is_navigation_request(&headers(&[(
-        "sec-fetch-mode",
-        "navigate"
-    )])));
-}
-
-#[test]
-fn sec_fetch_mode_cors_returns_false() {
-    assert!(!is_navigation_request(&headers(&[(
-        "sec-fetch-mode",
-        "cors"
-    )])));
-}
-
-#[test]
-fn sec_fetch_mode_no_cors_returns_false() {
-    assert!(!is_navigation_request(&headers(&[(
-        "sec-fetch-mode",
-        "no-cors"
-    )])));
-}
-
-#[test]
-fn sec_fetch_dest_document_returns_true() {
-    assert!(is_navigation_request(&headers(&[(
-        "sec-fetch-dest",
-        "document"
-    )])));
-}
-
-#[test]
-fn sec_fetch_dest_empty_returns_false() {
-    assert!(!is_navigation_request(&headers(&[(
-        "sec-fetch-dest",
-        "empty"
-    )])));
-}
-
-#[test]
-fn sec_fetch_dest_image_returns_false() {
-    assert!(!is_navigation_request(&headers(&[(
-        "sec-fetch-dest",
-        "image"
-    )])));
-}
-
-#[test]
-fn accept_text_html_returns_true() {
-    assert!(is_navigation_request(&headers(&[(
-        "accept",
-        "text/html,application/xhtml+xml,*/*;q=0.8"
-    )])));
-}
-
-#[test]
-fn accept_xhtml_only_returns_true() {
-    assert!(is_navigation_request(&headers(&[(
-        "accept",
-        "application/xhtml+xml"
-    )])));
-}
-
-#[test]
-fn accept_json_returns_false() {
-    assert!(!is_navigation_request(&headers(&[(
-        "accept",
-        "application/json"
-    )])));
-}
-
-#[test]
-fn no_relevant_headers_returns_false() {
-    assert!(!is_navigation_request(&HeaderMap::new()));
-}
-
-#[test]
-fn xhr_overrides_sec_fetch_navigate() {
-    let h = headers(&[
-        ("x-requested-with", "XMLHttpRequest"),
-        ("sec-fetch-mode", "navigate"),
-    ]);
-    assert!(!is_navigation_request(&h));
-}
-
-#[test]
-fn sec_fetch_mode_overrides_accept() {
-    let h = headers(&[("sec-fetch-mode", "cors"), ("accept", "text/html")]);
-    assert!(!is_navigation_request(&h));
+#[rstest]
+#[case::xhr(&[("x-requested-with", "XMLHttpRequest")], false)]
+#[case::xhr_case_insensitive(&[("x-requested-with", "xmlhttprequest")], false)]
+#[case::sec_fetch_mode_navigate(&[("sec-fetch-mode", "navigate")], true)]
+#[case::sec_fetch_mode_cors(&[("sec-fetch-mode", "cors")], false)]
+#[case::sec_fetch_mode_no_cors(&[("sec-fetch-mode", "no-cors")], false)]
+#[case::sec_fetch_dest_document(&[("sec-fetch-dest", "document")], true)]
+#[case::sec_fetch_dest_empty(&[("sec-fetch-dest", "empty")], false)]
+#[case::sec_fetch_dest_image(&[("sec-fetch-dest", "image")], false)]
+#[case::accept_text_html(&[("accept", "text/html,application/xhtml+xml,*/*;q=0.8")], true)]
+#[case::accept_xhtml_only(&[("accept", "application/xhtml+xml")], true)]
+#[case::accept_json(&[("accept", "application/json")], false)]
+#[case::no_relevant_headers(&[], false)]
+// Precedence: an explicit XHR/CORS signal wins over a navigation-looking one.
+#[case::xhr_overrides_sec_fetch_navigate(
+    &[("x-requested-with", "XMLHttpRequest"), ("sec-fetch-mode", "navigate")],
+    false
+)]
+#[case::sec_fetch_mode_overrides_accept(&[("sec-fetch-mode", "cors"), ("accept", "text/html")], false)]
+fn is_navigation_request_cases(#[case] pairs: &[(&str, &str)], #[case] expected: bool) {
+    assert_eq!(is_navigation_request(&headers(pairs)), expected);
 }
 
 // ── is_cross_site_request ─────────────────────────────────────────────────
 
-#[test]
-fn sec_fetch_site_cross_site_is_cross_site() {
-    assert!(is_cross_site_request(&headers(&[(
-        "sec-fetch-site",
-        "cross-site"
-    )])));
-}
-
-#[test]
-fn sec_fetch_site_same_origin_is_not_cross_site() {
-    assert!(!is_cross_site_request(&headers(&[(
-        "sec-fetch-site",
-        "same-origin"
-    )])));
-}
-
-#[test]
-fn sec_fetch_site_same_site_is_not_cross_site() {
-    assert!(!is_cross_site_request(&headers(&[(
-        "sec-fetch-site",
-        "same-site"
-    )])));
-}
-
-#[test]
-fn sec_fetch_site_none_is_not_cross_site() {
-    // "none" means user-initiated (typed URL, bookmark) — not a forgery.
-    assert!(!is_cross_site_request(&headers(&[(
-        "sec-fetch-site",
-        "none"
-    )])));
-}
-
-#[test]
-fn absent_sec_fetch_site_is_not_cross_site() {
-    assert!(!is_cross_site_request(&HeaderMap::new()));
+#[rstest]
+#[case::cross_site(&[("sec-fetch-site", "cross-site")], true)]
+#[case::same_origin(&[("sec-fetch-site", "same-origin")], false)]
+#[case::same_site(&[("sec-fetch-site", "same-site")], false)]
+// "none" means user-initiated (typed URL, bookmark) — not a forgery.
+#[case::none_user_initiated(&[("sec-fetch-site", "none")], false)]
+#[case::absent(&[], false)]
+fn is_cross_site_request_cases(#[case] pairs: &[(&str, &str)], #[case] expected: bool) {
+    assert_eq!(is_cross_site_request(&headers(pairs)), expected);
 }
 
 // ── error_chain ───────────────────────────────────────────────────────────

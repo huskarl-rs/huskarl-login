@@ -549,44 +549,17 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use http::HeaderMap;
-    use huskarl::core::{
-        Error,
-        platform::MaybeSendBoxFuture,
-        secrets::{Secret, SecretBytes, SecretOutput},
-    };
-    use huskarl::core::crypto::cipher::AeadV1Cipher;
-    use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
+    use huskarl::core::{crypto::cipher::AeadV1Cipher, platform::MaybeSendBoxFuture};
+    use huskarl_crypto_native::aead::AesGcmKey;
 
     use super::*;
-    use crate::cookie::encode_kid;
-    use crate::session_state::SessionState;
+    use crate::{
+        cookie::encode_kid,
+        session_state::SessionState,
+        test_support::{aes_key_with_kid, test_cipher, test_cipher_with_kid},
+    };
 
     // ── Cipher / fixtures ─────────────────────────────────────────────────
-
-    #[derive(Clone)]
-    struct TestSecret(SecretBytes);
-    impl Secret for TestSecret {
-        type Output = SecretBytes;
-        fn get_secret_value(
-            &self,
-        ) -> MaybeSendBoxFuture<'_, Result<SecretOutput<SecretBytes>, Error>> {
-            let out = SecretOutput {
-                value: self.0.clone(),
-                identity: None,
-            };
-            Box::pin(async move { Ok(out) })
-        }
-    }
-
-    async fn test_cipher() -> AesGcmKey {
-        AesGcmKey::from_secret(
-            AesGcmKeyType::Aes256,
-            TestSecret(SecretBytes::new(vec![0u8; 32])),
-            |_| None,
-        )
-        .await
-        .unwrap()
-    }
 
     fn test_state() -> SessionState {
         let now = SystemTime::now();
@@ -602,19 +575,6 @@ mod tests {
             .cookie_name("huskarl_session")
             .cookie_path("/")
             .build()
-    }
-
-    /// A cipher whose `key_id()` reports a fixed identity, used to exercise
-    /// the kid-sidecar set path on save and the `CipherMatch` path on load.
-    async fn test_cipher_with_kid(kid: &str) -> AesGcmKey {
-        let kid_owned = kid.to_owned();
-        AesGcmKey::from_secret(
-            AesGcmKeyType::Aes256,
-            TestSecret(SecretBytes::new(vec![0u8; 32])),
-            move |_| Some(kid_owned.clone()),
-        )
-        .await
-        .unwrap()
     }
 
     /// Builds a `Cookie:` header from the `Set-Cookie` values a save produced,
@@ -800,20 +760,6 @@ mod tests {
     // ── kid sidecar as hint, not filter ───────────────────────────────────
 
     use huskarl::core::crypto::cipher::{AeadDecryptor, MultiKeyCipher, MultiKeyDecryptor};
-
-    /// An AES-256 key with a stable identity, deterministic in `byte` so the
-    /// "same" key can be constructed twice (e.g. once for a decryptor set and
-    /// once as the encryptor).
-    async fn aes_key_with_kid(kid: &str, byte: u8) -> huskarl_crypto_native::aead::AesGcmKey {
-        let kid_owned = kid.to_owned();
-        AesGcmKey::from_secret(
-            AesGcmKeyType::Aes256,
-            TestSecret(SecretBytes::new(vec![byte; 32])),
-            move |_| Some(kid_owned.clone()),
-        )
-        .await
-        .unwrap()
-    }
 
     /// A rotation-shaped cipher: seals under "v2", unseals under {"v1", "v2"}.
     /// Unlike the single-key test ciphers (which ignore the `CipherMatch`

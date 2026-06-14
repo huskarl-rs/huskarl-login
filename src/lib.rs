@@ -61,6 +61,9 @@ mod error_page;
 mod session_state;
 mod store_session;
 
+#[cfg(test)]
+mod test_support;
+
 pub use completed_login::CompletedLogin;
 pub use config::{ActivityPolicy, ConfigError, LoginConfig, LogoutConfig};
 pub use cookie_session::{

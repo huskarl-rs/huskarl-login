@@ -558,6 +558,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::test_support::header_map as req;
 
     fn default_policy_config() -> LoginConfig {
         LoginConfig::builder()
@@ -670,17 +671,6 @@ mod tests {
             default_policy_config().activity_policy,
             ActivityPolicy::FirstParty
         );
-    }
-
-    fn req(pairs: &[(&str, &str)]) -> http::HeaderMap {
-        let mut map = http::HeaderMap::new();
-        for (name, value) in pairs {
-            map.insert(
-                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
-                http::HeaderValue::from_str(value).unwrap(),
-            );
-        }
-        map
     }
 
     #[test]

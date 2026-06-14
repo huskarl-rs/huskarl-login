@@ -504,9 +504,11 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         self.sealer.record_encrypt(kid.as_deref());
         let cookie_value = URL_SAFE_NO_PAD.encode(&bundle);
         let attrs = self.sealer.cookie_attrs();
-        let pointer =
-            HeaderValue::from_str(&format!("{}={cookie_value}; {attrs}", self.sealer.cookie_name))
-                .map_err(to_session_err)?;
+        let pointer = HeaderValue::from_str(&format!(
+            "{}={cookie_value}; {attrs}",
+            self.sealer.cookie_name
+        ))
+        .map_err(to_session_err)?;
         let kid_header = self.sealer.build_kid_header(kid.as_deref())?;
         Ok(vec![pointer, kid_header])
     }
@@ -617,7 +619,8 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         // Clear the pointer cookie and the kid sidecar.
         let clear_attrs = format!("{}; Max-Age=0", self.sealer.base_cookie_attrs());
         let mut headers = Vec::new();
-        if let Ok(v) = HeaderValue::from_str(&format!("{}=; {clear_attrs}", self.sealer.cookie_name))
+        if let Ok(v) =
+            HeaderValue::from_str(&format!("{}=; {clear_attrs}", self.sealer.cookie_name))
         {
             headers.push(v);
         }
@@ -722,45 +725,14 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
 mod tests {
     use std::convert::Infallible;
 
-    use huskarl::core::{
-        Error,
-        platform::MaybeSendBoxFuture,
-        secrets::{Secret, SecretBytes, SecretOutput},
-    };
-    use huskarl::core::crypto::cipher::AeadV1Cipher;
-    use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
+    use huskarl::core::{crypto::cipher::AeadV1Cipher, platform::MaybeSendBoxFuture};
 
     use super::*;
     use crate::{
         cookie::encode_kid,
         session_state::{Session, SessionState},
+        test_support::{aes_key_with_kid, test_cipher, test_cipher_with_kid},
     };
-
-    #[derive(Clone)]
-    struct TestSecret(SecretBytes);
-
-    impl Secret for TestSecret {
-        type Output = SecretBytes;
-        fn get_secret_value(
-            &self,
-        ) -> MaybeSendBoxFuture<'_, Result<SecretOutput<SecretBytes>, Error>> {
-            let out = SecretOutput {
-                value: self.0.clone(),
-                identity: None,
-            };
-            Box::pin(async move { Ok(out) })
-        }
-    }
-
-    async fn test_cipher() -> AesGcmKey {
-        AesGcmKey::from_secret(
-            AesGcmKeyType::Aes256,
-            TestSecret(SecretBytes::new(vec![0u8; 32])),
-            |_| None,
-        )
-        .await
-        .unwrap()
-    }
 
     #[derive(Clone)]
     struct MinimalSession {
@@ -1291,17 +1263,6 @@ mod tests {
         assert_eq!(recovered, original_key);
     }
 
-    async fn test_cipher_with_kid(kid: &str) -> AesGcmKey {
-        let kid_owned = kid.to_owned();
-        AesGcmKey::from_secret(
-            AesGcmKeyType::Aes256,
-            TestSecret(SecretBytes::new(vec![0u8; 32])),
-            move |_| Some(kid_owned.clone()),
-        )
-        .await
-        .unwrap()
-    }
-
     #[tokio::test]
     async fn pointer_cookie_emits_kid_sidecar_when_cipher_has_identity() {
         let session = test_session();
@@ -1332,16 +1293,6 @@ mod tests {
         use huskarl::core::crypto::cipher::{AeadDecryptor, MultiKeyCipher, MultiKeyDecryptor};
 
         // Rotation-shaped cipher: seals under "v2", unseals under {"v1","v2"}.
-        async fn aes_key_with_kid(kid: &str, byte: u8) -> AesGcmKey {
-            let kid_owned = kid.to_owned();
-            AesGcmKey::from_secret(
-                AesGcmKeyType::Aes256,
-                TestSecret(SecretBytes::new(vec![byte; 32])),
-                move |_| Some(kid_owned.clone()),
-            )
-            .await
-            .unwrap()
-        }
         let decryptor = MultiKeyDecryptor::new(vec![
             Arc::new(aes_key_with_kid("v1", 1).await) as Arc<dyn AeadDecryptor>,
             Arc::new(aes_key_with_kid("v2", 2).await) as Arc<dyn AeadDecryptor>,
