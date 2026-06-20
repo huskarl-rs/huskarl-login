@@ -1,11 +1,9 @@
-//! Cookie utilities for the login layer.
-//!
-//! Provides helpers for reading cookies from request headers and constructing
-//! login-state cookie names with appropriate security prefixes (`__Host-`,
-//! `__Secure-`, or none). Also provides CBOR encoding for the payloads
-//! sealed into the session and login-state cookies — CBOR saves ~25–40%
-//! over JSON, which matters because session cookies are sent on every
-//! authenticated request.
+//! Cookie helpers for the login layer: reading cookies from request headers
+//! ([`get_cookie`]), the validated [`CookieName`] newtype, login-state and
+//! session cookie naming with the right security prefix (`__Host-`,
+//! `__Secure-`, or none), and CBOR encoding for the payloads sealed into the
+//! session and login-state cookies — CBOR saves ~25–40% over JSON, which
+//! matters because session cookies are sent on every authenticated request.
 //!
 //! If the wire format ever changes, the rollout strategy is the same as for
 //! any other key change: in-flight sessions fail to decode, the user is
@@ -315,6 +313,25 @@ impl CookieSealer {
         self.cipher.key_id()
     }
 
+    /// AEAD associated data for a sealed cookie of the given `purpose`
+    /// (`"session"` / `"session_ptr"`).
+    ///
+    /// Binds two things the reader already knows independently at decrypt time:
+    /// the `purpose` (separating session cookies from store pointers) and the
+    /// cookie name (so a value sealed for one cookie cannot be transplanted to a
+    /// differently-named cookie even under a shared AEAD key). Cookie names are
+    /// RFC 6265 tokens (no `:`), so the `:` framing is unambiguous. Seal and open
+    /// must use the same value — always go through this method.
+    ///
+    /// No format version is bound here on purpose: AAD must be supplied to
+    /// decrypt, so a version in the AAD could not be *read* from a cookie, only
+    /// guessed by trial-decrypt. If the sealed format ever needs versioning, put
+    /// the marker in the (authenticated) payload, where it can be detected after
+    /// decryption.
+    pub(crate) fn aad(&self, purpose: &str) -> Vec<u8> {
+        format!("{purpose}:{}", self.cookie_name).into_bytes()
+    }
+
     /// Re-derives `cookie_name` for the deployment's real `secure` flag.
     pub(crate) fn apply_secure(&mut self, secure: bool) {
         self.secure = secure;
@@ -466,10 +483,10 @@ pub(crate) fn normalize_kid_label<'a>(
     }
 }
 
-/// Extracts a cookie value by name from request headers.
+/// Returns the first value of cookie `name` from the request headers, trimmed.
 ///
-/// This is a utility function for [`SessionDriver`](crate::session::SessionDriver)
-/// implementations that need to read cookies from request headers.
+/// For [`SessionDriver`](crate::session::SessionDriver) implementations reading
+/// cookies. The value is not unquoted or percent-decoded.
 pub fn get_cookie<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
     for value in headers.get_all(header::COOKIE) {
         let Ok(s) = value.to_str() else { continue };

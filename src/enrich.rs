@@ -45,11 +45,15 @@ use crate::{completed_login::CompletedLogin, session::SessionError};
 /// `Box::pin(async move { ... })`.
 ///
 /// A failed enrichment fails session creation: the callback responds with a
-/// 500 and no session is established. Build a [`SessionError`] with
-/// [`SessionError::new`] (a [`SessionErrorKind::Store`](crate::SessionErrorKind::Store) fault for a local
-/// mapping failure); a [`huskarl::core::Error`] from a `UserInfo` call converts
-/// with `?` directly. Enrichers that consider their data optional should catch
-/// their own errors and return a partially-populated session instead.
+/// 500 and no session is established. To signal failure:
+///
+/// - local mapping failure — build a [`SessionError`] with
+///   [`SessionError::new`] (a [`SessionErrorKind::Store`](crate::SessionErrorKind::Store) fault);
+/// - error from a `UserInfo` call — a [`huskarl::core::Error`] converts with `?`
+///   directly.
+///
+/// Enrichers that consider their data optional should instead catch their own
+/// errors and return a partially-populated session.
 ///
 /// # Mapping claims without I/O (the common case)
 ///

@@ -1,13 +1,18 @@
-//! Metrics observer trait for session cookie operations.
+//! Observer traits and result types for login and session-cookie metrics.
 //!
-//! [`SessionCookieMetrics`] is a zero-dependency sink that session stores call
-//! when they encrypt or decrypt a session cookie. Wire in a Prometheus (or
-//! other backend) implementation at construction time via the `metrics`
-//! builder setting on [`CookieSessionStore`](crate::CookieSessionStore) or
-//! [`StoreBackedSessionStore`](crate::StoreBackedSessionStore).
+//! Two zero-dependency observer traits let you wire a metrics backend
+//! (Prometheus, `StatsD`, OpenTelemetry, …) without this crate depending on one:
 //!
-//! Absent cookies are always silent — the metric fires only when a
-//! session-cookie-shaped value was present in the request.
+//! - [`LoginEngineMetrics`] observes login-flow events (start, complete,
+//!   refresh, teardown) on the [`LoginEngine`](crate::engine::LoginEngine).
+//! - [`SessionCookieMetrics`] observes session-cookie encrypt/decrypt on the
+//!   session stores.
+//!
+//! Result enums ([`LoginStartResult`], [`DecryptResult`], …) carry the outcome
+//! as a closed set of `&'static str` labels; [`normalize_as_error`] collapses an
+//! arbitrary error into one safe label so a hostile peer cannot blow up metric
+//! cardinality. Wire an implementation in via the `metrics` builder setting on
+//! the engine or a session store.
 
 use huskarl::core::platform::MaybeSendSync;
 
@@ -190,11 +195,15 @@ impl RefreshResult {
     }
 }
 
-/// Observer for [`LoginEngine`](crate::engine::LoginEngine) events.
+/// Observer for [`LoginEngine`](crate::engine::LoginEngine) login-flow events
+/// (start, complete, refresh, teardown).
 ///
 /// Implement this trait to record login-flow metrics to a backend of your
-/// choice. Attach an implementation via the `metrics` builder setting on
-/// [`LoginEngine`](crate::engine::LoginEngine).
+/// choice; attach an implementation via the `metrics` builder setting on
+/// [`LoginEngine`](crate::engine::LoginEngine). Methods are called inline on the
+/// request path, so they must not block — record and return. Label inputs are a
+/// closed set or pre-normalized (see [`normalize_as_error`]), so they are safe
+/// to use as metric labels directly.
 pub trait LoginEngineMetrics: MaybeSendSync + 'static {
     /// Record a login redirect attempt (browser redirected to authorization server).
     fn record_login_start(&self, result: &LoginStartResult);

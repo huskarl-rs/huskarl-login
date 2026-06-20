@@ -7,11 +7,12 @@
 
 use huskarl::{grant::core::TokenResponse, token::id_token::IdTokenClaims};
 
-/// The result of a successful login completion.
+/// The token response and validated identity claims from a completed login.
 ///
-/// Contains the token response and, when the authorization server returns an
-/// ID token (OIDC), the validated identity claims extracted from it.
-/// Non-standard claims are accessible via `claims.extra.get("…")`.
+/// Produced by the OAuth callback and consumed by session creation. Carries the
+/// token response and, when the authorization server returns an ID token (OIDC),
+/// the validated identity claims extracted from it. Non-standard claims are
+/// accessible via `claims.extra.get("…")`.
 #[derive(bon::Builder)]
 pub struct CompletedLogin {
     token_response: TokenResponse,
@@ -19,13 +20,14 @@ pub struct CompletedLogin {
 }
 
 impl CompletedLogin {
-    /// Returns the token response.
+    /// Returns the token response (access token, optional refresh token, and
+    /// any ID token).
     #[must_use]
     pub fn token_response(&self) -> &TokenResponse {
         &self.token_response
     }
 
-    /// Returns the validated ID token claims, if present.
+    /// Returns the validated ID token claims — present only for OIDC flows.
     #[must_use]
     pub fn id_token_claims(&self) -> Option<&IdTokenClaims> {
         self.id_token_claims.as_ref()

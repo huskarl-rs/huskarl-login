@@ -43,12 +43,13 @@ pub fn original_url(config: &LoginConfig, req_uri: &http::Uri) -> Option<String>
     let new_path = crate::config::join_base_path(base, stripped);
 
     // `base_url` is an `EndpointUrl`, so scheme and authority are guaranteed
-    // present by construction — no fallback needed.
-    let scheme = base.scheme_str().expect("base_url is absolute");
-    let authority = base
-        .authority()
-        .map(http::uri::Authority::as_str)
-        .expect("base_url is absolute");
+    // present by construction; the `else` is unreachable in practice.
+    let (Some(scheme), Some(authority)) = (
+        base.scheme_str(),
+        base.authority().map(http::uri::Authority::as_str),
+    ) else {
+        return None;
+    };
     Some(match req_uri.query() {
         Some(q) => format!("{scheme}://{authority}{new_path}?{q}"),
         None => format!("{scheme}://{authority}{new_path}"),
@@ -107,19 +108,16 @@ pub fn build_end_session_url(
 /// authority, and path. Used as the post-login fallback redirect when the
 /// original request URL cannot be reconstructed, and as the default
 /// post-logout redirect.
-///
-/// # Panics
-///
-/// Never in practice: `config.base_url` is an [`EndpointUrl`](huskarl::core::EndpointUrl),
-/// so its scheme and authority are guaranteed present by construction.
 pub fn base_url_as_string(config: &LoginConfig) -> String {
     let base = config.base_url.as_uri();
-    // `base_url` is an `EndpointUrl`: scheme and authority are guaranteed present.
-    let scheme = base.scheme_str().expect("base_url is absolute");
-    let authority = base
-        .authority()
-        .map(http::uri::Authority::as_str)
-        .expect("base_url is absolute");
+    // `base_url` is an `EndpointUrl`: scheme and authority are guaranteed present;
+    // the `else` (raw URI string) is unreachable in practice.
+    let (Some(scheme), Some(authority)) = (
+        base.scheme_str(),
+        base.authority().map(http::uri::Authority::as_str),
+    ) else {
+        return base.to_string();
+    };
     let path = base.path();
     if path.is_empty() || path == "/" {
         format!("{scheme}://{authority}/")

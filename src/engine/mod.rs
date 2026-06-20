@@ -357,10 +357,12 @@ fn unix_epoch() -> SystemTime {
 
 // ── LoginEngine ───────────────────────────────────────────────────────────────
 
-/// Framework-agnostic login engine.
+/// Framework-agnostic login engine: drives the OAuth flow (start, callback,
+/// logout) and persists sessions through its [`SessionDriver`] `SD`.
 ///
-/// See the [module documentation](self) for the set of primitives this
-/// engine exposes; framework adapters compose them into middleware.
+/// Build one with `LoginEngine::builder()`; framework adapters compose its
+/// primitives into middleware. See the [module documentation](self) for the
+/// full set of primitives.
 #[non_exhaustive]
 pub struct LoginEngine<SD> {
     /// The login configuration.
@@ -380,7 +382,7 @@ impl<SD> LoginEngine<SD>
 where
     SD: SessionDriver,
 {
-    /// Creates a new `LoginEngine`.
+    /// Builds a [`LoginEngine`]; invoked via `LoginEngine::builder()`.
     ///
     /// The `grant` drives the OAuth flow itself — PAR, JAR, `DPoP`, PKCE, and
     /// state/nonce generation all follow the grant's own configuration, and
@@ -846,8 +848,15 @@ where
         self.session_store.delete(session, request_headers).await
     }
 
-    /// Saves a session, returning `Set-Cookie` header values. See
-    /// [`persist_session`](Self::persist_session) for the role of `request_headers`.
+    /// Saves a session, returning `Set-Cookie` header values — an explicit,
+    /// unconditional save (e.g. after the application mutated the session), as
+    /// opposed to the deferred [`persist_session`](Self::persist_session) owed by
+    /// a [`LoadedSession::ActivePending`].
+    ///
+    /// See [`persist_session`](Self::persist_session) for the role of
+    /// `request_headers`. As there, the returned values may carry a re-sealed
+    /// session cookie, so the response must not be cached by shared caches — see
+    /// [`load_session`](Self::load_session)'s *Response caching* note.
     ///
     /// # Errors
     ///

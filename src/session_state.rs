@@ -130,9 +130,8 @@ impl SessionState {
 /// [`set_state`](Self::set_state) for replacement. All others have default
 /// implementations.
 ///
-/// State is never mutated through interior references. Event methods produce
-/// a new [`SessionState`] value and set it back via `set_state`, matching
-/// the load->transform->save model needed for distributed session stores.
+/// State is immutable: events go through `set_state`, never interior mutation —
+/// see [`SessionState`] for the load→transform→save model.
 pub trait Session {
     /// Returns a shared reference to the embedded [`SessionState`].
     fn state(&self) -> &SessionState;

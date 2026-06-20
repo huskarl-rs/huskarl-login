@@ -295,13 +295,10 @@ impl<C: CookiePayload> CookieSessionStore<C> {
         let cipher_match = kid
             .as_deref()
             .map(|k| CipherMatch::builder().kid(k).build());
-        let Some(plaintext) = unseal_with_kid_fallback(
-            &self.sealer.cipher,
-            cipher_match.as_ref(),
-            &bundle,
-            b"session",
-        )
-        .await
+        let aad = self.sealer.aad("session");
+        let Some(plaintext) =
+            unseal_with_kid_fallback(&self.sealer.cipher, cipher_match.as_ref(), &bundle, &aad)
+                .await
         else {
             self.sealer
                 .record_decrypt(kid.as_deref(), &DecryptResult::DecryptFailed);
@@ -378,10 +375,11 @@ impl<C: CookiePayload> CookieSessionStore<C> {
     ) -> Result<Vec<HeaderValue>, SessionError> {
         let payload =
             encode_payload(session).map_err(|e| SessionError::new(SessionErrorKind::Store, e))?;
+        let aad = self.sealer.aad("session");
         let bundle = self
             .sealer
             .cipher
-            .seal(&payload, b"session")
+            .seal(&payload, &aad)
             .await
             .map_err(|e| SessionError::new(SessionErrorKind::Crypto, e))?;
         // Read the active key's identity from the same cipher that just sealed
@@ -878,7 +876,10 @@ mod tests {
         let store = multi_key_store().await;
         let foreign = AeadV1Cipher::new(aes_key_with_kid("v9", 9).await);
         let payload = crate::cookie::encode_payload(&CookieSession(test_state())).unwrap();
-        let bundle = foreign.seal(&payload, b"session").await.unwrap();
+        let bundle = foreign
+            .seal(&payload, &store.sealer.aad("session"))
+            .await
+            .unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::COOKIE,
@@ -891,6 +892,48 @@ mod tests {
             .unwrap(),
         );
         assert!(store.load_session(&headers).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_value_is_bound_to_its_cookie_name() {
+        // F1: the session AAD binds the cookie name, so a value sealed for one
+        // cookie context cannot be unsealed by another that shares the AEAD key
+        // but uses a different cookie name.
+        let cipher: Arc<dyn AeadCipher> = Arc::new(test_cipher().await);
+        let sealer_a = CookieSealer::new(
+            cipher.clone(),
+            "app_a".parse().unwrap(),
+            "/".parse().unwrap(),
+            DEFAULT_COOKIE_MAX_AGE,
+            None,
+        );
+        let sealer_b = CookieSealer::new(
+            cipher.clone(),
+            "app_b".parse().unwrap(),
+            "/".parse().unwrap(),
+            DEFAULT_COOKIE_MAX_AGE,
+            None,
+        );
+
+        let bundle = sealer_a
+            .cipher
+            .seal(b"a session payload", &sealer_a.aad("session"))
+            .await
+            .unwrap();
+
+        // Same key, different cookie name → the AAD differs, so it must not unseal.
+        assert!(
+            unseal_with_kid_fallback(&sealer_b.cipher, None, &bundle, &sealer_b.aad("session"))
+                .await
+                .is_none(),
+            "a session sealed for app_a must not unseal under app_b's cookie name"
+        );
+        // Sanity: it unseals under its own cookie name.
+        assert!(
+            unseal_with_kid_fallback(&sealer_a.cipher, None, &bundle, &sealer_a.aad("session"))
+                .await
+                .is_some(),
+        );
     }
 
     #[tokio::test]
@@ -1494,7 +1537,7 @@ mod tests {
         // Seal garbage bytes under the session AAD — AEAD passes but CBOR
         // deserialization of CookieSession fails, exercising PayloadInvalid.
         let bundle = AeadV1Cipher::new(test_cipher().await)
-            .seal(b"not cbor", b"session")
+            .seal(b"not cbor", &store.sealer.aad("session"))
             .await
             .unwrap();
         let encoded = URL_SAFE_NO_PAD.encode(&bundle);

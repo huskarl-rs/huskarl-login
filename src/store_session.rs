@@ -32,7 +32,8 @@ use crate::{
     session_state::{Session, SessionState},
 };
 
-/// Trait for external session data stores (Redis, database, etc.).
+/// Backs session data with a durable store (Redis, SQL, …) — the persistence
+/// half of a [`StoreBackedSessionStore`].
 ///
 /// This trait is **pure storage**: insert, load, save, touch, delete. The
 /// cookie mechanics (pointer cookie encryption, session key generation) are
@@ -127,8 +128,7 @@ pub trait ExternalSessionStore: MaybeSendSync {
     /// - Mongo: `findOneAndUpdate({key, version}, {$set, $inc: {version: 1}})`.
     /// - Redis: `WATCH` the key (or a small Lua CAS).
     ///
-    /// The version is compared by **equality only** (never ordered), so a
-    /// `version + 1` that wraps is harmless — see
+    /// The version is compared by **equality only** — see
     /// [`PersistedSessionState::version`].
     fn compare_and_swap(
         &self,
@@ -136,7 +136,12 @@ pub trait ExternalSessionStore: MaybeSendSync {
         expected: i32,
     ) -> impl Future<Output = Result<SaveOutcome, Self::Error>> + MaybeSend;
 
-    /// Delete a session.
+    /// Deletes the session's stored record. Idempotent: a missing record is
+    /// `Ok(())`, not an error.
+    ///
+    /// Keyed off the embedded session key, like the other methods. The framework
+    /// owns pointer-cookie and liveness teardown, so an implementation need only
+    /// drop its own record.
     fn delete(
         &self,
         session: &Self::SessionType,
@@ -256,8 +261,8 @@ fn generate_session_key() -> Uuid {
     Uuid::now_v7()
 }
 
-/// Attempts an optimistic [`update`](StoreBackedSessionStore::update) makes
-/// before giving up with [`VersionConflict`]. Five absorbs realistic
+/// Number of attempts an optimistic [`update`](StoreBackedSessionStore::update)
+/// makes before giving up with [`VersionConflict`]. Five absorbs realistic
 /// contention; sustained failure past it signals a hot key worth surfacing.
 const UPDATE_MAX_ATTEMPTS: u32 = 5;
 
@@ -501,10 +506,11 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         &self,
         session_key: Uuid,
     ) -> Result<Vec<HeaderValue>, SessionError> {
+        let aad = self.sealer.aad("session_ptr");
         let bundle = self
             .sealer
             .cipher
-            .seal(session_key.as_bytes(), b"session_ptr")
+            .seal(session_key.as_bytes(), &aad)
             .await
             .map_err(to_session_err)?;
         // See cookie_session.rs for the rationale on reading `key_id()` from
@@ -538,13 +544,10 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         let cipher_match = kid
             .as_deref()
             .map(|k| CipherMatch::builder().kid(k).build());
-        let Some(plaintext) = unseal_with_kid_fallback(
-            &self.sealer.cipher,
-            cipher_match.as_ref(),
-            &bundle,
-            b"session_ptr",
-        )
-        .await
+        let aad = self.sealer.aad("session_ptr");
+        let Some(plaintext) =
+            unseal_with_kid_fallback(&self.sealer.cipher, cipher_match.as_ref(), &bundle, &aad)
+                .await
         else {
             self.sealer
                 .record_decrypt(kid.as_deref(), &DecryptResult::DecryptFailed);
@@ -1694,7 +1697,7 @@ mod tests {
         // Seal 17 bytes under session_ptr AAD — AEAD passes but the UUID
         // conversion ([u8; 16]) fails, exercising PayloadInvalid.
         let bundle = AeadV1Cipher::new(test_cipher().await)
-            .seal(&[0u8; 17], b"session_ptr")
+            .seal(&[0u8; 17], &store.sealer.aad("session_ptr"))
             .await
             .unwrap();
         let encoded = URL_SAFE_NO_PAD.encode(&bundle);
