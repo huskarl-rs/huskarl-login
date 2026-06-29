@@ -1,5 +1,4 @@
-//! `redirect_to_as` — start (or restart) the OAuth flow by redirecting the
-//! user to the authorization server.
+//! `redirect_to_as` — start the OAuth flow by redirecting to the AS.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::{HeaderValue, Uri};
@@ -44,8 +43,8 @@ where
         })
     }
 
-    /// Serializes the login-state payload, seals it under AEAD (with `state`
-    /// as associated data), and returns the `Set-Cookie` header value.
+    /// Seals the login-state payload under AEAD (`state` as associated data)
+    /// and returns the `Set-Cookie` value.
     async fn build_login_state_cookie(
         &self,
         state: &str,

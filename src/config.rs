@@ -1,9 +1,7 @@
 //! Login flow configuration.
 //!
-//! [`LoginConfig`] holds the settings that govern how the login middleware
-//! handles the OAuth 2.0 Authorization Code Grant: callback and logout paths,
-//! cookie attributes, session lifetime policies, and URL reconstruction for
-//! proxied deployments.
+//! [`LoginConfig`] holds the settings governing the OAuth 2.0 Authorization
+//! Code Grant login middleware.
 
 use std::time::Duration;
 
@@ -16,35 +14,16 @@ use crate::{
     engine::{is_cross_site_request, is_navigation_request},
 };
 
-/// Which requests count as user "activity" for server-side liveness tracking.
-///
-/// Idle timeout should approximate "the human stopped interacting," but not
-/// every authenticated request reflects a human: background polling, prefetch,
-/// service-worker fetches, and cross-site embeds all generate traffic that
-/// would otherwise keep an abandoned session alive. This policy classifies each
-/// request — from its fetch-metadata headers — as activity or not; only
-/// activity advances `last_active`. Idle *expiry* is enforced on every request
-/// regardless of this policy.
-///
-/// Defaults to [`FirstParty`](Self::FirstParty).
+/// Which requests count as user activity for liveness tracking; only activity
+/// advances `last_active` (idle expiry runs regardless). Classified from
+/// fetch-metadata headers. Defaults to [`FirstParty`](Self::FirstParty).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ActivityPolicy {
-    /// Only top-level browser navigations count (`Sec-Fetch-Mode: navigate` or
-    /// `Sec-Fetch-Dest: document`). Tightest idle semantics — suitable for
-    /// multi-page apps, but breaks fetch-driven SPAs: an active user who only
-    /// triggers XHR/fetch generates no navigations and would idle out.
+    /// Only top-level browser navigations count.
     NavigationsOnly,
-    /// First-party requests count: everything *except* cross-site requests that
-    /// are not themselves top-level navigations. Excludes cross-site embeds,
-    /// beacons, and other origins' CORS calls, while still counting same-origin
-    /// SPA fetches and genuine inbound link navigations. Requests without
-    /// fetch-metadata (older clients, non-browser agents) are treated as
-    /// first-party and count.
-    ///
-    /// Note: this cannot distinguish same-origin background polling from human
-    /// interaction — the browser sends no user-activation signal on fetch — so
-    /// a continuously-polling SPA still registers as active.
+    /// Everything except cross-site requests that are not top-level
+    /// navigations. Requests without fetch-metadata count as first-party.
     #[default]
     FirstParty,
     /// Every authenticated request counts as activity.
@@ -52,8 +31,7 @@ pub enum ActivityPolicy {
 }
 
 impl ActivityPolicy {
-    /// Returns whether a request with these headers should advance the
-    /// session's `last_active` timestamp under this policy.
+    /// Returns whether a request with these headers advances `last_active`.
     #[must_use]
     pub fn counts_as_activity(self, headers: &HeaderMap) -> bool {
         match self {
@@ -116,8 +94,7 @@ pub enum ConfigError {
         /// Why the prefix was rejected.
         reason: &'static str,
     },
-    /// A duration setting holds a nonsensical value (e.g. zero, or a refresh
-    /// margin that meets or exceeds the assumed token lifetime).
+    /// A duration setting holds an invalid value (e.g. zero).
     #[snafu(display("invalid {field}: {reason}"))]
     InvalidDuration {
         /// The name of the offending field.
@@ -127,40 +104,19 @@ pub enum ConfigError {
     },
 }
 
-/// A validated request path or path prefix: cookie- and header-safe by
-/// construction.
-///
-/// A `RoutePath` is guaranteed to start with `/` and to contain no `?`, `#`,
-/// `;`, or ASCII control characters — the shapes that are safe to interpolate
-/// into URLs, cookie `Path` scopes, and `Set-Cookie` values. The
-/// control-character guarantee in particular is defense-in-depth against header
-/// injection. Code holding a `RoutePath` can rely on the invariant without
-/// re-checking: it is established once, when the value is validated by
-/// [`LoginConfig::builder`] or [`LogoutConfig::builder`].
-///
-/// This is the relative-path counterpart to
-/// [`huskarl::core::EndpointUrl`](huskarl::core::EndpointUrl), which carries the
-/// absolute-URL invariant for authorization-server endpoints.
+/// A validated request path or path prefix, cookie- and header-safe by
+/// construction: starts with `/` and contains no `?`, `#`, `;`, or ASCII
+/// control characters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutePath(String);
 
 impl RoutePath {
-    /// Validates `path` and wraps it.
-    ///
-    /// Rejects a path that does not start with `/`, that contains `?`, `#`, or
-    /// `;`, or that contains ASCII control characters (CR/LF/NUL/etc). The
-    /// control-char check is defense-in-depth against header-injection attempts
-    /// via misconfigured paths later interpolated into `Set-Cookie` values.
-    ///
-    /// This is the public constructor used wherever a cookie-safe path is
-    /// supplied directly — e.g. the `cookie_path` of
-    /// [`CookieSessionStore`](crate::CookieSessionStore) and
-    /// [`StoreBackedSessionStore`](crate::StoreBackedSessionStore).
+    /// Validates `path` (must start with `/`; no `?`, `#`, `;`, or control
+    /// chars) and wraps it.
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidRoutePath`] naming the offending value and why it was
-    /// rejected.
+    /// Returns [`InvalidRoutePath`] with the offending value and reason.
     pub fn new(path: impl Into<String>) -> Result<Self, InvalidRoutePath> {
         let path = path.into();
         if !path.starts_with('/') {
@@ -184,8 +140,7 @@ impl RoutePath {
         Ok(Self(path))
     }
 
-    /// Validates `path`, mapping a rejection through `make_error` to the
-    /// caller-appropriate [`ConfigError`] variant.
+    /// Validates `path`, mapping a rejection through `make_error`.
     fn validated(
         path: String,
         make_error: impl FnOnce(String, &'static str) -> ConfigError,
@@ -259,10 +214,8 @@ impl PartialEq<&str> for RoutePath {
     }
 }
 
-/// Joins the path component of an absolute base URL with a trailing path
-/// `segment`, inserting exactly one `/` between them. Shared by
-/// [`compute_browser_callback_path`] and original-URL reconstruction (see
-/// [`crate::url::original_url`]) so the two stay consistent.
+/// Joins the path component of `base_url` with `segment`, inserting exactly
+/// one `/` between them.
 pub(crate) fn join_base_path(base_url: &http::Uri, segment: &str) -> String {
     let base_path = base_url.path().trim_end_matches('/');
     if segment.starts_with('/') {
@@ -272,12 +225,7 @@ pub(crate) fn join_base_path(base_url: &http::Uri, segment: &str) -> String {
     }
 }
 
-/// Validates the lifetime/interval settings against each other. A zero value
-/// silently breaks the flow it governs (`default_token_lifetime` /
-/// `login_state_ttl` of zero expire on issue, `Some(ZERO)` `max_lifetime` locks
-/// every session out immediately), and a refresh margin at or above the assumed
-/// token lifetime classifies tokens as expiring the instant they're issued —
-/// refreshing on every request.
+/// Validates the lifetime/interval settings against each other.
 fn validate_durations(
     max_lifetime: Option<Duration>,
     token_refresh_margin: Duration,
@@ -309,12 +257,8 @@ fn validate_durations(
     Ok(())
 }
 
-/// Computes the browser-facing callback path used for cookie scoping: the
-/// `base_url` path joined to `callback_path` with `strip_prefix` removed.
-///
-/// `LoginConfig::new` has already rejected a `callback_path` that doesn't
-/// start with `strip_prefix`, so the `unwrap_or` fallback is unreachable —
-/// kept only for totality.
+/// Computes the browser-facing callback path: `base_url` path joined to
+/// `callback_path` with `strip_prefix` removed.
 fn compute_browser_callback_path(
     callback_path: &RoutePath,
     strip_prefix: Option<&RoutePath>,
@@ -330,82 +274,40 @@ fn compute_browser_callback_path(
     join_base_path(base_url, stripped_callback)
 }
 
-/// Logout endpoint configuration.
-///
-/// Grouped under [`LoginConfig::logout`] so the dependency is structural: an
-/// end-session endpoint or post-logout redirect cannot be configured without
-/// the logout endpoint they belong to.
-///
-/// The `path` shape is validated eagerly by [`builder`](Self::builder); the
-/// remaining checks (absolute redirect URI, `strip_prefix` consistency) happen
-/// when the value is passed to [`LoginConfig::builder`].
+/// Logout endpoint configuration. Grouped under [`LoginConfig::logout`].
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct LogoutConfig {
     /// Path at which the logout endpoint is mounted (e.g. `"/logout"`).
-    ///
-    /// Requests to this path clear the local session and redirect: to
-    /// [`end_session_endpoint`](Self::end_session_endpoint) when configured,
-    /// otherwise to
-    /// [`post_logout_redirect_uri`](Self::post_logout_redirect_uri) (or
-    /// `base_url` when that is also absent).
     pub path: RoutePath,
     /// Authorization server's end-session endpoint for RP-initiated logout
     /// (OIDC RP-Initiated Logout 1.0).
-    ///
-    /// When set, the logout endpoint redirects here after deleting the local
-    /// session. The request includes the `client_id` (from the grant, so the
-    /// OP can identify this RP and validate the redirect target) and an
-    /// `id_token_hint` when the session holds an ID token; the
-    /// `post_logout_redirect_uri` is appended when configured.
-    ///
-    /// Typically available as the `end_session_endpoint` field in the
-    /// authorization server's discovery document.
     pub end_session_endpoint: Option<EndpointUrl>,
-    /// Absolute URI to redirect to after the local session is cleared.
-    ///
-    /// Sent as the `post_logout_redirect_uri` query parameter when
-    /// redirecting to `end_session_endpoint`. When no `end_session_endpoint`
-    /// is set, used as the redirect target directly. When `None`, defaults
-    /// to `base_url`.
-    ///
-    /// # Must be registered at the authorization server
-    ///
-    /// Per OIDC RP-Initiated Logout 1.0 §3, the OP performs post-logout
-    /// redirection only if this value *exactly matches* one of the RP's
-    /// previously registered `post_logout_redirect_uris`. Register it — and
-    /// the `base_url` default, if you rely on it — at the authorization
-    /// server, or the OP will drop the redirect and strand the user on its own
-    /// logout page, regardless of the `client_id` / `id_token_hint` the engine
-    /// sends.
-    ///
-    /// Held as the exact string supplied, not a parsed [`Uri`](http::Uri):
-    /// parsing normalizes (e.g. appends a trailing `/` to an authority-only
-    /// URL, drops a fragment), which would defeat the byte-exact match the OP
-    /// requires. This mirrors how the grant stores its `redirect_uri`.
+    /// Absolute URI to redirect to after the local session is cleared; defaults
+    /// to `base_url`. Held as the exact string supplied, as the OP matches it
+    /// byte-for-byte (OIDC RP-Initiated Logout 1.0 §3): it (and the `base_url`
+    /// default, if relied on) must be registered at the authorization server,
+    /// or the OP silently drops the redirect and strands the user on its logout
+    /// page.
     pub post_logout_redirect_uri: Option<String>,
 }
 
 #[bon::bon]
 impl LogoutConfig {
-    /// Creates a logout configuration, validating the `path` shape and that
-    /// `end_session_endpoint`, when set, is an absolute URL.
+    /// Creates a logout configuration, validating the `path` shape.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::InvalidLogoutPath`] if `path` does not start with
-    /// `/`, or contains `?`, `#`, `;`, or ASCII control characters.
+    /// Returns [`ConfigError::InvalidLogoutPath`] if `path` is malformed.
     #[builder]
     pub fn new(
         /// Path at which the logout endpoint is mounted (e.g. `"/logout"`).
         #[builder(into)]
         path: String,
         /// Authorization server's end-session endpoint for RP-initiated logout.
-        /// An [`EndpointUrl`], so its absolute-URL invariant (scheme +
-        /// authority) is established when the value is built.
         end_session_endpoint: Option<EndpointUrl>,
         /// Absolute URL to redirect to after logout, preserved exactly as
-        /// supplied for the OP's byte-exact match. Defaults to `base_url`.
+        /// supplied. Defaults to `base_url`.
         #[builder(into)]
         post_logout_redirect_uri: Option<String>,
     ) -> Result<Self, ConfigError> {
@@ -421,25 +323,11 @@ impl LogoutConfig {
     }
 }
 
-/// Configuration for the login middleware.
-///
-/// Authorization server endpoints, client credentials, and redirect URI are
-/// configured on the
+/// Configuration for the login middleware; constructed via
+/// [`builder`](Self::builder). Authorization server endpoints, client
+/// credentials, and redirect URI are configured on the
 /// [`AuthorizationCodeGrant`](huskarl::grant::authorization_code::AuthorizationCodeGrant)
 /// directly.
-///
-/// Cookie naming and the `Path` attribute for session cookies are the
-/// responsibility of the [`SessionDriver`](crate::session::SessionDriver)
-/// implementation — see the `cookie_path` builder setting on
-/// [`CookieSessionStore`](crate::CookieSessionStore) and
-/// [`StoreBackedSessionStore`](crate::StoreBackedSessionStore). Login-state
-/// cookies are scoped automatically to
-/// [`browser_callback_path`](Self::browser_callback_path).
-///
-/// This struct is `#[non_exhaustive]`: it can only be constructed through
-/// [`builder`](Self::builder), so a value of this type always carries the
-/// builder's validation as an invariant (cookie-safe paths, absolute URLs,
-/// `strip_prefix` consistency, derived `browser_callback_path`).
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct LoginConfig {
@@ -447,115 +335,52 @@ pub struct LoginConfig {
     pub callback_path: RoutePath,
     /// OAuth 2.0 scopes to request (e.g. `vec!["openid".to_owned()]`).
     pub scopes: Vec<String>,
-    /// Whether to set the `Secure` flag (and `__Host-`/`__Secure-` cookie name
-    /// prefixes) on the cookies this deployment issues.
-    ///
-    /// Not set directly — **derived** from [`base_url`](Self::base_url): `true`
-    /// when its scheme is `https`, `false` for `http`. The `Secure` attribute
-    /// and `__Host-` prefix are statements about the browser-facing connection,
-    /// which is exactly what `base_url`'s scheme describes, so this is the
-    /// single source of truth. The engine stamps the same value onto the
-    /// session store at construction (see
-    /// [`SessionDriver::apply_cookie_secure`](crate::SessionDriver::apply_cookie_secure)),
-    /// so login-state and session cookies can never disagree.
-    ///
-    /// Use an `http://` base URL for local development; it yields unprefixed,
-    /// non-`Secure` cookies that the browser will send over plain HTTP.
+    /// Whether to set the `Secure` flag and `__Host-`/`__Secure-` cookie name
+    /// prefixes. Derived from [`base_url`](Self::base_url): `true` when its
+    /// scheme is `https`.
     pub secure: bool,
-    /// Absolute session cap. Sessions older than this are expired regardless
-    /// of activity. `None` means no limit.
-    ///
-    /// This is the only lifetime bound enforced for cookie sessions. Idle
-    /// timeout is server-side only and configured separately on the liveness
-    /// store — see [`LivenessConfig`](crate::LivenessConfig) and
-    /// [`StoreBackedSessionStore::with_liveness`](crate::StoreBackedSessionStore::with_liveness).
+    /// Absolute session cap; sessions older than this expire regardless of
+    /// activity. `None` means no limit. The only lifetime bound for cookie
+    /// sessions; idle timeout is configured on the liveness store.
     pub max_lifetime: Option<Duration>,
-    /// Which requests count as user activity for server-side liveness tracking.
-    ///
-    /// Only affects sessions with a liveness store; idle expiry is always
-    /// enforced regardless. Defaults to [`ActivityPolicy::FirstParty`].
+    /// Which requests count as user activity. Only affects sessions with a
+    /// liveness store. Defaults to [`ActivityPolicy::FirstParty`].
     pub activity_policy: ActivityPolicy,
-    /// How early to refresh before actual token expiry.
-    ///
-    /// When a request arrives within this margin of the access token's expiry,
-    /// the middleware will attempt a token refresh (if a refresh token is available).
-    ///
-    /// Defaults to 30 seconds.
+    /// How early to refresh before token expiry. Defaults to 30 seconds.
     pub token_refresh_margin: Duration,
-    /// Lifetime assumed when the authorization server's token response omits
-    /// `expires_in`. The session's `token_expiry` is computed as
-    /// `received_at + default_token_lifetime` in that case.
-    ///
-    /// Defaults to 1 hour.
+    /// Lifetime assumed when the token response omits `expires_in`. Defaults
+    /// to 1 hour.
     pub default_token_lifetime: Duration,
-    /// Lifetime of the per-flow login-state cookie set during the redirect to
-    /// the authorization server.
-    ///
-    /// The user has this long to complete authentication (including any IdP-side
-    /// MFA prompts, tenant pickers, or password resets) before the callback
-    /// will fail with a missing-state error.
-    ///
-    /// This is also what bounds the accumulation of abandoned flows: each
-    /// login redirect sets a per-flow cookie named by its `state` (scoped to
-    /// the callback path) with `Max-Age` set to this TTL, so a tab the user
-    /// never completes clears itself from the browser within this window.
-    /// There is no separate server-side cap — the `Max-Age` is the bound.
-    ///
-    /// Defaults to 600 seconds (10 minutes).
+    /// Lifetime (and `Max-Age`) of the per-flow login-state cookie; the user
+    /// has this long to complete authentication. Defaults to 10 minutes.
     pub login_state_ttl: Duration,
-    /// Canonical client-facing base URL of this application
-    /// (e.g. `"https://app.example.com"` or `"https://app.example.com/base"`).
-    ///
-    /// Used to construct the absolute URL to redirect back to after login,
-    /// using the scheme and authority from `base_url` with the request path
-    /// appended (after stripping `strip_prefix` if configured). This is
-    /// necessary when a front proxy rewrites URLs before they reach this proxy.
-    ///
-    /// Held as an [`EndpointUrl`], so its absolute-URL invariant (scheme +
-    /// authority present) is carried in the type — the reconstruction code in
-    /// [`crate::url`] relies on it rather than re-checking.
+    /// Canonical client-facing base URL (e.g. `"https://app.example.com"`),
+    /// used to reconstruct the post-login redirect URL behind a front proxy.
     pub base_url: EndpointUrl,
-    /// Path prefix added by a front proxy that is not part of the
-    /// client-facing URL (e.g. `"/internal"`).
-    ///
-    /// Stripped from the request path before constructing the original URL.
-    /// Only used when `base_url` is set.
+    /// Path prefix added by a front proxy, stripped from the request path
+    /// before constructing the original URL (e.g. `"/internal"`).
     pub strip_prefix: Option<RoutePath>,
     /// Logout endpoint configuration. When `None`, no logout endpoint is
-    /// mounted — and structurally, no logout-dependent settings (end-session
-    /// endpoint, post-logout redirect) can exist without it.
+    /// mounted.
     pub logout: Option<LogoutConfig>,
-    /// Prefix for login-state cookie names. Defaults to `"huskarl_login"`.
-    ///
-    /// The full cookie name is `{security_prefix}{login_cookie_prefix}_{state}`,
-    /// where `security_prefix` is `__Host-` or `__Secure-` when `secure` is
-    /// enabled. Change this to avoid conflicts with other apps on the same domain.
-    ///
-    /// A [`CookieName`](crate::CookieName) — a cookie-name fragment — so its
-    /// `[A-Za-z0-9_-]` invariant is carried in the type and shared with the
-    /// session stores' `cookie_name` rather than re-checked here.
+    /// Prefix for login-state cookie names. The full name is
+    /// `{security_prefix}{login_cookie_prefix}_{state}`. Defaults to
+    /// `"huskarl_login"`.
     pub login_cookie_prefix: CookieName,
-    /// The browser-facing callback path, computed from `base_url`, `strip_prefix`,
-    /// and `callback_path`. Used as the `Path` attribute on login-state cookies
-    /// so they are scoped to only the callback endpoint.
-    ///
-    /// A [`RoutePath`], so its cookie-safety (no `;`/control chars) is carried
-    /// in the type: the builder validates the derived value once, and the
-    /// engine interpolates it into `Set-Cookie` without re-checking.
+    /// Browser-facing callback path, derived from `base_url`, `strip_prefix`,
+    /// and `callback_path`; used as the `Path` scope on login-state cookies.
     pub browser_callback_path: RoutePath,
 }
 
 #[bon::bon]
 impl LoginConfig {
-    /// Builds a [`LoginConfig`] from individual settings, validating paths and
-    /// the `base_url`.
+    /// Builds a [`LoginConfig`], validating paths and the `base_url`.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] if any path is malformed (must start with `/`,
-    /// must not contain `?`, `#`, `;`, or ASCII control characters) or if the
-    /// cookie `Path` derived from `base_url` and `callback_path` is not
-    /// cookie-safe.
+    /// Returns [`ConfigError`] if any path is malformed, the durations are
+    /// invalid, or the cookie `Path` derived from `base_url` and
+    /// `callback_path` is not cookie-safe.
     #[builder]
     pub fn new(
         /// Path at which the callback endpoint is mounted (e.g. `"/callback"`).
@@ -564,11 +389,11 @@ impl LoginConfig {
         scopes: Vec<String>,
         /// Absolute session cap. `None` means no limit.
         max_lifetime: Option<Duration>,
-        /// Which requests count as user activity for liveness. Defaults to
+        /// Which requests count as user activity. Defaults to
         /// [`ActivityPolicy::FirstParty`].
         #[builder(default)]
         activity_policy: ActivityPolicy,
-        /// How early to refresh before actual token expiry. Defaults to 30 seconds.
+        /// How early to refresh before token expiry. Defaults to 30 seconds.
         #[builder(default = Duration::from_secs(30))]
         token_refresh_margin: Duration,
         /// Lifetime assumed when the token response omits `expires_in`.
@@ -579,10 +404,8 @@ impl LoginConfig {
         #[builder(default = Duration::from_mins(10))]
         login_state_ttl: Duration,
         /// Canonical client-facing base URL (e.g. `"https://app.example.com"`).
-        /// An [`EndpointUrl`], so its absolute-URL invariant (scheme +
-        /// authority) is established when the value is built.
         base_url: EndpointUrl,
-        /// Path prefix added by a front proxy to strip before constructing the original URL.
+        /// Front-proxy path prefix to strip before reconstructing the URL.
         #[builder(into)]
         strip_prefix: Option<String>,
         /// Logout endpoint configuration. When `None`, no logout endpoint is

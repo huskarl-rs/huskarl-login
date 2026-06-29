@@ -4,50 +4,35 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
+// Tests legitimately unwrap/expect/panic; the denies above guard library code only.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 #![warn(clippy::pedantic)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-//! Shared login core for huskarl framework integrations.
+//! Framework-agnostic login core shared by `huskarl-axum` and
+//! `huskarl-pingora`: configuration, session drivers, session enrichment,
+//! cookie and URL helpers, and session store traits.
 //!
-//! This crate contains the framework-agnostic login logic shared by
-//! `huskarl-axum` and `huskarl-pingora`: configuration, session drivers,
-//! session enrichment, cookie helpers, URL helpers, and session store traits.
-//! The OAuth flow itself is driven by a
-//! [`huskarl::grant::authorization_code::AuthorizationCodeGrant`], passed
-//! directly to the [`engine::LoginEngine`].
-//!
-//! # Session model
-//!
-//! Session creation follows one model regardless of where sessions live: the
-//! framework prepares a *seed* ([`SessionState`], plus the session key for
-//! store-backed sessions), a [`SessionEnricher`] builds the application's
-//! session type from the seed and the [`CompletedLogin`] (mapping ID token
-//! claims, calling the OIDC `UserInfo` endpoint, …), and the chosen backend
-//! stores it:
-//!
-//! - [`CookieSessionStore`] seals the session into chunked, AEAD-encrypted
-//!   browser cookies — no server-side storage.
-//! - [`StoreBackedSessionStore`] keeps an encrypted pointer cookie and
-//!   persists the session via an [`ExternalSessionStore`] (Redis, a
-//!   database, …).
-//!
-//! The default enricher, [`NoEnrichment`], converts the seed straight into
-//! the session type via `From`; pass a custom one to the store builders'
-//! `build_with_enricher` finisher.
-//!
-//! The canonical [`SessionDriver`] interface returns `Vec<HeaderValue>` from
-//! mutating methods (`save`, `touch`, `delete`). Framework crates that need a
-//! different interface (e.g. Pingora's `&mut ResponseHeader`) adapt with a
-//! small helper that appends the returned headers.
-//!
-//! # Platform support
+//! The OAuth flow is driven by a
+//! [`huskarl::grant::authorization_code::AuthorizationCodeGrant`] passed to the
+//! [`engine::LoginEngine`]. A [`SessionEnricher`] builds the application's
+//! session type from a framework-prepared seed and the [`CompletedLogin`]; the
+//! session is then stored by a [`CookieSessionStore`] (sealed into AEAD
+//! browser cookies) or a [`StoreBackedSessionStore`] (persisted via an
+//! [`ExternalSessionStore`] behind a pointer cookie).
 //!
 //! Trait bounds use `huskarl::core::platform`'s `MaybeSend` / `MaybeSendSync`
-//! markers rather than bare `Send` / `Sync`: on native targets they are
-//! equivalent to `Send + Sync`, while on `wasm32` (assumed single-threaded)
-//! the requirement disappears. Time and sleeping likewise go through
-//! `huskarl::core::platform`, so the crate compiles for
-//! `wasm32-unknown-unknown` and WASI targets.
+//! markers, so the crate also compiles for `wasm32` and WASI targets.
+//!
+//! # Guides and explanation
+//!
+//! The API items here are the reference docs. For task-oriented how-to guides
+//! (enrichment, implementing an external store, refresh-token rotation) and
+//! design explanation (the session model, liveness, cookie security), see the
+//! [`_docs`] module.
+
+#[cfg(any(doc, docsrs))]
+pub mod _docs;
 
 pub mod cookie;
 pub mod engine;

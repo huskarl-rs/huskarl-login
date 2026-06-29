@@ -1,9 +1,4 @@
-//! Error page rendering for the login flow.
-//!
-//! The [`ErrorPage`] trait lets you customise the HTML shown when the login
-//! middleware encounters an error (session load failure, token exchange failure,
-//! etc.). [`DefaultErrorPage`] provides a minimal, self-contained page with
-//! XSS-safe output.
+//! Error page rendering: the [`ErrorPage`] trait and built-in [`DefaultErrorPage`].
 
 use bytes::Bytes;
 use http::StatusCode;
@@ -19,32 +14,16 @@ pub struct ErrorPageResponse {
 
 /// Renders error pages for the login middleware.
 ///
-/// The default implementation ([`DefaultErrorPage`]) produces minimal,
-/// self-contained HTML. Implement this trait to customise the look of error
-/// pages served during the login flow.
-///
 /// # Security
 ///
-/// `message` can contain **attacker-controlled content**. In particular,
-/// when the authorization server returns an error response to the callback,
-/// the `error_description` query parameter — which anyone can put in a
-/// request to the callback URL — is included verbatim. Implementations MUST
-/// treat `message` as untrusted data and escape it for whatever output
-/// context they render into (HTML-entity escaping for HTML bodies, as
-/// [`DefaultErrorPage`] does), or reflected XSS is possible.
+/// `message` is attacker-controllable (e.g. the callback's `error_description`).
+/// Implementations MUST escape it for their output context or risk reflected XSS.
 pub trait ErrorPage: MaybeSendSync {
-    /// Render an error page for the given HTTP status and human-readable
-    /// message.
-    ///
-    /// `message` is untrusted input — see the [trait docs](ErrorPage#security)
-    /// for the escaping requirement.
+    /// Render an error page for the given HTTP status and (untrusted) message.
     fn render(&self, status: StatusCode, message: &str) -> ErrorPageResponse;
 }
 
-/// The built-in error page renderer.
-///
-/// Produces a minimal, self-contained HTML page with no external resources.
-/// The `message` is HTML-entity-escaped to prevent XSS.
+/// The built-in renderer: minimal self-contained HTML with the `message` HTML-escaped.
 pub struct DefaultErrorPage;
 
 impl ErrorPage for DefaultErrorPage {

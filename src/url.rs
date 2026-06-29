@@ -1,9 +1,4 @@
 //! URL reconstruction and logout URL building.
-//!
-//! Handles reconstructing the client-facing URL to redirect back to after
-//! login (accounting for `base_url` and `strip_prefix`), and building OIDC
-//! RP-Initiated Logout URLs with optional `id_token_hint` and
-//! `post_logout_redirect_uri` parameters.
 
 use serde::Serialize;
 
@@ -11,16 +6,11 @@ use crate::config::LoginConfig;
 
 /// Reconstructs the client-facing URL to redirect back to after login.
 ///
-/// Combines the scheme and authority from `config.base_url` with its path
-/// prepended to the request path (after stripping `strip_prefix` if set).
-///
-/// Returns `None` if `strip_prefix` is configured but does not match the
-/// request path, indicating a misconfiguration.
+/// Returns `None` if `strip_prefix` is set but does not match the request path.
 ///
 /// # Panics
 ///
-/// Never in practice: `config.base_url` is an [`EndpointUrl`](huskarl::core::EndpointUrl),
-/// so its scheme and authority are guaranteed present by construction.
+/// Never in practice (`base_url` carries scheme and authority).
 pub fn original_url(config: &LoginConfig, req_uri: &http::Uri) -> Option<String> {
     let base = config.base_url.as_uri();
 
@@ -59,18 +49,9 @@ pub fn original_url(config: &LoginConfig, req_uri: &http::Uri) -> Option<String>
 /// Builds the end-session URL, appending `id_token_hint`, `client_id`, and
 /// `post_logout_redirect_uri` query parameters when present.
 ///
-/// `client_id` matters for the common case: the built-in session types do not
-/// store the `id_token`, so `id_token_hint` is absent, and per OIDC
-/// RP-Initiated Logout 1.0 §2 the OP then needs `client_id` to identify the RP
-/// — without it the OP cannot validate (and so silently drops)
-/// `post_logout_redirect_uri`, stranding the user on the OP's logout page.
-/// Sending `client_id` alongside an `id_token_hint` is also safe: the OP just
-/// verifies the two identify the same client.
-///
 /// # Errors
 ///
-/// Returns [`serde_html_form::ser::Error`] if the query parameters fail to
-/// serialize (in practice unreachable for the borrowed `&str` inputs).
+/// [`serde_html_form::ser::Error`] if the parameters fail to serialize.
 pub fn build_end_session_url(
     endpoint: &http::Uri,
     id_token_hint: Option<&str>,
@@ -104,10 +85,7 @@ pub fn build_end_session_url(
     })
 }
 
-/// Returns the configured `base_url` as a string preserving its scheme,
-/// authority, and path. Used as the post-login fallback redirect when the
-/// original request URL cannot be reconstructed, and as the default
-/// post-logout redirect.
+/// Returns the configured `base_url` as a string (scheme, authority, and path).
 pub fn base_url_as_string(config: &LoginConfig) -> String {
     let base = config.base_url.as_uri();
     // `base_url` is an `EndpointUrl`: scheme and authority are guaranteed present;

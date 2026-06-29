@@ -1,0 +1,13 @@
+[tools]
+cargo-docs-rs = "latest"
+
+[tasks.docs]
+description = "Build docs the docs.rs way (renders the gated `_docs` module)"
+run = "cargo docs-rs --open"
+
+[tasks.test-docs]
+description = "Run doctests, including the `_docs` pages (gated on cfg(docsrs))"
+# Plain `cargo test --doc` skips the `_docs` module because `cargo test --doc`
+# doesn't set `cfg(doc)`; `--cfg docsrs` brings the pages into scope.
+run = "cargo test --doc"
+env = { RUSTDOCFLAGS = "--cfg docsrs" }

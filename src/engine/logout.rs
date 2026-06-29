@@ -55,8 +55,7 @@ where
         }
     }
 
-    /// Loads the session for logout, swallowing load errors as `None` (logout
-    /// should still redirect even if session storage is unavailable).
+    /// Loads the session for logout, swallowing load errors as `None`.
     async fn load_session_for_logout(&self, headers: &HeaderMap) -> Option<SD::SessionType> {
         match self.session_store.load(headers).await {
             Ok(s) => s,
@@ -67,10 +66,9 @@ where
         }
     }
 
-    /// Returns the URL to redirect the user to after the local session is
-    /// cleared: the `IdP`'s `end_session_endpoint` (with `id_token_hint` and
-    /// `post_logout_redirect_uri` when available), falling back to the plain
-    /// post-logout target if the URL can't be built.
+    /// Returns the post-logout redirect URL: the `IdP`'s `end_session_endpoint`
+    /// (with `id_token_hint`/`post_logout_redirect_uri` when available), falling
+    /// back to the plain post-logout target.
     fn logout_redirect_target(
         &self,
         logout: &LogoutConfig,
@@ -102,8 +100,8 @@ where
         })
     }
 
-    /// Deletes the session via the driver and appends the returned cookie
-    /// clears to `set_cookies`. Logs and continues on delete errors.
+    /// Deletes the session and appends the returned cookie clears to
+    /// `set_cookies`; logs and continues on error.
     async fn append_session_delete_cookies(
         &self,
         session: &SD::SessionType,

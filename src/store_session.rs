@@ -1,11 +1,8 @@
 //! External-store-backed session storage.
 //!
 //! [`StoreBackedSessionStore`] keeps an encrypted pointer cookie in the browser
-//! and delegates actual session data to an [`ExternalSessionStore`] (Redis, a
-//! database, etc.). After a login, the attached
-//! [`SessionEnricher`](crate::SessionEnricher) builds the store's `Session`
-//! type from the framework-prepared [`PersistedSessionState`] seed; the
-//! external store then persists it.
+//! and delegates session data to an [`ExternalSessionStore`] (Redis, a database,
+//! etc.).
 
 use std::{borrow::Cow, sync::Arc, time::Duration};
 
@@ -32,82 +29,36 @@ use crate::{
     session_state::{Session, SessionState},
 };
 
-/// Backs session data with a durable store (Redis, SQL, …) — the persistence
-/// half of a [`StoreBackedSessionStore`].
+/// Pure-storage backend (Redis, SQL, …) for a [`StoreBackedSessionStore`]:
+/// insert, load, save, compare-and-swap, delete.
 ///
-/// This trait is **pure storage**: insert, load, save, touch, delete. The
-/// cookie mechanics (pointer cookie encryption, session key generation) are
-/// handled by [`StoreBackedSessionStore`], and session *construction* from a
-/// completed login is handled by the
-/// [`SessionEnricher`](crate::SessionEnricher) attached to the store — the
-/// same hook cookie sessions use.
-///
-/// The associated [`Session`](Self::SessionType) type is what the middleware works
-/// with after login. For the simplest case, use [`PersistedSessionState`]
-/// directly. For enriched sessions (e.g. with user profile data), define a
-/// custom type that implements [`Session`] and [`PersistedSession`], embedding
-/// a `PersistedSessionState`, and build it with a `SessionEnricher`.
+/// Session construction from a completed login is handled by the
+/// [`SessionEnricher`](crate::SessionEnricher) attached to the store, not here.
 pub trait ExternalSessionStore: MaybeSendSync {
-    /// The session type returned by this store.
-    ///
-    /// Must implement [`Session`] so the middleware can inspect token expiry,
-    /// refresh tokens, etc., and [`PersistedSession`] so the framework can
-    /// reach the embedded [`PersistedSessionState`] (session key plus any
-    /// future framework-managed fields).
+    /// The session type returned by this store. Must implement [`Session`] and
+    /// [`PersistedSession`].
     type SessionType: Session + PersistedSession + MaybeSendSync + 'static;
 
-    /// The error type returned by store operations — your backend's own error
-    /// (e.g. `sqlx::Error`, `redis::RedisError`); the framework never asks you
-    /// to construct one of its types.
-    ///
-    /// This is the **transport/backend-failure channel only**. The two outcomes
-    /// the framework acts on are expressed *structurally*, not as errors, so do
-    /// not encode them here: a missing session is [`load`](Self::load) returning
-    /// `Ok(None)`, and a lost compare-and-swap is
-    /// [`compare_and_swap`](Self::compare_and_swap) returning
-    /// [`SaveOutcome::Conflict`]. An `Err` therefore means "I could not reach or
-    /// use the backend" — the framework boxes it into a
-    /// [`SessionErrorKind::Unavailable`](crate::SessionErrorKind::Unavailable)
-    /// (retryable; adapters surface `503`), which assumes a retry is plausible.
+    /// The backend's own error type (e.g. `sqlx::Error`); transport-failure
+    /// channel only. Boxed into
+    /// [`SessionErrorKind::Unavailable`](crate::SessionErrorKind::Unavailable).
     type Error: std::error::Error + MaybeSendSync + 'static;
 
-    /// Persist a newly created session.
-    ///
-    /// Called once per login, after the
-    /// [`SessionEnricher`](crate::SessionEnricher) has built the session.
-    /// Everything the store needs to persist should be carried on the session
-    /// type itself — claim mapping and `UserInfo` lookups belong in the
-    /// enricher, not here.
+    /// Persist a newly created session. Called once per login, after enrichment.
     fn insert(
         &self,
         session: &Self::SessionType,
     ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 
     /// Load a session by its key. Returns `None` if the key does not exist.
-    ///
-    /// The key is a `UUIDv7` — passed by value because `Uuid` is `Copy` and
-    /// 16 bytes. Implementations that key records by string form should call
-    /// `session_key.to_string()` (or `as_simple()` for a hyphen-free form).
     fn load(
         &self,
         session_key: Uuid,
     ) -> impl Future<Output = Result<Option<Self::SessionType>, Self::Error>> + MaybeSend;
 
-    /// Save a session unconditionally, advancing the stored
-    /// [`version`](PersistedSessionState::version).
-    ///
-    /// This is the *last-writer-wins* path used for ambient writes (e.g. the
-    /// engine persisting refreshed tokens); a concurrent writer's changes can
-    /// be overwritten. For mutations that must not be lost under concurrency,
-    /// use [`StoreBackedSessionStore::update`], which goes through
-    /// [`compare_and_swap`](Self::compare_and_swap). Bumping the version here
-    /// (typically `version + 1`) is what lets a concurrent `update` notice this
-    /// write and retry.
-    ///
-    /// Set the record's storage TTL to the deployment's `max_lifetime` (the
-    /// absolute session cap). Idle expiry is no longer this store's concern —
-    /// activity is tracked separately by a [`LivenessStore`](crate::LivenessStore),
-    /// so there is nothing to extend here per-request.
+    /// Save a session unconditionally (last-writer-wins), advancing the stored
+    /// [`version`](PersistedSessionState::version). Set the record's TTL to the
+    /// deployment's `max_lifetime`.
     fn save(
         &self,
         session: &Self::SessionType,
@@ -115,33 +66,16 @@ pub trait ExternalSessionStore: MaybeSendSync {
 
     /// Save `session` only if the stored
     /// [`version`](PersistedSessionState::version) still equals `expected`,
-    /// advancing it on success. Returns [`SaveOutcome::Conflict`] (no write)
-    /// when another writer has since advanced the version.
-    ///
-    /// This is the compare-and-swap primitive behind
-    /// [`StoreBackedSessionStore::update`]; the retry loop lives there, so an
-    /// implementation only needs the conditional write:
-    ///
-    /// - SQL: `UPDATE … SET data = ?, version = version + 1 WHERE key = ? AND version = ?`
-    ///   — zero rows affected means [`Conflict`](SaveOutcome::Conflict).
-    /// - Dynamo: a conditional write with `ConditionExpression: version = :expected`.
-    /// - Mongo: `findOneAndUpdate({key, version}, {$set, $inc: {version: 1}})`.
-    /// - Redis: `WATCH` the key (or a small Lua CAS).
-    ///
-    /// The version is compared by **equality only** — see
-    /// [`PersistedSessionState::version`].
+    /// advancing it on success; otherwise returns [`SaveOutcome::Conflict`]
+    /// without writing. Version is compared by equality only.
     fn compare_and_swap(
         &self,
         session: &Self::SessionType,
         expected: i32,
     ) -> impl Future<Output = Result<SaveOutcome, Self::Error>> + MaybeSend;
 
-    /// Deletes the session's stored record. Idempotent: a missing record is
-    /// `Ok(())`, not an error.
-    ///
-    /// Keyed off the embedded session key, like the other methods. The framework
-    /// owns pointer-cookie and liveness teardown, so an implementation need only
-    /// drop its own record.
+    /// Delete the session's stored record. Idempotent: a missing record is
+    /// `Ok(())`.
     fn delete(
         &self,
         session: &Self::SessionType,
@@ -153,55 +87,34 @@ pub trait ExternalSessionStore: MaybeSendSync {
 pub enum SaveOutcome {
     /// The version matched; the session was written and the version advanced.
     Committed,
-    /// Another writer advanced the version first; nothing was written. The
-    /// caller should reload and retry.
+    /// Another writer advanced the version first; nothing was written.
     Conflict,
 }
 
-/// [`StoreBackedSessionStore::update`] found no session for the key — it was
-/// deleted or expired before the update could run.
+/// [`StoreBackedSessionStore::update`] found no session for the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
 #[snafu(display("session not found"))]
 pub struct SessionNotFound;
 
-/// [`StoreBackedSessionStore::update`] exhausted its retry budget — the session
-/// was concurrently rewritten on every attempt. The caller can retry the whole
-/// operation or surface a conflict (e.g. HTTP 409) to the client.
+/// [`StoreBackedSessionStore::update`] exhausted its retry budget under
+/// sustained concurrent rewrites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Snafu)]
 #[snafu(display("session update conflict: the session was modified concurrently"))]
 pub struct VersionConflict;
 
-/// Framework-managed session state carried by every store-backed session.
-///
-/// Contains the session key, session state, and any future framework-managed
-/// fields (e.g. step-up auth timestamp, MFA assertions, revocation versions).
-/// Built by the framework and passed as the *seed* to the
-/// [`SessionEnricher`](crate::SessionEnricher) after a successful login.
-///
-/// The struct is `#[non_exhaustive]` so new framework-managed fields can be
-/// added in a minor release without breaking store implementations.
-///
-/// For simple stores that don't need to enrich sessions, use
-/// `PersistedSessionState` directly as your [`ExternalSessionStore::SessionType`]
-/// type. For enriched sessions, embed this in your custom type and implement
-/// [`PersistedSession`] (and [`Session`]) by forwarding to the embedded value.
+/// Framework-managed session state carried by every store-backed session, and
+/// the seed passed to the [`SessionEnricher`](crate::SessionEnricher) after
+/// login.
 #[non_exhaustive]
 #[derive(Clone, Serialize, Deserialize, bon::Builder)]
 pub struct PersistedSessionState {
-    /// The random session key used as the primary lookup key in the external
-    /// store. A time-ordered `UUIDv7`.
+    /// Primary lookup key in the external store. A time-ordered `UUIDv7`.
     pub session_key: Uuid,
     /// Shared token and timing state. See [`SessionState`] for the field set.
     pub state: SessionState,
-    /// Optimistic-concurrency version, advanced on every write. `0` at insert;
-    /// set by the store on [`load`](ExternalSessionStore::load).
-    ///
-    /// Used by [`StoreBackedSessionStore::update`] to detect a concurrent
-    /// writer: the update reloads and replays its mutation when the stored
-    /// version no longer matches the one it loaded. Compared **by equality
-    /// only**, never ordered — so its signedness is immaterial and the
-    /// `wrapping_add` increment (unreachable short of 2³¹ writes to one session)
-    /// is harmless.
+    /// Optimistic-concurrency version, advanced on every write; `0` at insert,
+    /// set by the store on [`load`](ExternalSessionStore::load). Compared by
+    /// equality only.
     #[serde(default)]
     #[builder(default)]
     pub version: i32,
@@ -216,29 +129,8 @@ impl Session for PersistedSessionState {
     }
 }
 
-/// Trait implemented by every store-backed session type, exposing the
-/// embedded [`PersistedSessionState`] to the framework.
-///
-/// `PersistedSessionState` carries the session key plus any framework-managed
-/// fields. Requiring this trait on `ExternalSessionStore::SessionType` lets the
-/// framework rely on those fields being present without store implementations
-/// having to opt in per-capability.
-///
-/// The default implementation on `PersistedSessionState` itself is trivial;
-/// enriched session types implement this by forwarding to their embedded
-/// `PersistedSessionState` field.
-///
-/// # Accessor style
-///
-/// This trait deliberately differs from [`Session`]'s accessors. [`Session`]
-/// uses `state()`/`set_state(value)` — whole-value replacement — because its
-/// callers model application-visible *events* (refresh, activity) that
-/// produce a new [`SessionState`], matching the load→transform→save flow
-/// distributed stores need. `PersistedSession` instead provides
-/// `persisted()`/`persisted_mut()` — structural access — because it is
-/// framework plumbing: the framework reads and updates individual fields of
-/// its own struct (the session key today; step-up/MFA fields later) without
-/// every session type having to mirror per-field setters.
+/// Exposes the embedded [`PersistedSessionState`] to the framework. Implemented
+/// by every store-backed session type, forwarding to its embedded field.
 pub trait PersistedSession {
     /// Returns a shared reference to the embedded [`PersistedSessionState`].
     fn persisted(&self) -> &PersistedSessionState;
@@ -261,57 +153,32 @@ fn generate_session_key() -> Uuid {
     Uuid::now_v7()
 }
 
-/// Number of attempts an optimistic [`update`](StoreBackedSessionStore::update)
-/// makes before giving up with [`VersionConflict`]. Five absorbs realistic
-/// contention; sustained failure past it signals a hot key worth surfacing.
+/// Attempts an optimistic [`update`](StoreBackedSessionStore::update) makes
+/// before giving up with [`VersionConflict`].
 const UPDATE_MAX_ATTEMPTS: u32 = 5;
 
-/// A session store that keeps an encrypted pointer cookie in the browser and
-/// stores session data in an external [`ExternalSessionStore`].
+/// A session store that keeps an encrypted pointer cookie (the session key) in
+/// the browser and stores session data in an [`ExternalSessionStore`].
 ///
-/// The pointer cookie contains the encrypted session key (a random string).
-/// The actual session data is stored via the external store.
-///
-/// The session is built after a completed login by a [`SessionEnricher`]
-/// from the framework-prepared [`PersistedSessionState`] seed. The builder's
-/// `build()` finisher uses [`NoEnrichment`], which converts the seed via
-/// `From` — covering `SessionType = PersistedSessionState` (and any session
-/// type implementing `From<PersistedSessionState>`). For sessions needing
-/// claims or I/O, supply an enricher via the `build_with_enricher(…)`
-/// finisher.
-///
-/// The `Secure` attribute and cookie-name prefix follow the deployment's
-/// browser-facing scheme, which the engine derives from
-/// [`LoginConfig::base_url`](crate::LoginConfig::base_url) and stamps onto the
-/// store at construction (see
-/// [`SessionDriver::apply_cookie_secure`](crate::SessionDriver::apply_cookie_secure)).
-/// This store therefore takes no `secure` setting of its own. When that
-/// derived value is secure and `cookie_path` is `"/"`, the configured cookie
-/// name is automatically given the `__Host-` prefix (unless it already
-/// starts with `__Host-` or `__Secure-`). The prefix makes the browser
-/// reject the cookie if set by a sibling subdomain or over plain HTTP,
-/// blocking session fixation by cookie tossing. Note that switching a
-/// deployment from `http` to `https` renames the cookie: in-flight sessions
-/// under the old name are ignored and users re-login on their next navigation.
+/// The session is built after login by a [`SessionEnricher`] from the
+/// [`PersistedSessionState`] seed; `build()` uses [`NoEnrichment`],
+/// `build_with_enricher(…)` supplies a custom one. The engine stamps on the
+/// `Secure` attribute and `__Host-` prefix, so this store takes no `secure`
+/// setting.
 pub struct StoreBackedSessionStore<E: ExternalSessionStore> {
     external: E,
     enricher: Box<dyn SessionEnricher<PersistedSessionState, E::SessionType>>,
-    /// Shared cookie-sealing machinery (cipher, cookie name/attrs, kid sidecar,
-    /// metrics) for the pointer cookie — see [`CookieSealer`].
+    /// Cookie-sealing machinery for the pointer cookie — see [`CookieSealer`].
     sealer: CookieSealer,
-    /// Optional server-side liveness (idle) tracking. `None` means idle timeout
-    /// is not enforced and activity is not recorded. Attached post-construction
-    /// via [`with_liveness`](Self::with_liveness) so it does not change the
-    /// store's type.
+    /// Optional server-side liveness (idle) tracking; `None` disables it.
+    /// Attached via [`with_liveness`](Self::with_liveness).
     liveness: Option<(Box<dyn LivenessStore>, LivenessConfig)>,
 }
 
 #[bon::bon]
 impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
-    /// Creates a new store-backed session store. Finish the builder with
-    /// `build()` (uses [`NoEnrichment`]; requires
-    /// `E::SessionType: From<PersistedSessionState>`) or
-    /// `build_with_enricher(…)` to attach an async [`SessionEnricher`].
+    /// Creates a new store-backed session store. Finish with `build()` (uses
+    /// [`NoEnrichment`]) or `build_with_enricher(…)`.
     #[builder(state_mod(name = "store_builder"), finish_fn(vis = "", name = build_internal))]
     pub fn new(
         #[builder(finish_fn)] enricher: Box<
@@ -320,16 +187,11 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         external: E,
         #[builder(with = |cipher: impl AeadCipher + 'static| Arc::new(cipher) as Arc<dyn AeadCipher>)]
         cipher: Arc<dyn AeadCipher>,
-        /// Base name for the session cookie. A [`CookieName`], so its
-        /// `[A-Za-z0-9_-]` invariant is established at construction — e.g.
-        /// `"session".parse()?` or `CookieName::new("session")?`.
+        /// Base name for the session cookie.
         cookie_name: CookieName,
-        /// Cookie `Path` scope. A [`RoutePath`] (starts with `/`; no `;`, `?`,
-        /// `#`, or control chars) — e.g. `"/".parse()?` or `RoutePath::new("/")?`.
+        /// Cookie `Path` scope.
         cookie_path: RoutePath,
-        /// Defaults to 400 days. If `max_lifetime` is configured in `LoginConfig`,
-        /// pass it here so the browser discards the cookie when the session can
-        /// no longer be valid.
+        /// Cookie `Max-Age`; defaults to 400 days. Pass `max_lifetime` when set.
         #[builder(default = DEFAULT_COOKIE_MAX_AGE)]
         max_age: Duration,
         /// Optional metrics observer for encrypt/decrypt events.
@@ -345,8 +207,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
 }
 
 impl<E: ExternalSessionStore, S: store_builder::IsComplete> StoreBackedSessionStoreBuilder<E, S> {
-    /// Finishes the builder with the default [`NoEnrichment`] enricher, which
-    /// converts the [`PersistedSessionState`] seed into the session via `From`.
+    /// Finishes the builder with [`NoEnrichment`] (`From<PersistedSessionState>`).
     #[must_use]
     pub fn build(self) -> StoreBackedSessionStore<E>
     where
@@ -355,10 +216,9 @@ impl<E: ExternalSessionStore, S: store_builder::IsComplete> StoreBackedSessionSt
         self.build_internal(Box::new(NoEnrichment))
     }
 
-    /// Finishes the builder with a custom [`SessionEnricher`], for sessions
-    /// that need ID token claims or I/O (e.g. the OIDC `UserInfo` endpoint)
-    /// to construct. See [`SessionEnricher`] for examples (the seed type here
-    /// is [`PersistedSessionState`]).
+    /// Finishes the builder with a custom [`SessionEnricher`], for sessions that
+    /// need ID token claims or I/O to construct. Seed type is
+    /// [`PersistedSessionState`].
     #[must_use]
     pub fn build_with_enricher(
         self,
@@ -367,13 +227,10 @@ impl<E: ExternalSessionStore, S: store_builder::IsComplete> StoreBackedSessionSt
         self.build_internal(Box::new(enricher))
     }
 
-    /// Finishes the builder with a synchronous claim-mapper: build the session
-    /// from the [`PersistedSessionState`] seed and the
-    /// [`CompletedLogin`](crate::CompletedLogin) (e.g.
-    /// copy ID token claims) without I/O. For enrichment that must `await` —
-    /// such as the OIDC `UserInfo` endpoint — use
-    /// [`build_with_enricher`](Self::build_with_enricher) instead; for sessions
-    /// built from the seed alone, use [`build`](Self::build).
+    /// Finishes the builder with a synchronous claim-mapper that builds the
+    /// session from the seed and the [`CompletedLogin`](crate::CompletedLogin)
+    /// without I/O. For `await`ing enrichment use
+    /// [`build_with_enricher`](Self::build_with_enricher).
     #[must_use]
     pub fn build_with_claims<F>(self, f: F) -> StoreBackedSessionStore<E>
     where
@@ -390,25 +247,13 @@ impl<E: ExternalSessionStore, S: store_builder::IsComplete> StoreBackedSessionSt
 
 impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     /// Returns the active cipher's key ID, if the key has an identity.
-    ///
-    /// Delegates to
-    /// [`AeadEncryptor::key_id`](huskarl::core::crypto::cipher::AeadEncryptor::key_id).
-    /// Once reload support is added to `AeadCipher`, this will reflect the key
-    /// that will be used for the **next** seal operation — suitable for
-    /// updating an active-key gauge from a reload callback.
     pub fn key_id(&self) -> Option<Cow<'_, str>> {
         self.sealer.key_id()
     }
 
     /// Attach server-side liveness (idle-timeout) tracking, backed by the given
-    /// [`LivenessStore`] and configured by `config`.
-    ///
-    /// Liveness is server-side only and keyed by the session's `Uuid`, so it is
-    /// available only on store-backed sessions — there is no cookie-session
-    /// equivalent. The store may be a different (cheaper) backend than the
-    /// session store; see [`crate::liveness`] for the fail-open / monotonic
-    /// contract. Returns `self` so it chains after the builder, without changing
-    /// the store's type.
+    /// [`LivenessStore`] and configured by `config`. Returns `self`. See
+    /// [`crate::liveness`] for the fail-open / monotonic contract.
     #[must_use]
     pub fn with_liveness(
         mut self,
@@ -420,37 +265,19 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     }
 
     /// Atomically apply `mutate` to the stored session, retrying on concurrent
-    /// writes (optimistic concurrency control).
-    ///
-    /// Loads the session, runs `mutate` on it, and writes it back only if no
-    /// other writer changed it in between (via
-    /// [`compare_and_swap`](ExternalSessionStore::compare_and_swap)). On a
-    /// conflict it reloads the latest state and **runs `mutate` again**, so the
-    /// concurrent change is preserved rather than clobbered. Returns the
+    /// writes (optimistic concurrency control) via
+    /// [`compare_and_swap`](ExternalSessionStore::compare_and_swap). Returns the
     /// committed session.
     ///
-    /// Use this for any session mutation that must not be lost under
-    /// concurrency — step-up state, stored tokens, counters, app data touched by
-    /// more than one request. Ambient writes (the engine persisting refreshed
-    /// tokens) go through [`save`](ExternalSessionStore::save) and remain
-    /// last-writer-wins.
-    ///
-    /// # The closure must be replayable
-    ///
-    /// `mutate` may run more than once, each time against freshly-loaded state,
-    /// so it must compute the new state *from the session it is given* — set a
-    /// field, append to the loaded collection, recompute from current values.
-    /// It must not apply a value captured before the load or accumulate across
-    /// calls, or a retry will produce the wrong result.
+    /// `mutate` may run more than once against freshly-loaded state, so it must
+    /// be replayable: compute the new state from the session it is given, never
+    /// from a value captured before the load.
     ///
     /// # Errors
     ///
-    /// - [`SessionErrorKind::Gone`] (sourced by [`SessionNotFound`]) if the key
-    ///   has no session (deleted/expired).
-    /// - [`SessionErrorKind::Conflict`] (sourced by [`VersionConflict`]) if the
-    ///   retry budget is exhausted under sustained contention.
-    /// - [`SessionErrorKind::Unavailable`] wrapping the store's own error on a
-    ///   transport failure.
+    /// [`SessionErrorKind::Gone`] (no session), [`SessionErrorKind::Conflict`]
+    /// (retry budget exhausted), or [`SessionErrorKind::Unavailable`] (store
+    /// error).
     pub async fn update<F>(
         &self,
         session_key: Uuid,
@@ -490,18 +317,8 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         ))
     }
 
-    /// Encrypt the pointer cookie and emit it alongside the kid sidecar.
-    ///
-    /// The plaintext is the UUID's 16 raw bytes — not the 36-byte hyphenated
-    /// string form. This is the same compact representation Postgres uses
-    /// for its `uuid` type, and saves ~27 bytes off the wire on every
-    /// authenticated request once AEAD overhead and base64 expansion are
-    /// accounted for.
-    ///
-    /// The kid sidecar is set when the sealer reports an active identity, and
-    /// emitted as a `Max-Age=0` clear otherwise. The sidecar lets the unsealer
-    /// skip trial-decrypt when multiple keys are configured; absence (or any
-    /// corruption) degrades gracefully to trial-decrypt.
+    /// Encrypt the pointer cookie (the UUID's 16 raw bytes) and emit it
+    /// alongside the kid sidecar (a `Max-Age=0` clear when there is no identity).
     async fn pointer_cookie_headers(
         &self,
         session_key: Uuid,
@@ -826,9 +643,7 @@ mod tests {
         }
     }
 
-    /// Builds `MinimalSession` (a wrapper around the seed) from the
-    /// framework-prepared `PersistedSessionState` — the store-backed analogue
-    /// of a cookie-session enricher.
+    /// Builds `MinimalSession` from the `PersistedSessionState` seed.
     struct MinimalEnricher;
 
     impl SessionEnricher<PersistedSessionState, MinimalSession> for MinimalEnricher {
@@ -858,8 +673,8 @@ mod tests {
         assert_session_driver(&store);
     }
 
-    /// In-memory [`LivenessStore`] that records every write, shareable so a test
-    /// can inspect the entries after handing a clone to `with_liveness`.
+    /// In-memory [`LivenessStore`] that records every write, shareable for
+    /// inspection.
     #[derive(Clone, Default)]
     struct FakeLiveness {
         entries: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, SystemTime>>>,

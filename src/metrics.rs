@@ -1,28 +1,13 @@
 //! Observer traits and result types for login and session-cookie metrics.
 //!
-//! Two zero-dependency observer traits let you wire a metrics backend
-//! (Prometheus, `StatsD`, OpenTelemetry, …) without this crate depending on one:
-//!
-//! - [`LoginEngineMetrics`] observes login-flow events (start, complete,
-//!   refresh, teardown) on the [`LoginEngine`](crate::engine::LoginEngine).
-//! - [`SessionCookieMetrics`] observes session-cookie encrypt/decrypt on the
-//!   session stores.
-//!
-//! Result enums ([`LoginStartResult`], [`DecryptResult`], …) carry the outcome
-//! as a closed set of `&'static str` labels; [`normalize_as_error`] collapses an
-//! arbitrary error into one safe label so a hostile peer cannot blow up metric
-//! cardinality. Wire an implementation in via the `metrics` builder setting on
-//! the engine or a session store.
+//! The [`LoginEngineMetrics`] and [`SessionCookieMetrics`] observer traits wire
+//! a metrics backend in; result enums carry the outcome as `&'static str` labels.
 
 use huskarl::core::platform::MaybeSendSync;
 
 use crate::engine::TeardownReason;
 
 /// Outcome of a session cookie decryption attempt.
-///
-/// Passed to [`SessionCookieMetrics::record_decrypt`] to indicate why
-/// decryption succeeded or failed. [`as_str`](Self::as_str) returns a
-/// `&'static str` suitable for use as a Prometheus label value.
 #[derive(strum::AsRefStr, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
@@ -45,40 +30,19 @@ impl DecryptResult {
     }
 }
 
-/// Observer for session cookie encrypt/decrypt events.
-///
-/// Implement this trait to record metrics to a backend of your choice
-/// (Prometheus, `StatsD`, OpenTelemetry, etc.). Session stores accept an optional
-/// `Arc<dyn SessionCookieMetrics>` and call the appropriate method on each
-/// operation.
-///
-/// Absent cookies are always silent — [`record_decrypt`](Self::record_decrypt)
-/// fires only when a session-cookie-shaped value was actually present in the
-/// request.
+/// Observer for session cookie encrypt/decrypt events. Absent cookies are
+/// silent.
 pub trait SessionCookieMetrics: MaybeSendSync + 'static {
-    /// Record a decryption attempt on the session cookie.
-    ///
-    /// `cookie_name` is the base session cookie name (e.g. `huskarl_session`).
-    /// `kid` is the identity decoded from the kid sidecar cookie, or `None` if
-    /// the sidecar was absent or could not be decoded. `result` indicates the
-    /// outcome of the attempt.
+    /// Record a decryption attempt. `kid` is the identity from the kid sidecar cookie, or `None` if absent/undecodable.
     fn record_decrypt(&self, cookie_name: &str, kid: Option<&str>, result: &DecryptResult);
 
-    /// Record a completed encryption of the session cookie.
-    ///
-    /// `cookie_name` is the base session cookie name. `kid` is the key ID
-    /// reported by the active sealer (`sealer.key_id()`), or `None` if the
-    /// key was constructed without an identity. The `kid` label implicitly
-    /// tracks which key is performing live encryption, making key rotation
-    /// observable without a separate active-key gauge.
+    /// Record a completed encryption. `kid` is the active sealer's key ID, or `None` if the key has no identity.
     fn record_encrypt(&self, cookie_name: &str, kid: Option<&str>);
 }
 
 // ── Login engine metrics ───────────────────────────────────────────────────────
 
 /// Outcome of a login redirect attempt.
-///
-/// Passed to [`LoginEngineMetrics::record_login_start`].
 #[derive(strum::AsRefStr, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
@@ -98,8 +62,6 @@ impl LoginStartResult {
 }
 
 /// Outcome of processing an OAuth callback (token exchange and session creation).
-///
-/// Passed to [`LoginEngineMetrics::record_login_complete`].
 #[derive(strum::AsRefStr, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
@@ -126,9 +88,7 @@ impl LoginCompleteResult {
     }
 }
 
-/// OAuth 2.0 / OIDC authorization error codes recognized by
-/// [`normalize_as_error`]: RFC 6749 §4.1.2.1 plus the OIDC Core §3.1.2.6
-/// additions.
+/// Authorization error codes recognized by [`normalize_as_error`] (RFC 6749 / OIDC Core).
 const KNOWN_AS_ERROR_CODES: &[&str] = &[
     // RFC 6749 §4.1.2.1
     "invalid_request",
@@ -150,13 +110,7 @@ const KNOWN_AS_ERROR_CODES: &[&str] = &[
     "registration_not_supported",
 ];
 
-/// Normalizes an authorization server `error` code to a closed set of values.
-///
-/// The callback's `error` query parameter is attacker-suppliable — anyone can
-/// request `/callback?error=<arbitrary bytes>` — so it must not flow into a
-/// metrics label unbounded (label-cardinality explosion). Known RFC 6749 /
-/// OIDC Core error codes are returned as their `&'static str` equivalent;
-/// anything else maps to `"other"`.
+/// Normalizes an attacker-suppliable AS `error` code: known codes pass through, anything else maps to `"other"`.
 #[must_use]
 pub fn normalize_as_error(error: &str) -> &'static str {
     KNOWN_AS_ERROR_CODES
@@ -167,8 +121,6 @@ pub fn normalize_as_error(error: &str) -> &'static str {
 }
 
 /// Outcome of a token refresh attempt.
-///
-/// Passed to [`LoginEngineMetrics::record_refresh`].
 #[derive(strum::AsRefStr, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
@@ -179,11 +131,8 @@ pub enum RefreshResult {
     Ok,
     /// The token refresh request failed conclusively — session was cleared.
     Failed,
-    /// The refresh failed with a retryable (transient) error while the access
-    /// token was still valid — the session was retained and the refresh will
-    /// be re-attempted on a later request. A sustained elevated rate here
-    /// signals authorization-server trouble *before* users start getting
-    /// logged out.
+    /// The refresh failed with a retryable error while the access token was
+    /// still valid — the session was retained and will be re-attempted later.
     FailedRetained,
 }
 
@@ -195,48 +144,19 @@ impl RefreshResult {
     }
 }
 
-/// Observer for [`LoginEngine`](crate::engine::LoginEngine) login-flow events
-/// (start, complete, refresh, teardown).
-///
-/// Implement this trait to record login-flow metrics to a backend of your
-/// choice; attach an implementation via the `metrics` builder setting on
-/// [`LoginEngine`](crate::engine::LoginEngine). Methods are called inline on the
-/// request path, so they must not block — record and return. Label inputs are a
-/// closed set or pre-normalized (see [`normalize_as_error`]), so they are safe
-/// to use as metric labels directly.
+/// Observer for [`LoginEngine`](crate::engine::LoginEngine) login-flow events.
+/// Methods are called inline on the request path, so they must not block.
 pub trait LoginEngineMetrics: MaybeSendSync + 'static {
-    /// Record a login redirect attempt (browser redirected to authorization server).
+    /// Record a login redirect attempt.
     fn record_login_start(&self, result: &LoginStartResult);
 
-    /// Record the outcome of processing an OAuth callback.
-    ///
-    /// `as_error` carries the OAuth 2.0 `error` code from the authorization
-    /// server's error response (e.g. `"access_denied"`, `"server_error"`)
-    /// when `result` is [`LoginCompleteResult::AsDenied`], and is `None`
-    /// for all other outcomes. Useful for distinguishing user-initiated
-    /// denials from AS-side errors.
-    ///
-    /// The value is normalized via [`normalize_as_error`] before reaching
-    /// this method: it is always one of the known RFC 6749 / OIDC Core error
-    /// codes or the literal `"other"`, never raw attacker-suppliable input —
-    /// safe to use directly as a metrics label.
+    /// Record the outcome of an OAuth callback. `as_error` is the normalized AS `error` code for [`LoginCompleteResult::AsDenied`], else `None`.
     fn record_login_complete(&self, result: &LoginCompleteResult, as_error: Option<&str>);
 
     /// Record the outcome of a token refresh attempt.
-    ///
-    /// Called whenever a session is loaded and the access token is at or near
-    /// expiry — whether or not a refresh token is available.
     fn record_refresh(&self, result: &RefreshResult);
 
-    /// Record the teardown of a presented session — why
-    /// [`load_session`](crate::engine::LoginEngine::load_session) dropped it
-    /// instead of serving it.
-    ///
-    /// Distinguishes benign policy expirations
-    /// ([`MaxLifetime`](TeardownReason::MaxLifetime),
-    /// [`IdleTimeout`](TeardownReason::IdleTimeout)) from refresh problems
-    /// and corrupt timestamps — signals that would otherwise look identical
-    /// to users ("I was logged out"). Defaults to a no-op.
+    /// Record why a presented session was dropped rather than served. No-op by default.
     fn record_teardown(&self, _reason: &TeardownReason) {}
 }
 

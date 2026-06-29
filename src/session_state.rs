@@ -1,23 +1,6 @@
-//! Session state and lifecycle introspection.
-//!
-//! [`Session`] exposes the timing and token state that the login middleware
-//! needs to enforce session policies (max lifetime, idle timeout, token-bound
-//! expiry) and perform automatic token refresh.
-//!
-//! [`SessionState`] holds the common token/timing fields shared by all session
-//! types. Session types embed `SessionState` and implement [`Session`] with
-//! two methods — [`state`](Session::state) for reads and
-//! [`set_state`](Session::set_state) for replacement. All other trait methods
-//! have default implementations.
-//!
-//! State is never mutated in place. Events like [`refreshed`](SessionState::refreshed)
-//! produce a new `SessionState` value, which is then set back via the trait.
-//! This matches the load->transform->save model required for distributed
-//! session stores.
-//!
-//! Liveness (`last_active` / idle-timeout) is deliberately *not* part of this
-//! state — it is tracked separately and server-side only; see
-//! [`crate::liveness`].
+//! Session state and lifecycle introspection: [`SessionState`] holds the
+//! token/timing fields, [`Session`] exposes them to the middleware. State is
+//! immutable. Liveness is tracked separately (see [`crate::liveness`]).
 
 use huskarl::{
     core::{
@@ -31,35 +14,21 @@ use serde::{Deserialize, Serialize};
 
 /// Common token and timing state shared by all session types.
 ///
-/// Session types embed it and implement [`Session`] by providing read access
-/// and a replacement method. State changes are produced by event methods
-/// ([`refreshed`](Self::refreshed)) that return a new value rather than
-/// mutating in place.
-///
-/// The struct is `#[non_exhaustive]` so new fields can be added in a minor
-/// release. For OAuth flows the framework constructs it from the completed
-/// login; use [`SessionState::builder`] for tests and custom flows.
-///
-/// The raw `id_token` JWT is not stored here — see [`Session::id_token`]
-/// for the rationale and the override hook.
+/// Use [`SessionState::builder`] for tests and custom flows. The raw `id_token`
+/// JWT is not stored here — see [`Session::id_token`].
 #[non_exhaustive]
 #[derive(Clone, Serialize, Deserialize, bon::Builder)]
 pub struct SessionState {
-    /// Absolute expiry of the access token. Computed from the token response's
-    /// `expires_in`, or from [`LoginConfig::default_token_lifetime`](crate::LoginConfig::default_token_lifetime)
-    /// when `expires_in` is absent.
+    /// Absolute expiry of the access token (from `expires_in`, else the default lifetime).
     #[serde(with = "unix_secs")]
     pub token_expiry: SystemTime,
-    /// Refresh token issued alongside the access token, if any. Used by the
-    /// middleware to obtain a new access token when `token_expiry` approaches.
+    /// Refresh token issued alongside the access token, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<RefreshToken>,
-    /// Subject identifier from the ID token. Carried for back-channel logout
-    /// revocation lookup (OIDC Back-Channel Logout 1.0).
+    /// Subject identifier from the ID token, for logout revocation lookup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub: Option<String>,
-    /// Session ID from the ID token. Carried for front-channel and
-    /// back-channel logout revocation lookup.
+    /// Session ID from the ID token, for logout revocation lookup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
     /// When the session was created (initial login).
@@ -68,9 +37,7 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    /// Creates a `SessionState` from a completed login, extracting token data
-    /// and computing the token expiry from `expires_in` (or `default_lifetime`
-    /// when absent).
+    /// Creates a `SessionState` from a completed login.
     pub(crate) fn from_completed(
         completed: &crate::CompletedLogin,
         default_lifetime: Duration,
@@ -96,12 +63,8 @@ impl SessionState {
         }
     }
 
-    /// Produces a new `SessionState` with tokens updated from a refresh response.
-    ///
-    /// Replaces the raw token response and recomputes token expiry, falling
-    /// back to `default_lifetime` when the refresh response omits `expires_in`.
-    /// If the refresh response includes a rotated refresh token, it replaces
-    /// the old one; otherwise the existing refresh token is preserved.
+    /// Produces a new `SessionState` with tokens updated from a refresh response,
+    /// keeping the existing refresh token unless the response rotates it.
     #[must_use]
     pub fn refreshed(&self, token_response: &TokenResponse, default_lifetime: Duration) -> Self {
         let now = SystemTime::now();
@@ -121,17 +84,10 @@ impl SessionState {
     }
 }
 
-/// Exposes session state from a session type so the middleware can enforce
-/// lifetime policies (max lifetime, idle timeout, token-bound expiry) and
-/// perform token refresh.
+/// Exposes session state so the middleware can enforce lifetime policies and refresh tokens.
 ///
-/// Implement this on the session type used with the login middleware.
-/// Only two methods are required — [`state`](Self::state) for reads and
-/// [`set_state`](Self::set_state) for replacement. All others have default
-/// implementations.
-///
-/// State is immutable: events go through `set_state`, never interior mutation —
-/// see [`SessionState`] for the load→transform→save model.
+/// Implement on the session type used with the middleware; only
+/// [`state`](Self::state) and [`set_state`](Self::set_state) are required.
 pub trait Session {
     /// Returns a shared reference to the embedded [`SessionState`].
     fn state(&self) -> &SessionState;
@@ -139,8 +95,7 @@ pub trait Session {
     /// Replaces the embedded [`SessionState`] with a new value.
     fn set_state(&mut self, state: SessionState);
 
-    /// Absolute expiry of the access token (`received_at + expires_in`, or
-    /// `received_at + default_token_lifetime` when the AS omits `expires_in`).
+    /// Absolute expiry of the access token.
     fn token_expiry(&self) -> SystemTime {
         self.state().token_expiry
     }
@@ -150,27 +105,20 @@ pub trait Session {
         self.state().refresh_token.as_ref()
     }
 
-    /// The ID token (identity assertion), if the session stores one.
+    /// The ID token, if the session stores one.
     ///
-    /// The default implementation returns `None` because the built-in
-    /// [`SessionState`] does not store the raw `id_token` (it would add ~1 KB
-    /// per request to the cookie hot path). Sessions that need the `id_token`
-    /// for RP-initiated logout (`id_token_hint`) should override this method
-    /// on their custom session type.
+    /// Defaults to `None`: [`SessionState`] does not store the raw `id_token`.
+    /// Override on a custom session type to supply it (e.g. for `id_token_hint`).
     fn id_token(&self) -> Option<&IdToken> {
         None
     }
 
     /// Subject identifier from the ID token, if present.
-    ///
-    /// Used for back-channel logout revocation lookup.
     fn sub(&self) -> Option<&str> {
         self.state().sub.as_deref()
     }
 
     /// Session ID from the ID token, if present.
-    ///
-    /// Used for front-channel and back-channel logout revocation lookup.
     fn sid(&self) -> Option<&str> {
         self.state().sid.as_deref()
     }
@@ -180,9 +128,7 @@ pub trait Session {
         self.state().created_at
     }
 
-    /// Apply tokens from a refresh response.
-    ///
-    /// Produces a new [`SessionState`] via [`SessionState::refreshed`] and sets it.
+    /// Apply tokens from a refresh response via [`SessionState::refreshed`].
     fn apply_refresh(&mut self, token_response: &TokenResponse, default_lifetime: Duration) {
         let new_state = self.state().refreshed(token_response, default_lifetime);
         self.set_state(new_state);

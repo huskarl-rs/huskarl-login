@@ -1,13 +1,4 @@
-//! Sealed session driver trait.
-//!
-//! [`SessionDriver`] abstracts session persistence so that the login middleware
-//! can work with any session backend. The trait is **sealed** — pick from the
-//! built-in implementations ([`CookieSessionStore`](crate::CookieSessionStore)
-//! or [`StoreBackedSessionStore`](crate::StoreBackedSessionStore)) or provide
-//! custom persistence via [`ExternalSessionStore`](crate::ExternalSessionStore).
-//!
-//! Methods that modify session state return `Vec<HeaderValue>` of Set-Cookie
-//! values. Framework integrations append them to the HTTP response.
+//! Sealed [`SessionDriver`] trait abstracting session persistence.
 
 use std::{fmt, sync::Arc};
 
@@ -19,26 +10,14 @@ use huskarl::core::{
 
 use crate::{completed_login::CompletedLogin, liveness::LivenessVerdict, session_state::Session};
 
-/// A type-erased session-error cause.
-///
-/// `Send + Sync` except on WASM (assumed single-threaded), mirroring
-/// `huskarl::core::platform`'s `MaybeSendSync` and `huskarl::core::BoxedSource`.
+/// A type-erased session-error cause (`Send + Sync` except on WASM).
 #[cfg(not(target_arch = "wasm32"))]
 pub type BoxedSource = Box<dyn std::error::Error + Send + Sync + 'static>;
-/// A type-erased session-error cause.
-///
-/// `Send + Sync` except on WASM (assumed single-threaded), mirroring
-/// `huskarl::core::platform`'s `MaybeSendSync` and `huskarl::core::BoxedSource`.
+/// A type-erased session-error cause (`Send + Sync` except on WASM).
 #[cfg(target_arch = "wasm32")]
 pub type BoxedSource = Box<dyn std::error::Error + 'static>;
 
-/// A request-time session-store failure.
-///
-/// Follows the same model as [`huskarl::core::Error`]: one non-generic struct
-/// carrying a matchable [`SessionErrorKind`], optional context, and a
-/// type-erased cause. Programmatic handling goes through [`kind`](Self::kind)
-/// and [`is_retryable`](Self::is_retryable) — they are the stable contract;
-/// downcasting the [`source`](std::error::Error::source) is not supported API.
+/// A request-time session-store failure; handle via [`kind`](Self::kind) and [`is_retryable`](Self::is_retryable).
 #[derive(Debug)]
 pub struct SessionError {
     kind: SessionErrorKind,
@@ -46,31 +25,19 @@ pub struct SessionError {
     source: Option<BoxedSource>,
 }
 
-/// Classification of a [`SessionError`].
-///
-/// Marked `#[non_exhaustive]`: match with a wildcard arm. The kinds map onto
-/// the dispositions an adapter cares about — retry (`Unavailable`), conflict
-/// (`Conflict`), gone (`Gone`), or a genuine fault (`Crypto`/`Store`).
+/// Classification of a [`SessionError`]. Match with a wildcard arm.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionErrorKind {
-    /// The backing store is unreachable or failed transiently; retrying the
-    /// same operation may succeed. The only [retryable](SessionError::is_retryable)
-    /// kind. Adapters typically map this to `503 Service Unavailable`.
+    /// The backing store is unreachable or failed transiently. The only [retryable](SessionError::is_retryable) kind.
     Unavailable,
-    /// A compare-and-swap retry budget was exhausted: the session was
-    /// concurrently rewritten on every attempt. Adapters typically map this to
-    /// `409 Conflict`.
+    /// A compare-and-swap retry budget was exhausted under concurrent rewrites.
     Conflict,
-    /// The session vanished mid-operation (deleted or expired between load and
-    /// update). The engine treats this like a missing session — re-authentication.
+    /// The session was deleted or expired between load and update.
     Gone,
-    /// A cookie seal/unseal or other cryptographic operation failed. A genuine
-    /// fault, not retryable; adapters typically map this to `500`.
+    /// A cookie seal/unseal or other cryptographic operation failed.
     Crypto,
-    /// The store violated its contract: a deserialize failure, an invalid
-    /// header value, or other unexpected shape. A genuine fault, not retryable;
-    /// adapters typically map this to `500`.
+    /// The store violated its contract (deserialize failure, invalid header, etc.).
     Store,
 }
 
@@ -90,16 +57,13 @@ impl SessionError {
         self.kind
     }
 
-    /// If true, the failure is transient and the same operation may succeed if
-    /// re-attempted. Only [`SessionErrorKind::Unavailable`] is retryable.
+    /// Whether the failure is transient and may succeed on retry.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         matches!(self.kind, SessionErrorKind::Unavailable)
     }
 
-    /// Attach human-readable context about the failed operation. Shown as a
-    /// prefix in the `Display` output; layers outermost-first like
-    /// [`huskarl::core::Error::with_context`].
+    /// Attach human-readable context, shown as a prefix in `Display` (layers outermost-first).
     #[must_use]
     pub fn with_context(mut self, context: impl Into<String>) -> Self {
         self.context = Some(match self.context {
@@ -121,8 +85,7 @@ impl From<SessionErrorKind> for SessionError {
 }
 
 impl From<huskarl::core::Error> for SessionError {
-    /// Carry a huskarl error (e.g. from a `UserInfo` call inside an enricher)
-    /// as a session error, preserving its retryability and concrete cause.
+    /// Carry a huskarl error as a session error, preserving its retryability.
     fn from(err: huskarl::core::Error) -> Self {
         let kind = if err.is_retryable() {
             SessionErrorKind::Unavailable
@@ -162,20 +125,12 @@ impl std::error::Error for SessionError {
     }
 }
 
-/// Box a store's own error as an [`Unavailable`](SessionErrorKind::Unavailable)
-/// session error — the default classification for an opaque backing-store
-/// failure, which is far more often transient (network, timeout) than a
-/// permanent fault. Framework sites that *know* the failure is a conflict,
-/// gone, or crypto/store fault construct [`SessionError::new`] with the precise
-/// kind instead.
+/// Box a store's own error as an [`Unavailable`](SessionErrorKind::Unavailable) session error.
 pub(crate) fn to_session_err(e: impl std::error::Error + MaybeSendSync + 'static) -> SessionError {
     SessionError::new(SessionErrorKind::Unavailable, e)
 }
 
 /// Sealed trait marker module.
-///
-/// This module is `#[doc(hidden)]` public so that downstream crates can
-/// implement sealed traits for testing purposes.
 #[doc(hidden)]
 pub mod sealed {
     pub trait Sealed {}
@@ -183,17 +138,9 @@ pub mod sealed {
 
 /// Session driver trait implemented by the built-in session stores.
 ///
-/// This trait is **sealed** — it cannot be implemented outside this crate.
-/// Users pick a session mode by constructing either a
-/// [`CookieSessionStore`](crate::CookieSessionStore) or a
-/// [`StoreBackedSessionStore`](crate::StoreBackedSessionStore).
-///
-/// To provide custom session persistence, implement
-/// [`ExternalSessionStore`](crate::ExternalSessionStore) and wrap it in a
-/// [`StoreBackedSessionStore`](crate::StoreBackedSessionStore).
-///
-/// Methods that modify session state return `Vec<HeaderValue>` containing
-/// `Set-Cookie` values. The middleware appends these to the HTTP response.
+/// Sealed: implemented only by [`CookieSessionStore`](crate::CookieSessionStore)
+/// and [`StoreBackedSessionStore`](crate::StoreBackedSessionStore) (the latter
+/// wrapping a custom [`ExternalSessionStore`](crate::ExternalSessionStore)).
 pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// The session type stored and retrieved by this driver.
     type SessionType: Session + MaybeSendSync + 'static;
@@ -201,48 +148,21 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// The error type returned by [`load`](Self::load).
     type LoadError: std::error::Error + MaybeSendSync + 'static;
 
-    /// Stamp the deployment's cookie-security policy onto this driver.
-    ///
-    /// Called once by [`LoginEngine`](crate::engine::LoginEngine) at
-    /// construction, with the value derived from
-    /// [`LoginConfig::base_url`](crate::LoginConfig::base_url) (`true` for an
-    /// `https` scheme). The built-in cookie stores use it to finalize their
-    /// session-cookie naming (`__Host-`/`__Secure-` prefix) and the `Secure`
-    /// attribute, so the session cookies match the login-state cookies the
-    /// engine issues — there is no separate `secure` knob to keep in sync.
-    ///
-    /// Sealed: implemented only by this crate's built-in stores.
+    /// Stamp the cookie-security policy (`secure`, from the `base_url` scheme)
+    /// onto this driver, fixing `__Host-`/`__Secure-` naming and the `Secure`
+    /// attribute. Called once at engine construction.
     fn apply_cookie_secure(&mut self, secure: bool);
 
-    /// The AEAD cipher this driver seals session data with.
-    ///
-    /// Every session driver seals with AEAD — cookie stores seal the session
-    /// itself, store-backed stores seal the pointer cookie — so this is a hard
-    /// requirement, not an optional capability.
-    ///
-    /// Exposed so convenience layers (e.g. `huskarl-axum`'s `LoginLayer`) can
-    /// default the engine's *separate* login-state cipher to the same key when
-    /// a deployment only wants one. The two seals are AAD-domain-separated
-    /// (`b"session"` / `b"session_ptr"` vs the OAuth `state`), so sharing a key
-    /// is safe; a deployment that wants distinct keys — e.g. a KMS-backed
-    /// login-state key and a local per-request session key — passes the
-    /// login-state cipher to the engine explicitly instead.
+    /// The AEAD cipher this driver seals session data with (AAD-domain-separated
+    /// from the login-state seal, so the key may be shared).
     fn session_aead_cipher(&self) -> Arc<dyn AeadCipher>;
 
-    /// Create a new session from a completed login.
+    /// Create and persist a new session from a completed login, returning it
+    /// with the `Set-Cookie` values for the callback response.
     ///
-    /// The driver's attached [`SessionEnricher`](crate::SessionEnricher)
-    /// builds the session from the framework-prepared seed, then the driver
-    /// persists it via its backing store (cookie or external) and returns
-    /// both the session and the `Set-Cookie` header values the framework
-    /// should attach to the callback response (the session cookies for
-    /// cookie-backed stores, the pointer cookie for store-backed sessions).
-    ///
-    /// `default_lifetime` is the assumed access-token lifetime when the
-    /// authorization server's token response omits `expires_in`.
-    ///
-    /// `headers` carries the request's cookies so cookie-backed stores can
-    /// clear any stale session chunks left over from a previous flow.
+    /// `default_lifetime` is the assumed access-token lifetime when the token
+    /// response omits `expires_in`. `headers` carries request cookies so cookie
+    /// stores can clear stale session chunks.
     fn create(
         &self,
         completed: CompletedLogin,
@@ -256,47 +176,20 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
         headers: &http::HeaderMap,
     ) -> impl Future<Output = Result<Option<Self::SessionType>, Self::LoadError>> + MaybeSend;
 
-    /// Persist updated session state, returning any `Set-Cookie` header values.
-    ///
-    /// Called after a token refresh changes session data. Stores whose data
-    /// sink is the cookie return the (re-encrypted) session cookies; stores
-    /// whose data sink is external return no cookies because the pointer
-    /// cookie's value is unchanged.
-    ///
-    /// `headers` are the request headers; cookie-backed stores enumerate the
-    /// chunked session cookies the browser sent so they can emit `Max-Age=0`
-    /// clears for any slots the new payload no longer uses.
+    /// Persist updated session state, returning any `Set-Cookie` header values
+    /// (re-encrypted cookies plus `Max-Age=0` clears for now-unused chunks; none
+    /// for store-backed sessions whose pointer cookie is unchanged).
     fn save(
         &self,
         session: &Self::SessionType,
         headers: &http::HeaderMap,
     ) -> impl Future<Output = Result<Vec<HeaderValue>, SessionError>> + MaybeSend;
 
-    /// Evaluate session liveness for this request, recording the activity as a
-    /// side effect when `record_activity` is set.
+    /// Evaluate session liveness, recording activity when `record_activity` is set.
     ///
-    /// Liveness is **server-side only**, so the default implementation returns
-    /// [`LivenessVerdict::Untracked`] — cookie sessions and store-backed
-    /// sessions without a [`LivenessStore`](crate::LivenessStore) neither
-    /// enforce an idle timeout nor record activity. `StoreBackedSessionStore`
-    /// overrides this when liveness is configured: it reads `last_active` and
-    /// returns the [`LivenessConfig`](crate::LivenessConfig) idle verdict
-    /// (always, so idle expiry is enforced on every request), and — only when
-    /// `record_activity` is `true` and the session is live — records activity
-    /// via the store's (throttled) `touch`, best-effort. It fails open: a read
-    /// error or missing entry yields [`LivenessVerdict::Active`], so a liveness
-    /// outage never tears sessions down. The engine acts only on
-    /// [`LivenessVerdict::Expired`].
-    ///
-    /// `record_activity` is the engine's per-request
-    /// [`ActivityPolicy`](crate::ActivityPolicy) classification — e.g. a
-    /// cross-site embed or background poll may be excluded so it doesn't keep an
-    /// abandoned session alive.
-    ///
-    /// `expire_at` is the session's absolute deadline (`created_at +
-    /// max_lifetime`, or `None` when unbounded), passed through to the liveness
-    /// store so its entry expires exactly when the session can no longer be
-    /// valid.
+    /// Server-side only; defaults to [`LivenessVerdict::Untracked`]. Stores with
+    /// a [`LivenessStore`](crate::LivenessStore) override this, failing open.
+    /// `expire_at` is the session's absolute deadline, if any.
     fn check_liveness(
         &self,
         _session: &Self::SessionType,
@@ -307,11 +200,8 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
         async { Ok(LivenessVerdict::Untracked) }
     }
 
-    /// Delete a session, returning `Set-Cookie` header values that clear
-    /// the session cookies.
-    ///
-    /// `headers` lets cookie-backed stores emit clears only for the chunked
-    /// cookies the browser actually has, rather than a fixed-size sweep.
+    /// Delete a session, returning `Set-Cookie` values that clear its cookies
+    /// (only those present in `headers`).
     fn delete(
         &self,
         session: &Self::SessionType,

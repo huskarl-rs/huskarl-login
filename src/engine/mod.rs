@@ -1,20 +1,6 @@
-//! Framework-agnostic login engine.
-//!
-//! [`LoginEngine`] exposes the OAuth 2.0 Authorization Code Grant as a set of
-//! composable primitives:
-//!
-//! - [`try_handle_login_route`](LoginEngine::try_handle_login_route) — handle
-//!   the configured `/callback` and `/logout` paths.
-//! - [`load_session`](LoginEngine::load_session) — load and validate the
-//!   session cookie (refreshing tokens if needed), without ever redirecting.
-//! - [`persist_session`](LoginEngine::persist_session) — write the session
-//!   back to the store after the inner handler returned.
-//! - [`redirect_to_login`](LoginEngine::redirect_to_login) — produce a
-//!   response that asks the client to authenticate (302 to AS for browser
-//!   navigation, 401 for XHR).
-//!
-//! Framework adapters (huskarl-axum, huskarl-pingora) compose these into
-//! middleware appropriate for the framework's routing model.
+//! Framework-agnostic login engine. [`LoginEngine`] exposes the OAuth 2.0
+//! Authorization Code Grant as composable primitives that framework adapters
+//! compose into middleware.
 
 use std::sync::{Arc, LazyLock};
 
@@ -57,27 +43,19 @@ type EngineError = SessionError;
 
 /// A framework-neutral HTTP response produced by the login engine.
 ///
-/// Modelled as a sum type so the two response shapes the engine actually
-/// produces can't be mixed up: a [`Redirect`](Self::Redirect) *always* carries
-/// a `Location` (a 302 without one is unrepresentable), and a
-/// [`Rendered`](Self::Rendered) response *always* carries its own status and
-/// body. Framework adapters lower this into their native response type via
+/// Framework adapters lower this into their native response type via
 /// [`into_parts`](Self::into_parts) at the response boundary.
 #[must_use]
 pub enum LoginResponse {
-    /// A `302 Found` redirect. The `Location` is typed, so the engine cannot
-    /// emit a redirect without one. `set_cookies` are the session/login-state
-    /// `Set-Cookie` values that ride along; the boundary also emits
-    /// `Cache-Control: no-store`, since these redirects carry session-bearing
-    /// cookies (RFC 6749 §5.1).
+    /// A `302 Found` redirect. The boundary also emits `Cache-Control:
+    /// no-store`, since these redirects carry session-bearing cookies.
     Redirect {
         /// The `Location` to redirect to.
         location: HeaderValue,
         /// `Set-Cookie` values to emit alongside the redirect.
         set_cookies: Vec<HeaderValue>,
     },
-    /// A response rendered with an explicit status, header set, and body —
-    /// error pages, `401`, `403`, `405`, and `5xx`.
+    /// A response rendered with an explicit status, header set, and body.
     Rendered {
         /// HTTP status code.
         status: StatusCode,
@@ -98,12 +76,8 @@ impl LoginResponse {
         }
     }
 
-    /// Lowers this semantic response into concrete HTTP parts: status code,
-    /// the full header list, and body. For a [`Redirect`](Self::Redirect) the
-    /// `Location`, `Cache-Control: no-store`, and `Set-Cookie` headers are
-    /// materialized here. Framework adapters call this at the response
-    /// boundary; the typed variants guarantee the parts are always coherent
-    /// (a redirect can never be lowered without a `Location`).
+    /// Lowers this response into concrete HTTP parts: status, full header list,
+    /// and body (a [`Redirect`](Self::Redirect)'s headers are materialized here).
     #[must_use]
     pub fn into_parts(self) -> (StatusCode, Vec<(HeaderName, HeaderValue)>, Bytes) {
         match self {
@@ -128,10 +102,8 @@ impl LoginResponse {
     }
 
     /// The full header list this response is served with, materialized
-    /// (cloning) — including a redirect's synthesized `Location`,
-    /// `Cache-Control: no-store`, and `Set-Cookie`s. Convenience for
-    /// inspection; the response boundary should prefer
-    /// [`into_parts`](Self::into_parts), which avoids the clone.
+    /// (cloning). For non-clone access at the boundary prefer
+    /// [`into_parts`](Self::into_parts).
     #[must_use]
     pub fn headers(&self) -> Vec<(HeaderName, HeaderValue)> {
         match self {
@@ -151,9 +123,8 @@ impl LoginResponse {
         }
     }
 
-    /// Appends a header to a [`Rendered`](Self::Rendered) response. Used by the
-    /// error-path builders, which always operate on `Rendered`; a no-op on
-    /// `Redirect`, whose header set is fixed and materialized at the boundary.
+    /// Appends a header to a [`Rendered`](Self::Rendered) response; a no-op on
+    /// [`Redirect`](Self::Redirect).
     fn push_rendered_header(&mut self, name: HeaderName, value: HeaderValue) {
         if let Self::Rendered { headers, .. } = self {
             headers.push((name, value));
@@ -164,21 +135,14 @@ impl LoginResponse {
 /// The result of [`LoginEngine::load_session`] — one variant per session
 /// state the adapter can observe.
 ///
-/// A *transient* refresh failure while the access token is still valid does
-/// not clear the session — it surfaces as [`Active`](Self::Active) or
-/// [`ActivePending`](Self::ActivePending) and the refresh is retried on a
-/// later request.
-///
-/// This enum is deliberately **not** `#[non_exhaustive]`: an adapter must
-/// handle every session state, so a future state should be a compile error
-/// at every call site rather than fall through a wildcard arm.
+/// Not `#[non_exhaustive]`: every state must be handled, so a new variant is a
+/// compile error at each call site.
 #[must_use]
 pub enum LoadedSession<S> {
     /// The request carried no session cookie.
     Missing,
-    /// A session was presented but torn down — expired, or token refresh
-    /// failed conclusively. `clears` must reach the final response to drop
-    /// the now-stale session cookies.
+    /// A session was presented but torn down. `clears` must reach the final
+    /// response to drop the now-stale session cookies.
     Cleared {
         /// Why the session was torn down.
         reason: TeardownReason,
@@ -190,20 +154,14 @@ pub enum LoadedSession<S> {
     Active {
         /// The loaded session.
         session: S,
-        /// `Set-Cookie` headers that must reach the final response: the
-        /// re-sealed session cookies when a token refresh was persisted
-        /// eagerly, empty otherwise. When non-empty these carry a live session
-        /// cookie, so the response they ride on must not be cached by shared
-        /// caches — see [`load_session`](LoginEngine::load_session)'s *Response
-        /// caching* note.
+        /// `Set-Cookie` headers that must reach the final response (re-sealed
+        /// session cookies after an eager refresh, else empty); see
+        /// [`load_session`](LoginEngine::load_session) on caching.
         set_cookies: Vec<HeaderValue>,
     },
-    /// Authenticated, with a save owed after the inner handler responds —
-    /// call [`LoginEngine::persist_session`].
-    ///
-    /// Only arises when the eager persist of a refreshed session failed; the
-    /// post-response save (and its [`PersistFailurePolicy`]) is the retry.
-    /// Never carries cookies: the save produces its cookies when it runs.
+    /// Authenticated, with a save owed after the inner handler responds — call
+    /// [`LoginEngine::persist_session`]. Arises only when the eager persist of
+    /// a refreshed session failed.
     ActivePending {
         /// The loaded session.
         session: S,
@@ -242,26 +200,21 @@ impl<S> std::fmt::Debug for LoadedSession<S> {
 }
 
 /// Why [`LoginEngine::load_session`] tore down a presented session.
-///
-/// Carried on [`LoadedSession::Cleared`] and reported to
-/// [`LoginEngineMetrics::record_teardown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::AsRefStr, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
 pub enum TeardownReason {
     /// [`LoginConfig::max_lifetime`](crate::LoginConfig::max_lifetime) exceeded.
     MaxLifetime,
-    /// Idle timeout exceeded — the server-side liveness verdict was
-    /// [`crate::LivenessVerdict::Expired`]. See
-    /// [`LivenessConfig::idle_timeout`](crate::LivenessConfig::idle_timeout).
+    /// Idle timeout exceeded (server-side liveness verdict
+    /// [`crate::LivenessVerdict::Expired`]).
     IdleTimeout,
     /// Session timestamps too far in the future — corrupt or forged.
     ClockSkew,
     /// The authorization server conclusively rejected the refresh token
     /// (e.g. `invalid_grant`).
     RefreshRejected,
-    /// Token refresh failed transiently, but the access token had already
-    /// expired — there is nothing valid left to serve.
+    /// Token refresh failed transiently after the access token had expired.
     RefreshUnavailable,
     /// The access token expired and the session holds no refresh token.
     NoRefreshToken,
@@ -275,42 +228,25 @@ impl TeardownReason {
     }
 }
 
-/// Decides how a framework adapter should react when the post-response save of
-/// a refreshed session fails.
+/// Decides how a framework adapter reacts when the post-response save of a
+/// refreshed session fails.
 ///
-/// Return `Some(LoginResponse)` to replace the handler's response, or `None`
-/// to let it pass through unchanged.
-///
-/// # Idempotency
-///
-/// By the time this is called the inner handler has already run, including any
-/// side effects (DB writes, queued jobs, etc.). Returning a replacement
-/// response will cause well-behaved clients to retry — design handlers
-/// accordingly.
+/// The inner handler has already run (including side effects) by the time this
+/// is called; a replacement response will cause well-behaved clients to retry.
 pub trait PersistFailurePolicy: MaybeSendSync + 'static {
     /// Decide what to do after a [`LoadedSession::ActivePending`] save failed.
-    ///
-    /// Returning `Some(response)` replaces the inner handler's response; `None`
-    /// lets it pass through unchanged. `error` is the underlying store error;
-    /// downcast it to [`SessionError`] to branch on
-    /// [`kind`](SessionError::kind).
+    /// `Some(response)` replaces the handler's response; `None` lets it pass
+    /// through. `error` may downcast to [`SessionError`].
     fn handle(&self, error: &(dyn std::error::Error + 'static)) -> Option<LoginResponse>;
 }
 
-/// Default policy: fail closed when the refreshed-session save fails.
+/// Default policy: fail closed when the refreshed-session save fails, replacing
+/// the response to force a clean retry.
 ///
-/// `ActivePending` only arises when the engine refreshed the access token but
-/// the eager persist inside [`LoginEngine::load_session`] failed; if the
-/// handler response is allowed through without persisting the new tokens the
-/// client is stranded on stale state — and with refresh-token rotation, often
-/// locked out entirely. Replacing the response forces a clean retry.
-///
-/// The replacement status is derived from the error's [`SessionErrorKind`] when
-/// the error is a [`SessionError`]: a [`Conflict`](SessionErrorKind::Conflict)
-/// becomes `409`, a genuine [`Crypto`](SessionErrorKind::Crypto) or
-/// [`Store`](SessionErrorKind::Store) fault becomes `500`, and everything else
-/// (transient [`Unavailable`](SessionErrorKind::Unavailable), `Gone`, or a
-/// non-`SessionError` cause) falls back to `503`.
+/// The replacement status is derived from a [`SessionError`]'s
+/// [`SessionErrorKind`]: [`Conflict`](SessionErrorKind::Conflict) → `409`,
+/// [`Crypto`](SessionErrorKind::Crypto)/[`Store`](SessionErrorKind::Store) →
+/// `500`, anything else → `503`.
 pub struct DefaultPersistFailurePolicy;
 
 impl PersistFailurePolicy for DefaultPersistFailurePolicy {
@@ -332,20 +268,15 @@ impl PersistFailurePolicy for DefaultPersistFailurePolicy {
 
 // ── Internal types ────────────────────────────────────────────────────────────
 
-/// Encrypted payload stored in the per-flow login-state cookie.
-///
-/// The flow's `state` value is used as AEAD associated data, binding the cookie
-/// to the specific authorization request.
+/// Encrypted payload stored in the per-flow login-state cookie. The flow's
+/// `state` value is the AEAD associated data.
 #[derive(Serialize, Deserialize)]
 struct LoginStateCookie {
     original_url: String,
     pending_state: PendingState,
-    /// When the flow started. Lets the engine enforce
-    /// [`LoginConfig::login_state_ttl`] server-side (the cookie's `Max-Age`
-    /// only enforces it browser-side). Cookies sealed before this field
-    /// existed decode as the epoch, which uniformly classifies them as
-    /// expired — exactly the re-login behavior a format change is documented
-    /// to produce.
+    /// Flow start time; enforces [`LoginConfig::login_state_ttl`] server-side.
+    /// Cookies sealed before this field existed decode as the epoch (treated
+    /// as expired).
     #[serde(with = "unix_secs", default = "unix_epoch")]
     created_at: SystemTime,
 }
@@ -360,9 +291,7 @@ fn unix_epoch() -> SystemTime {
 /// Framework-agnostic login engine: drives the OAuth flow (start, callback,
 /// logout) and persists sessions through its [`SessionDriver`] `SD`.
 ///
-/// Build one with `LoginEngine::builder()`; framework adapters compose its
-/// primitives into middleware. See the [module documentation](self) for the
-/// full set of primitives.
+/// Build one with `LoginEngine::builder()`.
 #[non_exhaustive]
 pub struct LoginEngine<SD> {
     /// The login configuration.
@@ -384,13 +313,9 @@ where
 {
     /// Builds a [`LoginEngine`]; invoked via `LoginEngine::builder()`.
     ///
-    /// The `grant` drives the OAuth flow itself — PAR, JAR, `DPoP`, PKCE, and
-    /// state/nonce generation all follow the grant's own configuration, and
-    /// the grant carries its own HTTP client.
-    ///
-    /// The `cipher` is used only for the short-lived login-state cookie (CSRF
-    /// protection during the OAuth flow). Session persistence is handled
-    /// entirely by the session store.
+    /// `grant` drives the OAuth flow per its own configuration. `cipher` seals
+    /// only the short-lived login-state cookie; sessions are persisted by the
+    /// session store.
     #[builder]
     pub fn new(
         config: LoginConfig,
@@ -426,21 +351,12 @@ impl<SD> LoginEngine<SD>
 where
     SD: SessionDriver,
 {
-    /// If the request URI's path is the configured callback or logout path,
-    /// returns the corresponding response. Otherwise returns `None` and the
-    /// framework adapter should fall through to the next layer.
+    /// If `uri`'s path is the configured callback or logout path, returns the
+    /// corresponding response; otherwise `None` (the adapter falls through).
     ///
-    /// The path is taken from `uri` — pass the same engine-side URI the
-    /// request arrived with (including any front-proxy `strip_prefix`).
-    ///
-    /// The callback only accepts `GET` — the authorization server delivers the
-    /// response as a query-string redirect (top-level navigation). Logout
-    /// accepts only `POST` (submitted from a form): logout is state-changing,
-    /// so restricting it to `POST` keeps it from being triggered by a `GET`
-    /// the user never intended — a cross-site link, an `<img>` tag, a
-    /// prefetch. Other methods on these paths get a `405 Method Not Allowed`
-    /// with an `Allow` header rather than falling through, since the paths are
-    /// reserved for the engine.
+    /// Pass the engine-side URI (including any front-proxy `strip_prefix`). The
+    /// callback accepts only `GET`, logout only `POST`; other methods on these
+    /// paths get `405 Method Not Allowed` with an `Allow` header.
     pub async fn try_handle_login_route(
         &self,
         method: &Method,
@@ -465,8 +381,7 @@ where
         None
     }
 
-    /// Builds a `405 Method Not Allowed` response advertising the allowed
-    /// methods (RFC 9110 §15.5.6 requires the `Allow` header).
+    /// Builds a `405 Method Not Allowed` response with an `Allow` header.
     fn method_not_allowed(&self, allow: &'static str) -> LoginResponse {
         let mut resp =
             self.build_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
@@ -474,79 +389,21 @@ where
         resp
     }
 
-    /// Loads and validates the session from request cookies, refreshing
-    /// the access token if it's near expiry.
-    ///
-    /// Never redirects or returns an error response — the framework adapter
-    /// decides what to do when no session is present (a downstream gate may
-    /// call [`redirect_to_login`](Self::redirect_to_login), or the request
-    /// may simply proceed unauthenticated).
-    ///
-    /// # Eager persistence after refresh
-    ///
-    /// A successful token refresh is persisted *here*, before this method
-    /// returns, rather than deferred to the adapter's post-response
-    /// [`persist_session`](Self::persist_session) call — with refresh-token
-    /// rotation, a deferred save that never runs (the adapter skips the
-    /// persist phase, the connection drops, the handler panics) would strand
-    /// the rotated token and lock the session out. The session is then
-    /// returned as [`LoadedSession::Active`] with the re-sealed session
-    /// cookies in its `set_cookies`. If the eager persist fails, the session
-    /// is returned as [`LoadedSession::ActivePending`] so the post-response
-    /// persist (and its [`PersistFailurePolicy`]) acts as the retry.
-    ///
-    /// # Concurrent refresh and refresh-token rotation
-    ///
-    /// Two in-flight requests — or two replicas in a distributed deployment —
-    /// can enter the refresh window for the same session at once, and each
-    /// will exchange the session's refresh token independently. When the
-    /// authorization server rotates refresh tokens, the expected deployment
-    /// shape is:
-    ///
-    /// - a **shared refresh-token cache** across replicas (implement
-    ///   `huskarl::cache::TokenCache` / `RefreshTokenStore` over shared
-    ///   storage) so concurrent refreshes converge on the rotated token
-    ///   instead of racing each other, and
-    /// - an authorization server configured with a **rotation grace period**,
-    ///   so reuse of the just-rotated token inside the race window is honored
-    ///   rather than treated as token theft (which would revoke the token
-    ///   family and log the user out).
-    ///
-    /// The race window is the length of the read → exchange → save-back
-    /// workflow. The save-back happens eagerly inside this method (see
-    /// above), so the window is roughly the token-exchange round trip plus
-    /// the store write — the inner handler's latency is not part of it.
-    /// Only when the eager persist fails does the save-back fall to
-    /// [`persist_session`](Self::persist_session) after the handler has
-    /// responded.
-    ///
-    /// Without both, occasional concurrent refreshes will lose the race and
-    /// surface as [`RefreshResult::Failed`] teardowns — most visibly with
-    /// cookie sessions, where the refresh token lives in the cookie and the
-    /// last writer wins.
-    ///
-    /// On infrastructure failure (e.g. the session store is unreachable) the
-    /// underlying error is returned; the adapter typically maps that to a
-    /// 5xx response.
+    /// Loads and validates the session from request cookies, refreshing the
+    /// access token if near expiry. Never redirects or errors. A successful
+    /// refresh is persisted eagerly, yielding [`LoadedSession::Active`] (or
+    /// [`LoadedSession::ActivePending`] if that persist failed).
     ///
     /// # Response caching
     ///
-    /// A [`LoadedSession::Active`] returned after an eager refresh carries the
-    /// re-sealed session cookies in its `set_cookies`, and the adapter attaches
-    /// them to the **inner handler's** response — whose caching the engine does
-    /// not control. The engine marks its *own* redirects and error pages
-    /// `Cache-Control: no-store`, but a refreshed session cookie riding on a
-    /// cacheable handler response could be stored by a shared cache and later
-    /// replayed to a different user. Adapters MUST ensure any response carrying
-    /// session `Set-Cookie` values — these, or those returned by
-    /// [`persist_session`](Self::persist_session) — is non-cacheable
-    /// (`Cache-Control: no-store`, or at minimum `private`). The same applies
-    /// to the cookie clears on [`LoadedSession::Cleared`].
+    /// Any response carrying session `Set-Cookie` values — `Active`'s
+    /// `set_cookies`, [`LoadedSession::Cleared`]'s clears, or those from
+    /// [`persist_session`](Self::persist_session) — MUST be made non-cacheable
+    /// by the adapter, or a shared cache could replay a session cookie.
     ///
     /// # Errors
     ///
-    /// Returns [`SessionError`] if the underlying session store fails to load
-    /// the session (e.g. transport error against an external store).
+    /// Returns [`SessionError`] if the session store fails to load.
     pub async fn load_session(
         &self,
         headers: &HeaderMap,
@@ -604,12 +461,9 @@ where
         })
     }
 
-    /// Produces a response that asks the client to authenticate.
-    ///
-    /// - Browser navigation: `302 Found` to the authorization server, with
-    ///   the current URL stored in a sealed cookie so the user returns here
-    ///   after callback.
-    /// - API/XHR requests: `401 Unauthorized`.
+    /// Produces a response that asks the client to authenticate: `302 Found`
+    /// to the authorization server for browser navigation (current URL sealed
+    /// in a cookie for return), `401 Unauthorized` for API/XHR.
     pub async fn redirect_to_login(&self, headers: &HeaderMap, uri: &Uri) -> LoginResponse {
         if !is_navigation_request(headers) {
             return self.build_error_response(StatusCode::UNAUTHORIZED, "authentication required");
@@ -633,13 +487,9 @@ where
         }
     }
 
-    /// Returns the reason the session should be torn down rather than served
-    /// — clock-skew corruption or absolute lifetime exceeded — or `None` when
-    /// the session is still good by these absolute checks.
-    ///
-    /// Idle timeout is handled separately, server-side, via
-    /// [`SessionDriver::check_liveness`]; it is not enforced here because
-    /// `last_active` is no longer carried on the session.
+    /// Returns the teardown reason from the absolute checks (clock skew, max
+    /// lifetime), or `None`. Idle timeout is enforced separately via
+    /// [`SessionDriver::check_liveness`].
     fn session_teardown_reason(
         &self,
         session: &SD::SessionType,
@@ -657,16 +507,10 @@ where
         None
     }
 
-    /// Token (or refresh window) elapsed — exchange the refresh token, or
-    /// emit cookie clears if refresh is unavailable / fails.
-    ///
-    /// One failure mode is softened: a *transient* refresh failure while the
-    /// access token is still valid (we entered the refresh window early)
-    /// retains the session instead of tearing it down — a brief AS blip
-    /// shouldn't log users out while their token still works. A later request
-    /// re-enters the refresh window and retries. Conclusive failures (the AS
-    /// rejected the refresh token, e.g. `invalid_grant`) and failures after
-    /// actual token expiry still tear the session down.
+    /// Exchanges the refresh token, or emits cookie clears if refresh is
+    /// unavailable / fails. A transient failure while the access token is still
+    /// valid retains the session for a later retry; conclusive failures and
+    /// failures after token expiry tear it down.
     async fn refresh_or_clear(
         &self,
         mut session: SD::SessionType,
@@ -735,8 +579,8 @@ where
         }
     }
 
-    /// Calls `session_store.delete`, logging on failure and returning an
-    /// empty vec so callers can `.extend(...)` unconditionally.
+    /// Calls `session_store.delete`, logging on failure and returning an empty
+    /// vec so callers can `.extend(...)` unconditionally.
     async fn delete_best_effort(
         &self,
         session: &SD::SessionType,
@@ -752,15 +596,8 @@ where
     }
 
     /// Exchanges the refresh token up to [`REFRESH_MAX_ATTEMPTS`] times,
-    /// retrying only when the underlying error advertises itself as retryable
-    /// (transient transport failures). Non-retryable errors (e.g.
-    /// `invalid_grant` from the authorization server) are returned immediately
-    /// so we don't waste calls — or risk tripping AS-side rate limiting — on a
-    /// refresh token the AS has already rejected.
-    ///
-    /// Retries use exponential backoff with jitter ([`refresh_retry_delay`]) so
-    /// a brief AS outage doesn't produce a synchronized thundering herd when
-    /// every in-flight refresh retries at the same moment.
+    /// retrying retryable errors with exponential backoff plus jitter
+    /// ([`refresh_retry_delay`]); non-retryable errors return immediately.
     async fn refresh_with_retry(&self, rt: &RefreshToken) -> Result<TokenResponse, Error> {
         let refresh_grant = self.grant.to_refresh_grant();
         let mut attempt = 0;
@@ -807,23 +644,15 @@ where
         }
     }
 
-    /// Saves the session owed by a [`LoadedSession::ActivePending`]
-    /// after the inner service has responded.
-    ///
-    /// Returns `Set-Cookie` header values to append to the response.
-    ///
-    /// `request_headers` are the cookies the browser sent on the original
-    /// request — cookie-backed session stores use them to clear any stale
-    /// chunked-cookie slots that the new session no longer occupies.
-    ///
-    /// The returned `Set-Cookie` values may carry a re-sealed session cookie,
-    /// so the response they attach to must not be cached by shared caches — see
-    /// [`load_session`](Self::load_session)'s *Response caching* note.
+    /// Saves the session owed by a [`LoadedSession::ActivePending`] after the
+    /// inner service responded, returning `Set-Cookie` values to append.
+    /// `request_headers` are the original request cookies (used by cookie-backed
+    /// stores to clear stale slots); see
+    /// [`load_session`](Self::load_session) on caching.
     ///
     /// # Errors
     ///
-    /// Returns [`SessionError`] if the underlying session store fails to write
-    /// the session (e.g. transport error against an external store).
+    /// Returns [`SessionError`] if the session store fails to write.
     pub async fn persist_session(
         &self,
         session: &SD::SessionType,
@@ -832,14 +661,13 @@ where
         self.session_store.save(session, request_headers).await
     }
 
-    /// Deletes a session, returning `Set-Cookie` header values that clear
-    /// the session cookies. See [`persist_session`](Self::persist_session)
-    /// for the role of `request_headers`.
+    /// Deletes a session, returning `Set-Cookie` values that clear the session
+    /// cookies. See [`persist_session`](Self::persist_session) for
+    /// `request_headers`.
     ///
     /// # Errors
     ///
-    /// Returns [`SessionError`] if the underlying session store fails to
-    /// delete the session.
+    /// Returns [`SessionError`] if the session store fails to delete.
     pub async fn delete_session(
         &self,
         session: &SD::SessionType,
@@ -848,20 +676,14 @@ where
         self.session_store.delete(session, request_headers).await
     }
 
-    /// Saves a session, returning `Set-Cookie` header values — an explicit,
-    /// unconditional save (e.g. after the application mutated the session), as
-    /// opposed to the deferred [`persist_session`](Self::persist_session) owed by
-    /// a [`LoadedSession::ActivePending`].
-    ///
-    /// See [`persist_session`](Self::persist_session) for the role of
-    /// `request_headers`. As there, the returned values may carry a re-sealed
-    /// session cookie, so the response must not be cached by shared caches — see
-    /// [`load_session`](Self::load_session)'s *Response caching* note.
+    /// Explicitly and unconditionally saves a session (e.g. after the
+    /// application mutated it), returning `Set-Cookie` values; unlike the
+    /// deferred [`persist_session`](Self::persist_session). See
+    /// [`persist_session`](Self::persist_session) for `request_headers`.
     ///
     /// # Errors
     ///
-    /// Returns [`SessionError`] if the underlying session store fails to save
-    /// the session.
+    /// Returns [`SessionError`] if the session store fails to save.
     pub async fn save_session(
         &self,
         session: &SD::SessionType,
@@ -871,10 +693,6 @@ where
     }
 
     /// Renders an error response through the configured [`ErrorPage`].
-    ///
-    /// Framework adapters use this to keep server-side error pages (e.g. 500
-    /// when session loading fails) consistent with the error pages produced
-    /// inside the OAuth flow itself.
     pub fn render_error(&self, status: StatusCode, message: &str) -> LoginResponse {
         self.build_error_response(status, message)
     }
@@ -898,27 +716,16 @@ where
 // ── Utility functions ─────────────────────────────────────────────────────────
 
 /// Maximum number of refresh attempts (initial + retries) before giving up.
-/// Only retryable transport errors trigger a retry; AS-rejection errors return
-/// immediately. Three attempts cover the typical transient-failure window (e.g.
-/// a single retransmit after a brief network hiccup) without amplifying load
-/// on a healthy AS.
 const REFRESH_MAX_ATTEMPTS: u32 = 3;
 
 /// Base delay for the first refresh retry; doubled on each subsequent attempt.
-/// With `REFRESH_MAX_ATTEMPTS = 3` the un-jittered waits are 100ms then 200ms,
-/// well below typical request budgets.
 const REFRESH_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 
-/// Maximum random jitter added on top of the exponential base. Decorrelates
-/// retries across a fleet that all entered the refresh window at the same
-/// moment so they don't synchronize their retransmits on a flapping AS.
+/// Maximum random jitter added on top of the exponential base.
 const REFRESH_RETRY_JITTER_MAX: Duration = Duration::from_millis(50);
 
 /// Wait before retry `attempt` (1-indexed): `base * 2^(attempt-1) + jitter`,
-/// where jitter is uniform random in `[0, REFRESH_RETRY_JITTER_MAX)`.
-///
-/// `.min(16)` on the shift is paranoia against a future bump to
-/// [`REFRESH_MAX_ATTEMPTS`]; with the current value of 3 it's never reached.
+/// jitter uniform in `[0, REFRESH_RETRY_JITTER_MAX)`.
 fn refresh_retry_delay(attempt: u32) -> Duration {
     let base = REFRESH_RETRY_BASE_DELAY * (1u32 << (attempt - 1).min(16));
     let jitter_max_ms = u64::try_from(REFRESH_RETRY_JITTER_MAX.as_millis()).unwrap_or(u64::MAX);
@@ -926,14 +733,9 @@ fn refresh_retry_delay(attempt: u32) -> Duration {
     base + Duration::from_millis(jitter_ms)
 }
 
-/// Maximum tolerated clock skew when validating session timestamps.
-///
-/// A session whose `created_at` is more than this far ahead of the server's
-/// wall clock is treated as corrupted and expired, rather than silently
-/// bypassing the `max_lifetime` check.
-///
-/// Sized to absorb realistic NTP drift and short-lived clock jumps without
-/// false-positives.
+/// Maximum tolerated clock skew when validating session timestamps. A session
+/// whose `created_at` is further than this ahead of the wall clock is treated
+/// as corrupted and expired.
 const MAX_CLOCK_SKEW: Duration = Duration::from_mins(1);
 
 /// Returns `true` if `timestamp` is more than [`MAX_CLOCK_SKEW`] ahead of `now`.
@@ -949,8 +751,7 @@ fn elapsed_since(earlier: SystemTime, now: SystemTime) -> Duration {
     now.duration_since(earlier).unwrap_or(Duration::ZERO)
 }
 
-/// Browser fetch-metadata header names. Not in `http::header::*` constants, so
-/// we materialize them once at first use rather than re-parsing on every request.
+/// Browser fetch-metadata header names, materialized once.
 static SEC_FETCH_MODE: LazyLock<HeaderName> =
     LazyLock::new(|| HeaderName::from_static("sec-fetch-mode"));
 static SEC_FETCH_DEST: LazyLock<HeaderName> =
@@ -963,30 +764,13 @@ static X_REQUESTED_WITH: LazyLock<HeaderName> =
     LazyLock::new(|| HeaderName::from_static("x-requested-with"));
 
 /// Returns `true` for a CORS preflight (`OPTIONS` + `Access-Control-Request-Method`).
-///
-/// Framework adapters typically short-circuit these requests so they reach
-/// the application's CORS layer without going through session handling or
-/// auth gates.
 pub fn is_cors_preflight(method: &Method, headers: &HeaderMap) -> bool {
     *method == Method::OPTIONS && headers.contains_key(header::ACCESS_CONTROL_REQUEST_METHOD)
 }
 
-/// Returns `true` if this looks like a top-level browser navigation.
-///
-/// Uses a multi-layer detection algorithm:
-///
-/// 1. `X-Requested-With: XMLHttpRequest` — classic XHR signal, always
-///    indicates a non-navigation request.
-/// 2. `Sec-Fetch-Mode` — definitive in all modern browsers; only `navigate`
-///    is a top-level navigation.
-/// 3. `Sec-Fetch-Dest` — backup if `Sec-Fetch-Mode` is stripped by an
-///    intermediary; only `document` is a page load.
-/// 4. `Sec-Fetch-User` — affirmative signal sent only on user-activated
-///    top-level navigations (always `?1`); a precise last-ditch rescue for a
-///    navigation whose `Sec-Fetch-Mode`/`Sec-Fetch-Dest` were stripped, before
-///    falling through to the weaker `Accept` heuristic.
-/// 5. `Accept` header — fallback for older clients; the presence of
-///    `text/html` or `application/xhtml+xml` usually means a page load.
+/// Returns `true` if this looks like a top-level browser navigation, using
+/// fetch-metadata headers (`Sec-Fetch-Mode`/`-Dest`/`-User`,
+/// `X-Requested-With`) with an `Accept: text/html` fallback for older clients.
 pub fn is_navigation_request(headers: &HeaderMap) -> bool {
     // Classic XHR signal — never a top-level navigation.
     if headers
@@ -1022,15 +806,8 @@ pub fn is_navigation_request(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.contains("text/html") || v.contains("application/xhtml+xml"))
 }
 
-/// Returns `true` when fetch metadata identifies the request as cross-site.
-///
-/// Session cookies are `SameSite=Lax`, so they accompany cross-site top-level
-/// navigations — any page on the web can steer a user's browser at a
-/// state-changing endpoint (e.g. the logout path) with their session attached.
-/// All modern browsers send `Sec-Fetch-Site` on every request; rejecting
-/// `cross-site` blocks that forgery. Requests without the header (older
-/// clients, non-browser agents, direct navigation) are not considered
-/// cross-site.
+/// Returns `true` when `Sec-Fetch-Site` identifies the request as cross-site.
+/// Requests without the header are not considered cross-site.
 #[must_use]
 pub fn is_cross_site_request(headers: &HeaderMap) -> bool {
     headers

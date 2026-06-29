@@ -105,11 +105,9 @@ where
         self.build_callback_redirect(&login_state.original_url, &cookie_name, session_cookies)
     }
 
-    /// Handles an RFC 6749 §4.1.2.1 error response from the authorization
-    /// server: records the metric (with the error code normalized to a closed
-    /// set — the parameter is attacker-suppliable) and renders a 403. The
-    /// raw `description` reaches the error page, which is responsible for
-    /// escaping it.
+    /// Handles an RFC 6749 §4.1.2.1 error response from the authorization server:
+    /// records the metric (error code normalized to a closed set) and renders a
+    /// 403. The raw `description` reaches the error page, which must escape it.
     fn handle_as_error(&self, error: &str, description: Option<&str>) -> LoginResponse {
         let message = match description {
             Some(desc) => format!("authorization denied: {desc}"),
@@ -122,14 +120,9 @@ where
         self.build_error_response(StatusCode::FORBIDDEN, &message)
     }
 
-    /// Assembles the 302 response that sends the user back to their original
-    /// URL: `Location`, the login-state cookie clear, and the session cookies
-    /// the driver minted on `create`.
-    ///
-    /// `original_url` was reconstructed from `base_url` plus the request path
-    /// and resealed in our own login-state cookie, so it is virtually always a
-    /// valid header value; should it somehow not be, the redirect falls back
-    /// to `base_url` rather than emitting a `Location`-less 302.
+    /// Assembles the 302 back to `original_url`, with the login-state cookie
+    /// clear and the session cookies minted on `create`. Falls back to
+    /// `base_url` if `original_url` is not a valid header value.
     fn build_callback_redirect(
         &self,
         original_url: &str,
@@ -150,15 +143,10 @@ where
         }
     }
 
-    /// Decodes the (base64-encoded, AEAD-sealed) login-state cookie and
-    /// returns the deserialized payload. On failure, returns the status code
-    /// and message the callback should respond with — the caller is
-    /// responsible for clearing the cookie.
-    ///
-    /// The payload's `created_at` is checked against
-    /// [`login_state_ttl`](crate::LoginConfig::login_state_ttl): the cookie's
-    /// `Max-Age` enforces the TTL browser-side only, so without this check a
-    /// captured cookie would stay usable indefinitely.
+    /// Decodes the base64-encoded, AEAD-sealed login-state cookie. On failure
+    /// returns the status and message to respond with (the caller clears the
+    /// cookie). Enforces
+    /// [`login_state_ttl`](crate::LoginConfig::login_state_ttl) server-side.
     async fn decode_login_state(
         &self,
         cookie_encoded: &str,
@@ -183,8 +171,7 @@ where
     }
 
     /// Builds the `Set-Cookie` value that clears a login-state cookie by name.
-    /// Returns `None` only if the name produces an invalid header value, which
-    /// shouldn't happen for cookies we generated.
+    /// `None` if the name produces an invalid header value.
     pub(super) fn clear_login_state_cookie(&self, cookie_name: &str) -> Option<HeaderValue> {
         let attrs = cookie_attrs(
             self.config.secure,
@@ -193,9 +180,8 @@ where
         HeaderValue::from_str(&format!("{cookie_name}=; {attrs}; Max-Age=0")).ok()
     }
 
-    /// Builds an error response for a failed callback and appends a
-    /// `Set-Cookie` that clears the located login-state cookie, so a stale
-    /// flow cannot be replayed.
+    /// Builds a callback error response and appends a `Set-Cookie` clearing the
+    /// login-state cookie.
     fn callback_error(
         &self,
         status: StatusCode,
@@ -211,9 +197,6 @@ where
 }
 
 /// Outcome of parsing the callback query string.
-///
-/// Pure data — the engine maps each variant to the appropriate HTTP response,
-/// keeping query parsing decoupled from response building.
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 enum CallbackParse {
     /// Valid OAuth response: code + state present (and optional `iss`).

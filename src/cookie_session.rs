@@ -1,9 +1,6 @@
-//! Cookie-based session storage.
-//!
-//! [`CookieSessionStore`] encrypts the entire session into chunked browser
-//! cookies using AEAD, so no server-side session store is needed. Large
-//! payloads are automatically split across multiple cookies (`.0`, `.1`, ...)
-//! to stay within browser size limits.
+//! Cookie-based session storage. [`CookieSessionStore`] encrypts the session
+//! into AEAD-sealed browser cookies, chunked (`.0`, `.1`, …) to stay within
+//! browser size limits.
 
 use std::{borrow::Cow, sync::Arc, time::Duration};
 
@@ -30,58 +27,8 @@ use crate::{
 
 const CHUNK_SIZE: usize = 3800;
 
-/// Bound alias for any type that can be sealed into (and unsealed from) the
-/// session cookie: a [`Session`] that round-trips through serde.
-///
-/// Blanket-implemented — never implement it directly. Define a custom payload
-/// type to store only the fields your application needs in the browser cookie
-/// rather than the full [`SessionState`], and build it with a
-/// [`SessionEnricher`] (supplied via the builder's `build_with_enricher`
-/// finisher) — see [`SessionEnricher`] for claim-mapping and `UserInfo`
-/// examples.
-///
-/// # Storing the `id_token` for RP-initiated logout
-///
-/// If your `IdP` supports RP-initiated logout and you want clean logout UX
-/// (no OP confirmation page), store the `id_token` in your custom type and
-/// override [`Session::id_token`]:
-///
-/// ```
-/// # use huskarl::token::IdToken;
-/// # use huskarl_login::{Session, SessionState};
-/// # struct MySession {
-/// #     state: SessionState,
-/// #     id_token: Option<IdToken>,
-/// # }
-/// impl Session for MySession {
-///     fn id_token(&self) -> Option<&IdToken> {
-///         self.id_token.as_ref()
-///     }
-///     // ...other methods
-/// #     fn state(&self) -> &SessionState { &self.state }
-/// #     fn set_state(&mut self, state: SessionState) { self.state = state; }
-/// }
-/// ```
-///
-/// # Updating custom fields on token refresh
-///
-/// If any of your custom fields come from a refresh response, override
-/// [`Session::apply_refresh`] to update them alongside the [`SessionState`]:
-///
-/// ```
-/// # use huskarl::{core::platform::Duration, grant::core::TokenResponse};
-/// # use huskarl_login::{Session, SessionState};
-/// # struct MySession { state: SessionState }
-/// # impl Session for MySession {
-/// #     fn state(&self) -> &SessionState { &self.state }
-/// #     fn set_state(&mut self, state: SessionState) { self.state = state; }
-/// fn apply_refresh(&mut self, token_response: &TokenResponse, default_lifetime: Duration) {
-///     let new_state = self.state().refreshed(token_response, default_lifetime);
-///     self.set_state(new_state);
-///     // update your own fields from token_response here
-/// }
-/// # }
-/// ```
+/// A [`Session`] that round-trips through serde, sealable into the session
+/// cookie. Blanket-implemented; build custom payloads via a [`SessionEnricher`].
 pub trait CookiePayload:
     Session + Serialize + for<'de> Deserialize<'de> + MaybeSendSync + 'static
 {
@@ -92,15 +39,8 @@ impl<T: Session + Serialize + for<'de> Deserialize<'de> + MaybeSendSync + 'stati
 {
 }
 
-/// A session that stores token state encrypted in browser cookies.
-///
-/// This is the default session type used with [`CookieSessionStore`]. It is a
-/// transparent newtype over [`SessionState`], so existing encrypted cookies
-/// deserialize correctly.
-///
-/// It carries no ID token claims beyond the `sub`/`sid` baked into
-/// [`SessionState`]. For a payload with user info (or a smaller one), define
-/// a custom type and build it with a [`SessionEnricher`].
+/// The default [`CookieSessionStore`] payload: a transparent newtype over
+/// [`SessionState`], carrying no claims beyond its `sub`/`sid`.
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CookieSession(SessionState);
@@ -123,72 +63,20 @@ impl From<SessionState> for CookieSession {
 
 /// A built-in session store that encrypts session data into chunked cookies.
 ///
-/// Large payloads are automatically split across multiple cookies (`.0`, `.1`,
-/// etc.) to stay within browser cookie size limits. Decryption failure is
-/// treated as "no session" rather than an error.
+/// The type parameter `C` is the [`CookiePayload`] stored in the cookie,
+/// defaulting to [`CookieSession`]. Decryption failure is treated as "no
+/// session". The `Secure` attribute and `__Host-`/`__Secure-` prefix are
+/// stamped on by the engine via
+/// [`SessionDriver::apply_cookie_secure`](crate::SessionDriver::apply_cookie_secure),
+/// not configured here.
 ///
-/// The type parameter `C` controls what is stored in the cookie. The default
-/// is [`CookieSession`], which stores the full [`SessionState`]. For a custom
-/// payload, supply any [`CookiePayload`] type.
-///
-/// The session payload is built after a completed login by a
-/// [`SessionEnricher`]. The builder's `build()` finisher uses
-/// [`NoEnrichment`] (requires `C: From<SessionState>`); the
-/// `build_with_enricher(…)` finisher attaches a custom enricher (e.g. one
-/// that maps ID token claims or calls the OIDC `UserInfo` endpoint) for
-/// payloads that need claims or I/O.
-///
-/// # Cookie format
-///
-/// - Cookie name: `{name}.0`, `{name}.1`, etc.
-/// - Chunk value: raw base64 of the sealed payload, split across chunks
-/// - Attributes: `HttpOnly; SameSite=Lax; Path={path}` plus optional `Secure`
-///
-/// The `Secure` attribute and cookie-name prefix follow the deployment's
-/// browser-facing scheme, which the engine derives from
-/// [`LoginConfig::base_url`](crate::LoginConfig::base_url) and stamps onto the
-/// store at construction (see
-/// [`SessionDriver::apply_cookie_secure`](crate::SessionDriver::apply_cookie_secure)).
-/// This store therefore takes no `secure` setting of its own — it cannot
-/// disagree with the login-state cookies the engine issues. When that derived
-/// value is secure and `cookie_path` is `"/"`, the configured name is
-/// automatically given the `__Host-` prefix (unless it already starts with
-/// `__Host-` or `__Secure-`). The prefix makes the browser reject the cookie
-/// if set by a sibling subdomain or over plain HTTP, blocking session
-/// fixation by cookie tossing. Note that switching a deployment from `http` to
-/// `https` renames the cookie: in-flight sessions under the old name are
-/// ignored and users re-login on their next navigation.
-///
-/// On read, chunks are concatenated by walking `{name}.0`, `{name}.1`, … until
-/// an index is missing. Truncation or stale leftover chunks just produce a
-/// payload the AEAD layer can't authenticate, which surfaces as "no session"
-/// and triggers a fresh login.
-///
-/// # Logout and revocation
-///
-/// A cookie session lives entirely in the browser — there is no server-side
-/// record to invalidate. Logout (and [`delete`](SessionDriver::delete)) can
-/// only emit `Max-Age=0` clears that drop the cookie from the *cooperating*
-/// browser; it cannot revoke a copy of the sealed cookie an attacker already
-/// captured (via XSS, a shared machine, or malware). Such a copy stays valid
-/// until its own timestamps age out — i.e. until
-/// [`max_lifetime`](crate::LoginConfig::max_lifetime) elapses, or the access
-/// token expires with no usable refresh token. There is no way to cut it short
-/// server-side, because the server holds no state for it. Cookie sessions have
-/// no idle timeout: idle enforcement is server-side only (see
-/// [`crate::liveness`]), and a stateless cookie has nothing to expire.
-///
-/// Mitigate by keeping `max_lifetime` tight — the realistic
-/// blast radius of a stolen cookie is that window. If you need server-side
-/// revocation — immediate logout-everywhere, back-channel logout, admin
-/// session kill — use
-/// [`StoreBackedSessionStore`](crate::StoreBackedSessionStore) instead: its
-/// [`delete`](SessionDriver::delete) removes the record from the external
-/// store, so the bearer cookie is dead on the next request regardless of who
-/// holds it.
+/// Cookie sessions are stateless: [`delete`](SessionDriver::delete) only
+/// clears the cooperating browser's cookie (no server-side revocation, no idle
+/// timeout); a stolen copy stays valid until
+/// [`max_lifetime`](crate::LoginConfig::max_lifetime) elapses. For revocation,
+/// use [`StoreBackedSessionStore`](crate::StoreBackedSessionStore).
 pub struct CookieSessionStore<C = CookieSession> {
-    /// Shared cookie-sealing machinery (cipher, cookie name/attrs, kid sidecar,
-    /// metrics) — see [`CookieSealer`].
+    /// Shared cookie-sealing machinery — see [`CookieSealer`].
     sealer: CookieSealer,
     enricher: Box<dyn SessionEnricher<SessionState, C>>,
 }
@@ -203,17 +91,13 @@ impl<C> CookieSessionStore<C> {
         #[builder(finish_fn)] enricher: Box<dyn SessionEnricher<SessionState, C>>,
         #[builder(with = |cipher: impl AeadCipher + 'static| Arc::new(cipher) as Arc<dyn AeadCipher>)]
         cipher: Arc<dyn AeadCipher>,
-        /// Base name for the session cookie. A [`CookieName`], so its
-        /// `[A-Za-z0-9_-]` invariant is established at construction — e.g.
-        /// `"session".parse()?` or `CookieName::new("session")?`.
+        /// Base name for the session cookie.
         cookie_name: CookieName,
-        /// Cookie `Path` scope. A [`RoutePath`] (starts with `/`; no `;`, `?`,
-        /// `#`, or control chars) — e.g. `"/".parse()?` or `RoutePath::new("/")?`.
+        /// Cookie `Path` scope.
         cookie_path: RoutePath,
-        /// Defaults to 400 days — finite but generous enough that the cookie
-        /// never expires before the server-side session does. If `max_lifetime`
-        /// is configured in `LoginConfig`, pass it here so the browser discards
-        /// the cookie around the time the session can no longer be valid.
+        /// Cookie `Max-Age`; defaults to 400 days. Pass `LoginConfig`'s
+        /// `max_lifetime` so the browser discards the cookie when the session
+        /// can no longer be valid.
         #[builder(default = DEFAULT_COOKIE_MAX_AGE)]
         max_age: Duration,
         /// Optional metrics observer for encrypt/decrypt events.
@@ -238,8 +122,7 @@ impl<C, S: cookie_store_builder::IsComplete> CookieSessionStoreBuilder<C, S> {
     }
 
     /// Finishes the builder with a custom [`SessionEnricher`], for payloads
-    /// that need ID token claims or I/O (e.g. the OIDC `UserInfo` endpoint)
-    /// to construct. See [`SessionEnricher`] for examples.
+    /// that need ID token claims or I/O to construct.
     #[must_use]
     pub fn build_with_enricher(
         self,
@@ -248,12 +131,10 @@ impl<C, S: cookie_store_builder::IsComplete> CookieSessionStoreBuilder<C, S> {
         self.build_internal(Box::new(enricher))
     }
 
-    /// Finishes the builder with a synchronous claim-mapper: build the payload
-    /// from the [`SessionState`] seed and the [`CompletedLogin`] (e.g. copy ID
-    /// token claims) without I/O. For enrichment that must `await` — such as
-    /// the OIDC `UserInfo` endpoint — use
-    /// [`build_with_enricher`](Self::build_with_enricher) instead; for payloads
-    /// built from the seed alone, use [`build`](Self::build).
+    /// Finishes the builder with a synchronous claim-mapper that builds the
+    /// payload from the [`SessionState`] seed and the [`CompletedLogin`]
+    /// without I/O. For `await`-ing enrichment use
+    /// [`build_with_enricher`](Self::build_with_enricher).
     #[must_use]
     pub fn build_with_claims<F>(self, f: F) -> CookieSessionStore<C>
     where
@@ -265,12 +146,6 @@ impl<C, S: cookie_store_builder::IsComplete> CookieSessionStoreBuilder<C, S> {
 
 impl<C> CookieSessionStore<C> {
     /// Returns the active cipher's key ID, if the key has an identity.
-    ///
-    /// Delegates to
-    /// [`AeadEncryptor::key_id`](huskarl::core::crypto::cipher::AeadEncryptor::key_id).
-    /// Once reload support is added to `AeadCipher`, this will reflect the key
-    /// that will be used for the **next** seal operation — suitable for
-    /// updating an active-key gauge from a reload callback.
     #[must_use]
     pub fn key_id(&self) -> Option<Cow<'_, str>> {
         self.sealer.key_id()
@@ -333,27 +208,20 @@ impl<C: CookiePayload> CookieSessionStore<C> {
         chunks
     }
 
-    /// Parses a single `name=value` cookie pair as a chunk if `name` matches
-    /// `{cookie_name}.N` for some non-negative integer `N`. The full
-    /// `(index, value)` form is what `load_session` needs to reassemble.
+    /// Parses a `name=value` cookie pair into `(index, value)` if `name`
+    /// matches `{cookie_name}.N`.
     fn parse_chunk_pair(&self, pair: &str) -> Option<(usize, String)> {
         let (k, v) = pair.trim().split_once('=')?;
         Some((self.parse_chunk_index(k)?, v.trim().to_owned()))
     }
 
-    /// Parses just the chunk index from a cookie name. Used by the clear-path,
-    /// which needs to know which `{name}.N` slots the browser currently has
-    /// but doesn't care about their values.
+    /// Parses the chunk index `N` from a `{cookie_name}.N` cookie name.
     fn parse_chunk_index(&self, name: &str) -> Option<usize> {
         let suffix = name.trim().strip_prefix(&self.sealer.cookie_name)?;
         suffix.strip_prefix('.')?.parse::<usize>().ok()
     }
 
-    /// Invokes `f` once with each `{cookie_name}.N` index the browser sent on
-    /// this request. The callback shape avoids materializing a `Vec<usize>`
-    /// when the only reason for enumerating is to emit one `Set-Cookie` per
-    /// match — and we only ever enumerate on a save/touch/delete path that's
-    /// already emitting cookies, so this is the one walk per write.
+    /// Invokes `f` once with each `{cookie_name}.N` index the browser sent.
     fn for_each_request_chunk_index(&self, headers: &http::HeaderMap, mut f: impl FnMut(usize)) {
         for value in headers.get_all(http::header::COOKIE) {
             let Ok(s) = value.to_str() else { continue };
@@ -403,9 +271,7 @@ impl<C: CookiePayload> CookieSessionStore<C> {
         Ok(headers)
     }
 
-    /// Builds the `Set-Cookie` header for chunk `i`. All chunks carry the raw
-    /// base64 payload — chunk count is implied by the presence of `{name}.0`,
-    /// `{name}.1`, … in the request and inferred by the reader.
+    /// Builds the `Set-Cookie` header for chunk `i`.
     fn build_chunk_header(
         &self,
         i: usize,
@@ -417,9 +283,7 @@ impl<C: CookiePayload> CookieSessionStore<C> {
     }
 
     /// Appends `Max-Age=0` clears for every chunk slot the browser sent that
-    /// the current save is not going to overwrite (indices `>= num_chunks`).
-    /// Reads the request rather than walking a fixed range, so there is no
-    /// chunk-count cap to grow over time and no orphaned slots after a shrink.
+    /// this save will not overwrite (indices `>= num_chunks`).
     fn append_clears_for_leftover_chunks(
         &self,
         headers: &mut Vec<HeaderValue>,
@@ -516,10 +380,8 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
     }
 }
 
-/// Splits the encoded session string into [`CHUNK_SIZE`]-byte slices. The
-/// input is URL-safe base64 (ASCII), so every byte offset is a `char`
-/// boundary and slicing by byte range is always valid — no UTF-8 revalidation
-/// (or its panic path) is needed.
+/// Splits the encoded session string into [`CHUNK_SIZE`]-byte slices. Input is
+/// ASCII base64, so byte-range slicing is always on a `char` boundary.
 fn split_into_chunks(cookie_value: &str) -> Vec<&str> {
     let len = cookie_value.len();
     (0..len)
@@ -528,15 +390,9 @@ fn split_into_chunks(cookie_value: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Reassembles the chunked session payload by concatenating `{name}.0`,
-/// `{name}.1`, … until a gap is found. Returns `None` if chunk 0 is absent.
-/// Truncation, gaps, and stale leftover chunks all produce a payload the AEAD
-/// layer can't authenticate — caller treats that as "no session" and the user
-/// re-logs in.
-///
-/// The loop is bounded by the size of the request (the chunk map only contains
-/// what the browser actually sent), which is in turn bounded by the HTTP layer's
-/// request-size limit.
+/// Reassembles the chunked payload by concatenating `{name}.0`, `{name}.1`, …
+/// until a gap is found. Returns `None` if chunk 0 is absent; truncation or
+/// gaps just yield a payload the AEAD layer rejects as "no session".
 fn reassemble_chunks(chunks: &std::collections::HashMap<usize, String>) -> Option<String> {
     let first = chunks.get(&0)?;
     let mut raw_encoded = String::with_capacity(chunks.len() * CHUNK_SIZE);
@@ -601,9 +457,8 @@ mod tests {
         assert!(matches!(result, Err(InvalidCookieName { .. })));
     }
 
-    /// Builds a `Cookie:` header from the `Set-Cookie` values a save produced,
-    /// stripping cookie attributes so it looks like an actual request cookie
-    /// header sent by the browser.
+    /// Builds a request `Cookie:` header from the `Set-Cookie` values a save
+    /// produced, stripping attributes.
     fn request_cookies_from_set_cookies(set_cookies: &[HeaderValue]) -> HeaderMap {
         let mut headers = HeaderMap::new();
         let mut pairs = Vec::new();
@@ -623,8 +478,6 @@ mod tests {
     }
 
     /// A request `Cookie:` header carrying chunk slots `.0` through `.{n-1}`.
-    /// Used to exercise the clear-leftover-chunks path on save without going
-    /// through a real round-trip.
     fn request_with_chunk_slots(n: usize) -> HeaderMap {
         let mut headers = HeaderMap::new();
         if n > 0 {
@@ -786,10 +639,8 @@ mod tests {
     use huskarl::core::crypto::cipher::{AeadDecryptor, MultiKeyCipher, MultiKeyDecryptor};
 
     /// A rotation-shaped cipher: seals under "v2", unseals under {"v1", "v2"}.
-    /// Unlike the single-key test ciphers (which ignore the `CipherMatch`
-    /// hint entirely), the multi-key decryptor takes an exact-kid match as
-    /// definitive and reports "no matching key" for unknown kids — the shape
-    /// that makes a wrong sidecar hint actually bite.
+    /// Its decryptor treats an exact-kid match as definitive, so a wrong
+    /// sidecar hint actually bites (unlike the single-key test ciphers).
     async fn multi_key_cipher() -> MultiKeyCipher<AesGcmKey> {
         let decryptor = MultiKeyDecryptor::new(vec![
             Arc::new(aes_key_with_kid("v1", 1).await) as Arc<dyn AeadDecryptor>,
@@ -988,9 +839,7 @@ mod tests {
 
     // ── Save / load roundtrip ─────────────────────────────────────────────
 
-    /// Sanity-check that the CBOR payload is meaningfully smaller than the
-    /// equivalent JSON payload. Cookies are sent on every authenticated
-    /// request, so this directly affects bandwidth.
+    /// Sanity-check that the CBOR payload is smaller than the JSON equivalent.
     #[test]
     fn cbor_payload_is_smaller_than_json() {
         let state = test_state();
@@ -1047,10 +896,8 @@ mod tests {
 
     // ── SessionEnricher / CookiePayload ───────────────────────────────────
 
-    /// An enrichment-built session type: `email` is *required*, so the type
-    /// can't be built from the seed alone (no `From<SessionState>`). It
-    /// implements only `Session` + serde (`CookiePayload` is
-    /// blanket-implemented) and is constructed by an enricher.
+    /// An enrichment-built session type: `email` is required, so there is no
+    /// `From<SessionState>` and it must be built by an enricher.
     #[derive(Serialize, Deserialize)]
     struct EnrichedSession {
         state: SessionState,
@@ -1066,8 +913,8 @@ mod tests {
         }
     }
 
-    /// Stands in for an enricher that owns its own clients (e.g. a
-    /// `UserInfoClient`) and awaits them while building the session.
+    /// Stands in for an enricher that awaits its own clients while building
+    /// the session.
     struct TestEnricher;
 
     impl SessionEnricher<SessionState, EnrichedSession> for TestEnricher {
@@ -1134,8 +981,7 @@ mod tests {
         assert_eq!(cipher.key_id().as_deref(), Some("v5"));
     }
 
-    /// A completed login carrying an `email` profile claim, for exercising the
-    /// synchronous claim-mapper finisher.
+    /// A completed login carrying an `email` profile claim.
     fn completed_with_email(email: &str) -> CompletedLogin {
         let token_response = huskarl::grant::core::RawTokenResponse::builder()
             // A fixture token value, not a key — `SecretString::new` is the
