@@ -1279,6 +1279,10 @@ fn default_persist_failure_policy_maps_kinds_and_is_no_store() {
     for (kind, expected) in [
         (SessionErrorKind::Conflict, StatusCode::CONFLICT),
         (SessionErrorKind::Crypto, StatusCode::INTERNAL_SERVER_ERROR),
+        (
+            SessionErrorKind::Encoding,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
         (SessionErrorKind::Store, StatusCode::INTERNAL_SERVER_ERROR),
         (
             SessionErrorKind::Unavailable,

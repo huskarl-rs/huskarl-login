@@ -36,7 +36,7 @@ where
             .await?;
 
         let location = HeaderValue::from_str(&start.authorization_url.to_string())
-            .map_err(|e| SessionError::new(SessionErrorKind::Store, e))?;
+            .map_err(|e| SessionError::new(SessionErrorKind::Encoding, e))?;
         Ok(LoginResponse::Redirect {
             status: http::StatusCode::FOUND,
             location,
@@ -58,7 +58,7 @@ where
             pending_state,
             created_at: SystemTime::now(),
         })
-        .map_err(|e| SessionError::new(SessionErrorKind::Store, e))?;
+        .map_err(|e| SessionError::new(SessionErrorKind::Encoding, e))?;
         let bundle = self
             .cipher
             .seal(&payload, &super::login_state_aad(state))
@@ -79,6 +79,6 @@ where
         HeaderValue::from_str(&format!(
             "{cookie_name}={cookie_value}; {attrs}; Max-Age={max_age}"
         ))
-        .map_err(|e| SessionError::new(SessionErrorKind::Store, e))
+        .map_err(|e| SessionError::new(SessionErrorKind::Encoding, e))
     }
 }

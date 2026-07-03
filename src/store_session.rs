@@ -356,7 +356,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             .cipher
             .seal(session_key.as_bytes(), &aad)
             .await
-            .map_err(to_session_err)?;
+            .map_err(|e| SessionError::new(SessionErrorKind::Crypto, e))?;
         // See cookie_session.rs for the rationale on reading `key_id()` from
         // the same cipher that just sealed the bundle: stable for single-key
         // ciphers; if multi-key sealers land, switch to `AeadCipherSelector`.
@@ -368,7 +368,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             "{}={cookie_value}; {attrs}",
             self.sealer.cookie_name
         ))
-        .map_err(to_session_err)?;
+        .map_err(|e| SessionError::new(SessionErrorKind::Encoding, e))?;
         let kid_header = self.sealer.build_kid_header(kid.as_deref())?;
         Ok(vec![pointer, kid_header])
     }
