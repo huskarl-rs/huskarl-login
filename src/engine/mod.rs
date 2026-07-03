@@ -280,7 +280,9 @@ impl PersistFailurePolicy for DefaultPersistFailurePolicy {
         };
         Some(LoginResponse::Rendered {
             status,
-            headers: Vec::new(),
+            // Same rule as every engine-rendered response: session-adjacent
+            // responses are never cacheable.
+            headers: vec![(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
             body: Bytes::new(),
         })
     }
