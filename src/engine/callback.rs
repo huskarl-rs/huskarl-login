@@ -11,9 +11,10 @@ use serde::Deserialize;
 
 use super::{LoginEngine, LoginResponse, LoginStateCookie, error_chain};
 use crate::{
-    CompletedLogin, SessionDriver,
+    CompletedLogin, Session, SessionDriver,
     cookie::{
         cookie_attrs, decode_payload, get_cookie, is_valid_oauth_state, login_state_cookie_name,
+        login_state_cookie_name_prefix, login_state_cookie_names,
     },
     metrics::{LoginCompleteResult, normalize_as_error},
     url::base_url_as_string,
@@ -43,8 +44,15 @@ where
             self.config.login_cookie_prefix.as_str(),
         );
         let Some(cookie_encoded) = get_cookie(headers, &cookie_name).map(str::to_owned) else {
-            // No cookie to clear — either none was set, or the browser sent a
-            // cookie under a different `state` name (which we can't address).
+            // No cookie under this state's name. The common benign cause is a
+            // flow that already completed: the success sweep cleared it
+            // (another tab finished first, or the user re-navigated a stale
+            // callback URL). If the browser already holds a usable session,
+            // send it home instead of failing the navigation.
+            if self.has_usable_session(headers).await {
+                self.record_login_complete(&LoginCompleteResult::AlreadyAuthenticated, None);
+                return self.redirect_to_base_url();
+            }
             self.record_login_complete(&LoginCompleteResult::InvalidRequest, None);
             return self.build_error_response(StatusCode::BAD_REQUEST, "invalid or missing state");
         };
@@ -102,7 +110,39 @@ where
         };
 
         self.record_login_complete(&LoginCompleteResult::Ok, None);
-        self.build_callback_redirect(&login_state.original_url, &cookie_name, session_cookies)
+        self.build_callback_redirect(&login_state.original_url, headers, session_cookies)
+    }
+
+    /// Best-effort: whether the request already carries a session that passes
+    /// the absolute checks and holds an unexpired access token. Deliberately
+    /// skips refresh and liveness — this only picks between a friendly
+    /// redirect and a 400 on the callback's no-login-state path; the next
+    /// request runs the full [`load_session`](LoginEngine::load_session).
+    async fn has_usable_session(&self, headers: &HeaderMap) -> bool {
+        match self.session_store.load(headers).await {
+            Ok(Some(session)) => {
+                let now = SystemTime::now();
+                self.session_teardown_reason(&session, now).is_none()
+                    && now < session.token_expiry()
+            }
+            Ok(None) => false,
+            Err(e) => {
+                log::debug!(
+                    "session load failed during callback fallback: {}",
+                    error_chain(&e)
+                );
+                false
+            }
+        }
+    }
+
+    /// A plain `302 Found` to the configured `base_url`.
+    fn redirect_to_base_url(&self) -> LoginResponse {
+        LoginResponse::Redirect {
+            location: HeaderValue::from_str(&base_url_as_string(&self.config))
+                .unwrap_or_else(|_| HeaderValue::from_static("/")),
+            set_cookies: vec![],
+        }
     }
 
     /// Handles an RFC 6749 §4.1.2.1 error response from the authorization server:
@@ -120,21 +160,35 @@ where
         self.build_error_response(StatusCode::FORBIDDEN, &message)
     }
 
-    /// Assembles the 302 back to `original_url`, with the login-state cookie
-    /// clear and the session cookies minted on `create`. Falls back to
-    /// `base_url` if `original_url` is not a valid header value.
+    /// Assembles the 302 back to `original_url`, with clears for every pending
+    /// login-state cookie and the session cookies minted on `create`. Falls
+    /// back to `base_url` if `original_url` is not a valid header value.
     fn build_callback_redirect(
         &self,
         original_url: &str,
-        cookie_name: &str,
+        headers: &HeaderMap,
         session_cookies: Vec<HeaderValue>,
     ) -> LoginResponse {
         let location = HeaderValue::from_str(original_url)
             .or_else(|_| HeaderValue::from_str(&base_url_as_string(&self.config)))
             .unwrap_or_else(|_| HeaderValue::from_static("/"));
-        let mut set_cookies = Vec::with_capacity(session_cookies.len() + 1);
-        if let Some(v) = self.clear_login_state_cookie(cookie_name) {
-            set_cookies.push(v);
+        // Sweep every login-state cookie on the request, not just the flow
+        // that completed: the session now exists, so pending flows in other
+        // tabs are moot, and clearing them keeps abandoned flows from piling
+        // toward the browser's per-domain cookie cap (where eviction could
+        // hit the session cookie itself). The sweep only touches names whose
+        // suffix is a valid state value — names this crate could have minted.
+        let prefix = login_state_cookie_name_prefix(
+            self.config.secure,
+            self.config.browser_callback_path.as_str(),
+            self.config.login_cookie_prefix.as_str(),
+        );
+        let names = login_state_cookie_names(headers, &prefix);
+        let mut set_cookies = Vec::with_capacity(session_cookies.len() + names.len());
+        for name in &names {
+            if let Some(v) = self.clear_login_state_cookie(name) {
+                set_cookies.push(v);
+            }
         }
         set_cookies.extend(session_cookies);
         LoginResponse::Redirect {

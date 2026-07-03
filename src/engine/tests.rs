@@ -1367,6 +1367,97 @@ async fn callback_success_redirects_to_original_url() {
     assert!(login_cookie_cleared, "login-state cookie must be cleared");
 }
 
+#[tokio::test]
+async fn callback_success_sweeps_all_pending_login_state_cookies() {
+    // Abandoned flows (other tabs, retried logins) leave login-state cookies
+    // behind; a completed login makes them all moot, so the success response
+    // clears every one — bounding jar growth toward the browser's per-domain
+    // cookie cap.
+    let e = LoginEngine::builder()
+        .config(default_config())
+        .grant(test_grant(TokenHttp).await)
+        .session_store(MockSessionStore::empty())
+        .cipher(test_cipher().await)
+        .build();
+    let state = "valid_state";
+    let sealed = seal_login_cookie(state, "https://app.example.com/page").await;
+    let name = |s: &str| {
+        crate::cookie::login_state_cookie_name(
+            s,
+            true,
+            "/callback",
+            crate::cookie::DEFAULT_LOGIN_COOKIE_PREFIX,
+        )
+    };
+    let cookie_header = format!(
+        "{}={sealed}; unrelated=keep; {}=stale1; {}=stale2",
+        name(state),
+        name("stale_a"),
+        name("stale_b"),
+    );
+    let h = headers(&[("cookie", &cookie_header)]);
+    let uri = format!("/callback?code=authcode&state={state}")
+        .parse()
+        .unwrap();
+    let r = e
+        .try_handle_login_route(&Method::GET, &h, &uri)
+        .await
+        .expect("callback handled");
+    assert_eq!(r.status(), StatusCode::FOUND);
+    for s in [state, "stale_a", "stale_b"] {
+        let n = name(s);
+        let cleared = r.headers().iter().any(|(hn, v)| {
+            *hn == http::header::SET_COOKIE
+                && v.to_str().unwrap().starts_with(&format!("{n}=;"))
+                && v.to_str().unwrap().contains("Max-Age=0")
+        });
+        assert!(cleared, "expected clear for pending flow cookie {n}");
+    }
+    // Cookies outside the login-state namespace are untouched.
+    let unrelated_touched = r.headers().iter().any(|(hn, v)| {
+        *hn == http::header::SET_COOKIE && v.to_str().unwrap().starts_with("unrelated=")
+    });
+    assert!(!unrelated_touched, "unrelated cookies must not be swept");
+}
+
+#[tokio::test]
+async fn callback_without_state_cookie_but_with_session_redirects_home() {
+    // The success sweep (or a re-navigated stale callback URL) can produce a
+    // code+state callback with no matching login-state cookie. With a usable
+    // session already present, the user is sent home instead of shown a 400.
+    let e = engine(MockSessionStore::with_session(valid_session())).await;
+    let uri = "/callback?code=authcode&state=mystate".parse().unwrap();
+    let r = e
+        .try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
+        .await
+        .expect("callback handled");
+    assert_eq!(r.status(), StatusCode::FOUND);
+    let hdrs = r.headers();
+    let loc = hdrs
+        .iter()
+        .find(|(n, _)| *n == http::header::LOCATION)
+        .map(|(_, v)| v.to_str().unwrap());
+    assert_eq!(loc, Some("https://app.example.com/"));
+}
+
+#[tokio::test]
+async fn callback_without_state_cookie_and_expired_session_returns_400() {
+    // An expired session can't vouch for the user — the fallback must not
+    // rescue it; the 400 (and a fresh login) is correct.
+    let session = session_with(
+        SystemTime::now() - Duration::from_mins(5),
+        None,
+        SystemTime::now() - Duration::from_hours(1),
+    );
+    let e = engine(MockSessionStore::with_session(session)).await;
+    let uri = "/callback?code=authcode&state=mystate".parse().unwrap();
+    let r = e
+        .try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
+        .await
+        .expect("callback handled");
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+}
+
 // ── Logout handler ────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1772,6 +1863,23 @@ async fn metrics_callback_as_denied_normalizes_unknown_error_code() {
         vec![MetricCall::LoginComplete {
             result: "as_denied",
             as_error: Some("other".to_owned()),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn metrics_callback_already_authenticated_on_stale_callback_with_session() {
+    // A stale callback rescued by an existing session must not be counted as
+    // an invalid request (nor as a fresh login).
+    let (e, m) = engine_with_metrics(MockSessionStore::with_session(valid_session())).await;
+    let uri = "/callback?code=authcode&state=mystate".parse().unwrap();
+    e.try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
+        .await;
+    assert_eq!(
+        m.calls(),
+        vec![MetricCall::LoginComplete {
+            result: "already_authenticated",
+            as_error: None
         }]
     );
 }

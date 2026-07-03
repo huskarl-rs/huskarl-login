@@ -11,6 +11,7 @@ use huskarl::core::{
     platform::MaybeSendSync,
 };
 use serde::{Deserialize, Serialize};
+use snafu::Snafu;
 
 use crate::{
     completed_login::CompletedLogin,
@@ -26,6 +27,29 @@ use crate::{
 };
 
 const CHUNK_SIZE: usize = 3800;
+
+/// Default chunk budget for a saved session (see the builder's `max_chunks`).
+/// Two chunks ≈ 7.6 KB of cookie data (~5.6 KB of plaintext session), sized
+/// against common 8–16 KB request-header limits (nginx and Apache default to
+/// 8 KB, Node to 16 KB in total).
+const DEFAULT_MAX_CHUNKS: usize = 2;
+
+/// [`CookieSessionStore`] refused to save a session whose sealed payload
+/// exceeds the configured chunk budget.
+#[derive(Debug, Clone, Snafu)]
+#[snafu(display(
+    "serialized session needs {chunks} cookie chunks ({encoded_len} bytes encoded), over the \
+     configured max_chunks of {max_chunks}; oversized cookies can exceed request-header limits \
+     and lock the client out — shrink the session payload or use a store-backed session"
+))]
+struct SessionTooLarge {
+    /// Base64-encoded size of the sealed session.
+    encoded_len: usize,
+    /// Chunks the payload would need.
+    chunks: usize,
+    /// The configured budget it exceeded.
+    max_chunks: usize,
+}
 
 /// A [`Session`] that round-trips through serde, sealable into the session
 /// cookie. Blanket-implemented; build custom payloads via a [`SessionEnricher`].
@@ -79,6 +103,8 @@ pub struct CookieSessionStore<C = CookieSession> {
     /// Shared cookie-sealing machinery — see [`CookieSealer`].
     sealer: CookieSealer,
     enricher: Box<dyn SessionEnricher<SessionState, C>>,
+    /// Chunk budget enforced on save — see the builder's `max_chunks`.
+    max_chunks: usize,
 }
 
 #[bon::bon]
@@ -100,12 +126,26 @@ impl<C> CookieSessionStore<C> {
         /// can no longer be valid.
         #[builder(default = DEFAULT_COOKIE_MAX_AGE)]
         max_age: Duration,
+        /// Most chunk cookies a saved session may occupy; a save needing more
+        /// fails instead of writing. Each chunk holds 3800 bytes of base64
+        /// (~2.8 KB of plaintext), so the default of 2 allows ~5.6 KB of
+        /// serialized session — sized against common 8–16 KB request-header
+        /// limits, past which servers reject requests *before* any code that
+        /// could clear the cookies runs, locking the client out for the
+        /// cookies' lifetime. Raise this only if every proxy in front of the
+        /// app accepts larger request headers; if sessions routinely need
+        /// more than one chunk, prefer
+        /// [`StoreBackedSessionStore`](crate::StoreBackedSessionStore).
+        /// Values below 1 are treated as 1.
+        #[builder(default = DEFAULT_MAX_CHUNKS)]
+        max_chunks: usize,
         /// Optional metrics observer for encrypt/decrypt events.
         metrics: Option<Arc<dyn SessionCookieMetrics>>,
     ) -> Self {
         Self {
             sealer: CookieSealer::new(cipher, cookie_name, cookie_path, max_age, metrics),
             enricher,
+            max_chunks: max_chunks.max(1),
         }
     }
 }
@@ -250,6 +290,23 @@ impl<C: CookiePayload> CookieSessionStore<C> {
             .seal(&payload, &aad)
             .await
             .map_err(|e| SessionError::new(SessionErrorKind::Crypto, e))?;
+        let cookie_value = URL_SAFE_NO_PAD.encode(&bundle);
+        let chunks = split_into_chunks(&cookie_value);
+        let num_chunks = chunks.len();
+        // Refuse oversized sessions instead of writing them: past common
+        // request-header limits the server rejects every request before the
+        // clearing path could run, bricking the client for the cookies'
+        // Max-Age. Failing the save surfaces the problem at login instead.
+        if num_chunks > self.max_chunks {
+            return Err(SessionError::new(
+                SessionErrorKind::Store,
+                SessionTooLarge {
+                    encoded_len: cookie_value.len(),
+                    chunks: num_chunks,
+                    max_chunks: self.max_chunks,
+                },
+            ));
+        }
         // Read the active key's identity from the same cipher that just sealed
         // the bundle. The cipher is fixed at construction so this is stable;
         // if huskarl-login ever switches to a multi-key sealer that picks
@@ -257,9 +314,6 @@ impl<C: CookiePayload> CookieSessionStore<C> {
         // `AeadCipherSelector`.
         let kid = self.sealer.key_id();
         self.sealer.record_encrypt(kid.as_deref());
-        let cookie_value = URL_SAFE_NO_PAD.encode(&bundle);
-        let chunks = split_into_chunks(&cookie_value);
-        let num_chunks = chunks.len();
 
         let attrs = self.sealer.cookie_attrs();
         let mut headers = Vec::with_capacity(num_chunks + 2);
@@ -1067,6 +1121,85 @@ mod tests {
                     && std::error::Error::source(e)
                         .is_some_and(|s| s.to_string().contains("enrichment boom"))),
             "enricher error must propagate",
+        );
+    }
+
+    // ── max_chunks budget ─────────────────────────────────────────────────
+
+    fn oversized_session() -> EnrichedSession {
+        // ~9 KB of payload → ~12 KB of base64 → 4 chunks.
+        EnrichedSession {
+            state: test_state(),
+            email: "x".repeat(9000),
+        }
+    }
+
+    #[tokio::test]
+    async fn save_rejects_session_over_default_chunk_budget() {
+        let store = CookieSessionStore::<EnrichedSession>::builder()
+            .cipher(test_cipher().await)
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .build_with_enricher(TestEnricher);
+        let result = store
+            .save_session(&oversized_session(), &HeaderMap::new())
+            .await;
+        // 4 chunks exceeds the default budget of 2: the save must fail loudly
+        // instead of emitting cookies that can trip request-header limits and
+        // lock the client out.
+        assert!(
+            matches!(&result, Err(e) if e.kind() == SessionErrorKind::Store
+                && std::error::Error::source(e)
+                    .is_some_and(|s| s.to_string().contains("max_chunks"))),
+            "oversized session must fail the save with the budget in the message"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_allows_larger_sessions_when_budget_is_raised() {
+        let store = CookieSessionStore::<EnrichedSession>::builder()
+            .cipher(test_cipher().await)
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .max_chunks(4)
+            .build_with_enricher(TestEnricher);
+        let session = oversized_session();
+        let cookies = store
+            .save_session(&session, &HeaderMap::new())
+            .await
+            .expect("raised budget accepts 4 chunks");
+        let chunk_sets = cookies
+            .iter()
+            .filter(|c| {
+                let s = c.to_str().unwrap();
+                s.starts_with("__Host-huskarl_session.")
+                    && !s.starts_with("__Host-huskarl_session.kid")
+            })
+            .count();
+        assert_eq!(chunk_sets, 4);
+        // The large payload still round-trips.
+        let req = request_cookies_from_set_cookies(&cookies);
+        let loaded = store.load_session(&req).await.expect("session loads");
+        assert_eq!(loaded.email.len(), 9000);
+    }
+
+    #[tokio::test]
+    async fn max_chunks_zero_is_treated_as_one() {
+        let store = CookieSessionStore::<CookieSession>::builder()
+            .cipher(test_cipher().await)
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .max_chunks(0)
+            .build();
+        // A small session (one chunk) still saves under the clamped budget.
+        let cookies = store
+            .save_session(&CookieSession(test_state()), &HeaderMap::new())
+            .await
+            .expect("single-chunk session saves under clamped budget");
+        assert!(
+            cookies
+                .iter()
+                .any(|c| c.to_str().unwrap().starts_with("__Host-huskarl_session.0="))
         );
     }
 

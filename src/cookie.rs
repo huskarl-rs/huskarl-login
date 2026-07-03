@@ -58,6 +58,30 @@ pub fn is_valid_oauth_state(state: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Returns the name of every login-state cookie on the request: cookies whose
+/// name is `{prefix}{state}` with a suffix satisfying [`is_valid_oauth_state`]
+/// (so each returned name is safe to splice into a `Set-Cookie` clear).
+/// Duplicates are returned once.
+pub(crate) fn login_state_cookie_names(headers: &http::HeaderMap, prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for value in headers.get_all(header::COOKIE) {
+        let Ok(s) = value.to_str() else { continue };
+        for pair in s.split(';') {
+            let Some((name, _)) = pair.trim().split_once('=') else {
+                continue;
+            };
+            let name = name.trim();
+            let Some(state) = name.strip_prefix(prefix) else {
+                continue;
+            };
+            if is_valid_oauth_state(state) && !names.iter().any(|n| n == name) {
+                names.push(name.to_owned());
+            }
+        }
+    }
+    names
+}
+
 /// Returns the security-prefixed login-state cookie name for OAuth `state`,
 /// which must satisfy [`is_valid_oauth_state`] (debug-asserted).
 #[must_use]
@@ -465,6 +489,64 @@ mod tests {
     fn cookie_name_contains_state() {
         let name = login_state_cookie_name("mystate", true, "/", DEFAULT_LOGIN_COOKIE_PREFIX);
         assert!(name.contains("mystate"));
+    }
+
+    // -- login_state_cookie_names tests --
+
+    #[test]
+    fn login_state_names_finds_all_matching_cookies() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            "__Host-huskarl_login_aaa=1; other=x; __Host-huskarl_login_bbb=2"
+                .parse()
+                .unwrap(),
+        );
+        let names = login_state_cookie_names(&headers, "__Host-huskarl_login_");
+        assert_eq!(
+            names,
+            vec!["__Host-huskarl_login_aaa", "__Host-huskarl_login_bbb"]
+        );
+    }
+
+    #[test]
+    fn login_state_names_spans_multiple_cookie_headers_and_dedups() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(header::COOKIE, "__Host-huskarl_login_aaa=1".parse().unwrap());
+        headers.append(
+            header::COOKIE,
+            "__Host-huskarl_login_aaa=dup; __Host-huskarl_login_bbb=2"
+                .parse()
+                .unwrap(),
+        );
+        let names = login_state_cookie_names(&headers, "__Host-huskarl_login_");
+        assert_eq!(
+            names,
+            vec!["__Host-huskarl_login_aaa", "__Host-huskarl_login_bbb"]
+        );
+    }
+
+    #[test]
+    fn login_state_names_skips_invalid_state_suffixes() {
+        // Suffixes outside the state charset (or empty) are not login-state
+        // cookies this crate minted — never splice them into a Set-Cookie.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            "__Host-huskarl_login_=empty; __Host-huskarl_login_a.b=dot; \
+             __Host-huskarl_login_ok-1=x"
+                .parse()
+                .unwrap(),
+        );
+        let names = login_state_cookie_names(&headers, "__Host-huskarl_login_");
+        assert_eq!(names, vec!["__Host-huskarl_login_ok-1"]);
+    }
+
+    #[test]
+    fn login_state_names_empty_without_matches() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(header::COOKIE, "session=abc; foo=bar".parse().unwrap());
+        assert!(login_state_cookie_names(&headers, "__Host-huskarl_login_").is_empty());
     }
 
     // -- is_valid_oauth_state tests --

@@ -23,12 +23,34 @@ can't be lifted from one slot and replayed in another:
 - the login-state cookie binds the OAuth `state` value, tying it to one
   in-flight authorization request.
 
-## Chunking
+## Chunking and the size budget
 
 A cookie session can exceed a single cookie's size limit, so the sealed payload
 is split across numbered chunk cookies. On save, slots the new session no longer
 occupies are cleared; this is why the persist methods take the original request
 headers — to see which stale chunks to drop.
+
+Chunking is bounded by the store's `max_chunks` budget (default 2, ≈ 5.6 KB of
+serialized session). A save that would exceed it **fails** rather than writing:
+once the total `Cookie` header outgrows a proxy or server's request-header
+limit (commonly 8–16 KB), requests are rejected *before* any code that could
+clear the cookies runs, locking the client out for the cookies' `Max-Age`.
+Failing the save surfaces the oversized payload at login instead. If sessions
+routinely need more than one chunk, prefer a
+[`StoreBackedSessionStore`](crate::StoreBackedSessionStore).
+
+## Login-state cookie hygiene
+
+Each login start mints one login-state cookie, scoped to the callback path so
+it rides only on callback requests. Abandoned flows expire with the
+`login_state_ttl` `Max-Age`, and a **successful callback sweeps every pending
+login-state cookie** (not just its own flow's): the session now exists, so
+other pending flows are moot, and the sweep keeps flow bursts from piling
+toward the browser's per-domain cookie cap — where eviction could hit the
+session cookie itself. A callback that arrives after its cookie was swept (a
+second tab finishing the race, or a re-navigated stale callback URL) redirects
+home when the browser already holds a usable session, instead of failing with
+a 400.
 
 ## Key rotation
 

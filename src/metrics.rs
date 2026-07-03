@@ -68,6 +68,11 @@ impl LoginStartResult {
 pub enum LoginCompleteResult {
     /// Login completed successfully — a new session was created.
     Ok,
+    /// The callback carried no usable login state but the browser already
+    /// holds a valid session (e.g. a second tab completing after the first,
+    /// or a re-navigated stale callback URL) — redirected home without
+    /// re-authenticating.
+    AlreadyAuthenticated,
     /// The authorization server returned an error response (e.g. user denied access).
     AsDenied,
     /// The callback request was malformed: missing or invalid `code` or `state`.
