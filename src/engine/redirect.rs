@@ -44,8 +44,9 @@ where
         })
     }
 
-    /// Seals the login-state payload under AEAD (`state` as associated data)
-    /// and returns the `Set-Cookie` value.
+    /// Seals the login-state payload under AEAD
+    /// ([`login_state_aad`](super::login_state_aad) as associated data) and
+    /// returns the `Set-Cookie` value.
     async fn build_login_state_cookie(
         &self,
         state: &str,
@@ -60,7 +61,7 @@ where
         .map_err(|e| SessionError::new(SessionErrorKind::Store, e))?;
         let bundle = self
             .cipher
-            .seal(&payload, state.as_bytes())
+            .seal(&payload, &super::login_state_aad(state))
             .await
             .map_err(|e| SessionError::new(SessionErrorKind::Crypto, e))?;
         let cookie_name = login_state_cookie_name(

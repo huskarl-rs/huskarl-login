@@ -213,7 +213,7 @@ where
             .map_err(|_| (StatusCode::BAD_REQUEST, "malformed state cookie"))?;
         let plaintext = self
             .cipher
-            .unseal(None, &bundle, state.as_bytes())
+            .unseal(None, &bundle, &super::login_state_aad(state))
             .await
             .map_err(|_| (StatusCode::BAD_REQUEST, "state cookie decryption failed"))?;
         let login_state = decode_payload::<LoginStateCookie>(&plaintext)

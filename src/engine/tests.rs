@@ -549,7 +549,10 @@ async fn seal_login_cookie_at(state: &str, original_url: &str, created_at: Syste
         created_at,
     };
     let payload = crate::cookie::encode_payload(&cookie).unwrap();
-    let bundle = sealer.seal(&payload, state.as_bytes()).await.unwrap();
+    let bundle = sealer
+        .seal(&payload, &super::login_state_aad(state))
+        .await
+        .unwrap();
     URL_SAFE_NO_PAD.encode(&bundle)
 }
 
