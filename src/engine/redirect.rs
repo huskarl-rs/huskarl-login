@@ -38,6 +38,7 @@ where
         let location = HeaderValue::from_str(&start.authorization_url.to_string())
             .map_err(|e| SessionError::new(SessionErrorKind::Store, e))?;
         Ok(LoginResponse::Redirect {
+            status: http::StatusCode::FOUND,
             location,
             set_cookies: vec![cookie_header],
         })

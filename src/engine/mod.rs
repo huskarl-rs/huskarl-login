@@ -47,9 +47,13 @@ type EngineError = SessionError;
 /// [`into_parts`](Self::into_parts) at the response boundary.
 #[must_use]
 pub enum LoginResponse {
-    /// A `302 Found` redirect. The boundary also emits `Cache-Control:
-    /// no-store`, since these redirects carry session-bearing cookies.
+    /// A redirect: `302 Found` from GET contexts (login start, callback),
+    /// `303 See Other` after a POST (logout), which pins the follow-up
+    /// request to GET. The boundary also emits `Cache-Control: no-store`,
+    /// since these redirects carry session-bearing cookies.
     Redirect {
+        /// The redirect status (`302` or `303`).
+        status: StatusCode,
         /// The `Location` to redirect to.
         location: HeaderValue,
         /// `Set-Cookie` values to emit alongside the redirect.
@@ -71,8 +75,7 @@ impl LoginResponse {
     #[must_use]
     pub fn status(&self) -> StatusCode {
         match self {
-            Self::Redirect { .. } => StatusCode::FOUND,
-            Self::Rendered { status, .. } => *status,
+            Self::Redirect { status, .. } | Self::Rendered { status, .. } => *status,
         }
     }
 
@@ -82,6 +85,7 @@ impl LoginResponse {
     pub fn into_parts(self) -> (StatusCode, Vec<(HeaderName, HeaderValue)>, Bytes) {
         match self {
             Self::Redirect {
+                status,
                 location,
                 set_cookies,
             } => {
@@ -91,7 +95,7 @@ impl LoginResponse {
                 for c in set_cookies {
                     headers.push((header::SET_COOKIE, c));
                 }
-                (StatusCode::FOUND, headers, Bytes::new())
+                (status, headers, Bytes::new())
             }
             Self::Rendered {
                 status,
@@ -110,6 +114,7 @@ impl LoginResponse {
             Self::Redirect {
                 location,
                 set_cookies,
+                ..
             } => {
                 let mut headers = Vec::with_capacity(set_cookies.len() + 2);
                 headers.push((header::LOCATION, location.clone()));
