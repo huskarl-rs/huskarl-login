@@ -289,6 +289,30 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     where
         F: Fn(&mut E::SessionType) + MaybeSend,
     {
+        self.try_update(session_key, move |session| {
+            mutate(session);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Like [`update`](Self::update), for mutations that can fail: `mutate`
+    /// returning `Err` aborts the update — nothing is written — and the error
+    /// is returned as-is. The same replayability contract applies: `mutate`
+    /// may run more than once against freshly-loaded state.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `mutate` returned, or the same errors as
+    /// [`update`](Self::update).
+    pub async fn try_update<F>(
+        &self,
+        session_key: Uuid,
+        mutate: F,
+    ) -> Result<E::SessionType, SessionError>
+    where
+        F: Fn(&mut E::SessionType) -> Result<(), SessionError> + MaybeSend,
+    {
         for _ in 0..UPDATE_MAX_ATTEMPTS {
             let Some(mut session) = self
                 .external
@@ -299,7 +323,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
                 return Err(SessionError::new(SessionErrorKind::Gone, SessionNotFound));
             };
             let expected = session.persisted().version;
-            mutate(&mut session);
+            mutate(&mut session)?;
             // Advance the version on the session so stores that persist it from
             // the record's body see the new value; column-based stores that do
             // `version + 1` arrive at the same value (stored == expected).
@@ -1082,6 +1106,45 @@ mod tests {
             conflicted,
             "expected VersionConflict under sustained conflict"
         );
+    }
+
+    #[tokio::test]
+    async fn try_update_mutation_error_aborts_without_writing() {
+        let session = test_session();
+        let key = session.persisted.session_key;
+        let store = store_over(VersioningStore::with(session)).await;
+
+        let result = store
+            .try_update(key, |_| {
+                Err(SessionError::new(SessionErrorKind::Store, "app rule violated"))
+            })
+            .await;
+        // The closure's error comes back as-is (the session types here aren't
+        // `Debug`, so assert on the `Err` arm directly), and nothing was written.
+        let aborted = result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.kind() == SessionErrorKind::Store);
+        assert!(aborted, "closure error must propagate");
+        let stored = store.external.stored.lock().unwrap().clone().unwrap();
+        assert_eq!(stored.persisted.version, 0, "no write on mutation error");
+    }
+
+    #[tokio::test]
+    async fn try_update_ok_commits_like_update() {
+        let session = test_session();
+        let key = session.persisted.session_key;
+        let store = store_over(VersioningStore::with(session)).await;
+
+        let updated = store
+            .try_update(key, |s| {
+                s.persisted.state.sub = Some("mine".to_owned());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated.persisted.state.sub.as_deref(), Some("mine"));
+        assert_eq!(updated.persisted.version, 1);
     }
 
     // ── apply_refresh_and_save (engine refresh persist) ───────────────────
