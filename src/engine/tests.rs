@@ -771,6 +771,13 @@ async fn redirect_to_login_api_returns_401() {
     let uri = "/api/data".parse().unwrap();
     let r = e.redirect_to_login(&api_headers(), &uri).await;
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    // RFC 9110: every 401 carries a WWW-Authenticate challenge.
+    let challenge = r
+        .headers()
+        .iter()
+        .find(|(n, _)| *n == http::header::WWW_AUTHENTICATE)
+        .map(|(_, v)| v.to_str().unwrap().to_owned());
+    assert_eq!(challenge.as_deref(), Some("Cookie"));
 }
 
 #[tokio::test]

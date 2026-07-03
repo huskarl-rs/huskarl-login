@@ -481,7 +481,14 @@ where
     /// in a cookie for return), `401 Unauthorized` for API/XHR.
     pub async fn redirect_to_login(&self, headers: &HeaderMap, uri: &Uri) -> LoginResponse {
         if !is_navigation_request(headers) {
-            return self.build_error_response(StatusCode::UNAUTHORIZED, "authentication required");
+            // RFC 9110 §15.5.2: a 401 MUST carry `WWW-Authenticate`. No
+            // scheme is registered for cookie-session auth; `Cookie` is a
+            // syntactically valid scheme token that names the mechanism
+            // without inviting bearer tokens this middleware won't accept.
+            let mut resp =
+                self.build_error_response(StatusCode::UNAUTHORIZED, "authentication required");
+            resp.push_rendered_header(header::WWW_AUTHENTICATE, HeaderValue::from_static("Cookie"));
+            return resp;
         }
         match self.redirect_to_as(uri).await {
             Ok(resp) => {
