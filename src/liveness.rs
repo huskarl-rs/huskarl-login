@@ -222,7 +222,10 @@ mod tests {
     fn builder_derives_touch_as_quarter_of_idle_timeout() {
         // idle 1h → derived touch 15min, well below the timeout, so a
         // continuously-active session always re-touches before it can expire.
-        let config = LivenessConfig::builder().idle_timeout(HOUR).build().unwrap();
+        let config = LivenessConfig::builder()
+            .idle_timeout(HOUR)
+            .build()
+            .unwrap();
         assert_eq!(config.touch_min_interval, HOUR / 4);
     }
 

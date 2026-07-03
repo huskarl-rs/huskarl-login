@@ -159,12 +159,16 @@ pub enum LoadedSession<S> {
         /// [`load_session`](LoginEngine::load_session) on caching.
         set_cookies: Vec<HeaderValue>,
     },
-    /// Authenticated, with a save owed after the inner handler responds — call
-    /// [`LoginEngine::persist_session`]. Arises only when the eager persist of
-    /// a refreshed session failed.
+    /// Authenticated, with a save owed after the inner handler responds — pass
+    /// `session` and `token_response` to [`LoginEngine::persist_session`].
+    /// Arises only when the eager persist of a refreshed session failed.
     ActivePending {
-        /// The loaded session.
+        /// The loaded session, with the refresh applied in memory.
         session: S,
+        /// The refresh response, so [`LoginEngine::persist_session`] can
+        /// re-commit it against fresh store state. Boxed to keep the rare
+        /// variant from inflating every [`LoadedSession`] returned.
+        token_response: Box<TokenResponse>,
     },
 }
 
@@ -173,7 +177,7 @@ impl<S> LoadedSession<S> {
     pub fn session(&self) -> Option<&S> {
         match self {
             Self::Missing | Self::Cleared { .. } => None,
-            Self::Active { session, .. } | Self::ActivePending { session } => Some(session),
+            Self::Active { session, .. } | Self::ActivePending { session, .. } => Some(session),
         }
     }
 }
@@ -525,15 +529,26 @@ where
         };
         match self.refresh_with_retry(&rt).await {
             Ok(token_response) => {
-                session.apply_refresh(&token_response, self.config.default_token_lifetime);
                 self.record_refresh(&RefreshResult::Ok);
                 // Persist eagerly rather than waiting for the adapter's
                 // post-response phase: with refresh-token rotation, a later
                 // phase that is skipped or fails would strand the rotated
-                // token and lock the session out. On failure, fall back to
-                // a pending `Save` so the adapter's persist step (and its
-                // `PersistFailurePolicy`) gets a second attempt.
-                match self.session_store.save(&session, headers).await {
+                // token and lock the session out. The driver applies the
+                // refresh as a replayable mutation (store-backed sessions
+                // commit via CAS so a concurrent `update` is merged, not
+                // overwritten). On failure, fall back to `ActivePending` so
+                // the adapter's persist step (and its `PersistFailurePolicy`)
+                // gets a second attempt.
+                match self
+                    .session_store
+                    .apply_refresh_and_save(
+                        &mut session,
+                        &token_response,
+                        self.config.default_token_lifetime,
+                        headers,
+                    )
+                    .await
+                {
                     Ok(set_cookies) => LoadedSession::Active {
                         session,
                         set_cookies,
@@ -544,7 +559,10 @@ where
                              post-response persist: {}",
                             error_chain(&e)
                         );
-                        LoadedSession::ActivePending { session }
+                        LoadedSession::ActivePending {
+                            session,
+                            token_response: Box::new(token_response),
+                        }
                     }
                 }
             }
@@ -644,21 +662,35 @@ where
         }
     }
 
-    /// Saves the session owed by a [`LoadedSession::ActivePending`] after the
-    /// inner service responded, returning `Set-Cookie` values to append.
-    /// `request_headers` are the original request cookies (used by cookie-backed
-    /// stores to clear stale slots); see
+    /// Commits the refresh owed by a [`LoadedSession::ActivePending`] after the
+    /// inner service responded, returning `Set-Cookie` values to append. Pass
+    /// the variant's `session` and `token_response` back in; the refresh is
+    /// re-committed through the same merge-safe path as the eager persist, so
+    /// a concurrent [`StoreBackedSessionStore::update`] landing in between is
+    /// preserved. On success `session` is the committed (merged) session.
+    /// `request_headers` are the original request cookies (used by
+    /// cookie-backed stores to clear stale slots); see
     /// [`load_session`](Self::load_session) on caching.
+    ///
+    /// [`StoreBackedSessionStore::update`]: crate::StoreBackedSessionStore::update
     ///
     /// # Errors
     ///
     /// Returns [`SessionError`] if the session store fails to write.
     pub async fn persist_session(
         &self,
-        session: &SD::SessionType,
+        session: &mut SD::SessionType,
+        token_response: &TokenResponse,
         request_headers: &HeaderMap,
     ) -> Result<Vec<HeaderValue>, SessionError> {
-        self.session_store.save(session, request_headers).await
+        self.session_store
+            .apply_refresh_and_save(
+                session,
+                token_response,
+                self.config.default_token_lifetime,
+                request_headers,
+            )
+            .await
     }
 
     /// Deletes a session, returning `Set-Cookie` values that clear the session
@@ -680,6 +712,12 @@ where
     /// application mutated it), returning `Set-Cookie` values; unlike the
     /// deferred [`persist_session`](Self::persist_session). See
     /// [`persist_session`](Self::persist_session) for `request_headers`.
+    ///
+    /// This is a whole-session, last-writer-wins write: it overwrites changes
+    /// committed concurrently by other requests. For store-backed sessions
+    /// that may be mutated concurrently, prefer
+    /// [`StoreBackedSessionStore::update`](crate::StoreBackedSessionStore::update),
+    /// which merges via compare-and-swap.
     ///
     /// # Errors
     ///

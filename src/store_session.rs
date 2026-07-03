@@ -8,9 +8,12 @@ use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
-use huskarl::core::{
-    crypto::cipher::{AeadCipher, AeadSealer as _, CipherMatch},
-    platform::{MaybeSend, MaybeSendSync, SystemTime},
+use huskarl::{
+    core::{
+        crypto::cipher::{AeadCipher, AeadSealer as _, CipherMatch},
+        platform::{MaybeSend, MaybeSendSync, SystemTime},
+    },
+    grant::core::TokenResponse,
 };
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
@@ -495,6 +498,42 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
         _headers: &http::HeaderMap,
     ) -> Result<Vec<HeaderValue>, SessionError> {
         self.save_session(session).await
+    }
+
+    async fn apply_refresh_and_save(
+        &self,
+        session: &mut E::SessionType,
+        token_response: &TokenResponse,
+        default_lifetime: std::time::Duration,
+        _headers: &http::HeaderMap,
+    ) -> Result<Vec<HeaderValue>, SessionError> {
+        // Commit through the CAS loop rather than saving this request's
+        // snapshot wholesale: an [`update`](Self::update) committed since this
+        // request loaded must survive the refresh. Replaying `apply_refresh`
+        // against the freshly-loaded session touches exactly what the refresh
+        // response justifies (plus any custom `Session::apply_refresh`
+        // override) and nothing else.
+        let key = session.persisted().session_key;
+        match self
+            .update(key, |fresh| {
+                fresh.apply_refresh(token_response, default_lifetime);
+            })
+            .await
+        {
+            Ok(committed) => {
+                *session = committed;
+                // A refresh never changes the session key, so the pointer
+                // cookie is unchanged.
+                Ok(vec![])
+            }
+            Err(e) => {
+                // Keep the trait contract: on error the refresh is applied in
+                // memory (the request can still serve the new tokens) and the
+                // persist is owed.
+                session.apply_refresh(token_response, default_lifetime);
+                Err(e)
+            }
+        }
     }
 
     async fn check_liveness(
@@ -1042,6 +1081,93 @@ mod tests {
         assert!(
             conflicted,
             "expected VersionConflict under sustained conflict"
+        );
+    }
+
+    // ── apply_refresh_and_save (engine refresh persist) ───────────────────
+
+    /// A refresh-style token response with no `expires_in`, so the new expiry
+    /// comes from the `default_lifetime` handed to `apply_refresh`.
+    fn refresh_token_response() -> TokenResponse {
+        huskarl::grant::core::RawTokenResponse::builder()
+            .access_token(huskarl::core::secrets::SecretString::new(
+                "refreshed-access-token",
+            ))
+            .token_type("Bearer")
+            .build()
+            .into_token_response(None, std::time::SystemTime::now())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn refresh_save_preserves_concurrent_update() {
+        // The regression this guards: the engine's refresh persist must not
+        // write back its request-scoped snapshot wholesale — an `update`
+        // committed by another request in the meantime has to survive.
+        let session = test_session(); // version 0, no sid
+        let mut ext = VersioningStore::with(session.clone());
+        // A concurrent writer commits `sid` just before our first CAS.
+        *ext.inject_once.get_mut().unwrap() = Some(|s| {
+            s.persisted.version = s.persisted.version.wrapping_add(1);
+            s.persisted.state.sid = Some("concurrent".to_owned());
+        });
+        let store = store_over(ext).await;
+
+        let mut snapshot = session;
+        let lifetime = Duration::from_hours(2);
+        let cookies = store
+            .apply_refresh_and_save(
+                &mut snapshot,
+                &refresh_token_response(),
+                lifetime,
+                &http::HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+
+        // No Set-Cookie: the pointer cookie is unchanged by a refresh.
+        assert!(cookies.is_empty());
+        // The caller's session was replaced with the committed merge: the
+        // concurrent `sid` write survived AND the refresh was applied.
+        assert_eq!(snapshot.persisted.state.sid.as_deref(), Some("concurrent"));
+        assert!(
+            snapshot.state().token_expiry > std::time::SystemTime::now() + Duration::from_mins(90),
+            "refresh must extend token_expiry via default_lifetime"
+        );
+        assert_eq!(snapshot.persisted.version, 2);
+        // The store holds the same merged state.
+        let stored = store.external.stored.lock().unwrap().clone().unwrap();
+        assert_eq!(stored.persisted.state.sid.as_deref(), Some("concurrent"));
+        assert_eq!(stored.persisted.version, 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_save_failure_applies_refresh_in_memory() {
+        // On a persist failure the trait contract is "refresh applied in
+        // memory, save owed" — the engine serves the request from `snapshot`
+        // and retries via persist_session.
+        let session = test_session();
+        let ext = VersioningStore {
+            stored: std::sync::Mutex::new(Some(session.clone())),
+            always_conflict: true,
+            inject_once: std::sync::Mutex::new(None),
+        };
+        let store = store_over(ext).await;
+
+        let mut snapshot = session;
+        let err = store
+            .apply_refresh_and_save(
+                &mut snapshot,
+                &refresh_token_response(),
+                Duration::from_hours(2),
+                &http::HeaderMap::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), SessionErrorKind::Conflict);
+        assert!(
+            snapshot.state().token_expiry > std::time::SystemTime::now() + Duration::from_mins(90),
+            "the in-memory session must carry the refreshed tokens"
         );
     }
 

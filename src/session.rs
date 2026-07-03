@@ -3,9 +3,12 @@
 use std::{fmt, sync::Arc};
 
 use http::HeaderValue;
-use huskarl::core::{
-    crypto::cipher::AeadCipher,
-    platform::{MaybeSend, MaybeSendSync, SystemTime},
+use huskarl::{
+    core::{
+        crypto::cipher::AeadCipher,
+        platform::{MaybeSend, MaybeSendSync, SystemTime},
+    },
+    grant::core::TokenResponse,
 };
 
 use crate::{completed_login::CompletedLogin, liveness::LivenessVerdict, session_state::Session};
@@ -179,11 +182,48 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// Persist updated session state, returning any `Set-Cookie` header values
     /// (re-encrypted cookies plus `Max-Age=0` clears for now-unused chunks; none
     /// for store-backed sessions whose pointer cookie is unchanged).
+    ///
+    /// This is an unconditional whole-session write (last-writer-wins). The
+    /// engine's refresh persist goes through
+    /// [`apply_refresh_and_save`](Self::apply_refresh_and_save) instead, so it
+    /// never overwrites a concurrent
+    /// [`update`](crate::StoreBackedSessionStore::update).
     fn save(
         &self,
         session: &Self::SessionType,
         headers: &http::HeaderMap,
     ) -> impl Future<Output = Result<Vec<HeaderValue>, SessionError>> + MaybeSend;
+
+    /// Apply a token-refresh response to `session` (via
+    /// [`Session::apply_refresh`]) and persist the result, returning any
+    /// `Set-Cookie` header values.
+    ///
+    /// The default implementation mutates `session` and calls
+    /// [`save`](Self::save) — correct for cookie sessions, which are inherently
+    /// last-writer-wins in the browser. [`StoreBackedSessionStore`] overrides
+    /// this to commit the refresh as a replayable mutation through
+    /// compare-and-swap, so a concurrent
+    /// [`update`](crate::StoreBackedSessionStore::update) is merged rather than
+    /// silently overwritten; on success `session` is replaced with the
+    /// committed (merged) session.
+    ///
+    /// On error the refresh has been applied to `session` in memory but not
+    /// persisted — the save is owed (see
+    /// [`LoadedSession::ActivePending`](crate::engine::LoadedSession::ActivePending)).
+    ///
+    /// [`StoreBackedSessionStore`]: crate::StoreBackedSessionStore
+    fn apply_refresh_and_save(
+        &self,
+        session: &mut Self::SessionType,
+        token_response: &TokenResponse,
+        default_lifetime: std::time::Duration,
+        headers: &http::HeaderMap,
+    ) -> impl Future<Output = Result<Vec<HeaderValue>, SessionError>> + MaybeSend {
+        async move {
+            session.apply_refresh(token_response, default_lifetime);
+            self.save(session, headers).await
+        }
+    }
 
     /// Evaluate session liveness, recording activity when `record_activity` is set.
     ///

@@ -17,12 +17,24 @@ adapter skipped the persist phase, the connection dropped, or the handler
 panicked — would strand the rotated token and lock the session out. Persisting
 eagerly closes that window.
 
+The persist is *merge-safe*: the engine hands the token response to the
+session driver, which applies it as a replayable mutation rather than writing
+back the request-scoped snapshot wholesale. For store-backed sessions the
+mutation is committed through the same compare-and-swap loop as
+[`StoreBackedSessionStore::update`](crate::StoreBackedSessionStore::update),
+so an application update committed by a concurrent request between this
+request's load and the refresh is merged, never silently overwritten — and the
+request continues with the merged session. Cookie sessions keep the plain
+write; the browser cookie jar is inherently last-writer-wins.
+
 On success the session is returned as
 [`Active`](crate::engine::LoadedSession::Active) with the re-sealed session
 cookies in `set_cookies`. If the eager persist *fails*, the session is returned
-as [`ActivePending`](crate::engine::LoadedSession::ActivePending) so the
-post-response persist — and its
-[`PersistFailurePolicy`](crate::PersistFailurePolicy) — acts as the retry.
+as [`ActivePending`](crate::engine::LoadedSession::ActivePending) — carrying
+the token response — so the post-response
+[`persist_session`](crate::engine::LoginEngine::persist_session) — and its
+[`PersistFailurePolicy`](crate::PersistFailurePolicy) — acts as the retry,
+re-committing the refresh through the same merge-safe path.
 
 ## Transient vs conclusive failure
 

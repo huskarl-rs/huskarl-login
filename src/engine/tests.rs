@@ -204,10 +204,16 @@ fn expect_active(loaded: LoadedSession<MockSession>) -> (MockSession, Vec<Header
     }
 }
 
-/// Unwraps [`LoadedSession::ActivePending`] into the session.
-fn expect_pending(loaded: LoadedSession<MockSession>) -> MockSession {
+/// Unwraps [`LoadedSession::ActivePending`] into the session and the refresh
+/// response owed to [`LoginEngine::persist_session`].
+fn expect_pending(
+    loaded: LoadedSession<MockSession>,
+) -> (MockSession, Box<huskarl::grant::core::TokenResponse>) {
     match loaded {
-        LoadedSession::ActivePending { session } => session,
+        LoadedSession::ActivePending {
+            session,
+            token_response,
+        } => (session, token_response),
         other => unreachable!("expected ActivePending, got {}", variant_name(&other)),
     }
 }
@@ -1102,8 +1108,37 @@ async fn refresh_success_with_failing_save_defers_persistence() {
         .cipher(test_cipher().await)
         .build();
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let session = expect_pending(loaded);
+    let (session, _token_response) = expect_pending(loaded);
     // The refresh itself was applied — only persistence is outstanding.
+    assert!(session.token_expiry() > SystemTime::now() + Duration::from_mins(30));
+}
+
+#[tokio::test]
+async fn persist_session_retries_the_deferred_refresh_save() {
+    // ActivePending carries the refresh response so the post-response persist
+    // can re-commit it (through the merge-safe path) once the store recovers.
+    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    let mut e = LoginEngine::builder()
+        .config(default_config())
+        .grant(test_grant(TokenHttp).await)
+        .session_store(MockSessionStore::with_session_failing_save(session))
+        .cipher(test_cipher().await)
+        .build();
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    let (mut session, token_response) = expect_pending(loaded);
+
+    // The store recovers; the owed persist now succeeds.
+    e.session_store.fail_save = false;
+    let set_cookies = e
+        .persist_session(&mut session, &token_response, &HeaderMap::new())
+        .await
+        .unwrap();
+    assert!(e.session_store.save_called());
+    assert_eq!(
+        set_cookies,
+        vec![HeaderValue::from_static(MOCK_SAVE_COOKIE)]
+    );
+    // The re-applied refresh keeps the session's tokens fresh.
     assert!(session.token_expiry() > SystemTime::now() + Duration::from_mins(30));
 }
 
@@ -1175,9 +1210,22 @@ async fn load_session_store_error_bubbles_up() {
 async fn persist_save_calls_store_save() {
     let e = engine(MockSessionStore::with_session(valid_session())).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (session, _) = expect_active(loaded);
-    e.persist_session(&session, &api_headers()).await.unwrap();
+    let (mut session, _) = expect_active(loaded);
+    e.persist_session(&mut session, &token_response_fixture(), &api_headers())
+        .await
+        .unwrap();
     assert!(e.session_store.save_called());
+}
+
+/// A minimal refresh-style token response for driving `persist_session`.
+fn token_response_fixture() -> huskarl::grant::core::TokenResponse {
+    use huskarl::core::secrets::SecretString;
+    huskarl::grant::core::RawTokenResponse::builder()
+        .access_token(SecretString::new("refreshed-access-token"))
+        .token_type("Bearer")
+        .build()
+        .into_token_response(None, SystemTime::now())
+        .unwrap()
 }
 
 // ── Callback handler ──────────────────────────────────────────────────────
