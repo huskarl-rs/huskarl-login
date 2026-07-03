@@ -569,6 +569,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn secure_subpath_store_emits_secure_prefixed_cookies() {
+        // A sub-path scope can't carry `__Host-` (browsers require `Path=/`),
+        // but `__Secure-` is valid there — the store derives it so sub-path
+        // deployments aren't left with an unprefixed session cookie.
+        let store = CookieSessionStore::<CookieSession>::builder()
+            .cipher(test_cipher().await)
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/app".parse().unwrap())
+            .build();
+        let cookies = store
+            .save_session(&CookieSession(test_state()), &HeaderMap::new())
+            .await
+            .unwrap();
+        let chunk0 = cookies[0].to_str().unwrap();
+        assert!(
+            chunk0.starts_with("__Secure-huskarl_session.0="),
+            "got: {chunk0}"
+        );
+        assert!(chunk0.contains("Path=/app"));
+    }
+
+    #[tokio::test]
     async fn save_sets_security_attributes() {
         let store = test_store().await;
         let session = CookieSession(test_state());

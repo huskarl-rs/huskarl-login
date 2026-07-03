@@ -96,25 +96,32 @@ pub fn login_state_cookie_name(state: &str, secure: bool, path: &str, prefix: &s
     )
 }
 
+/// The cookie security prefix derived from the deployment: `__Host-` when
+/// `secure` and the cookie is host-wide (`path == "/"`), `__Secure-` when
+/// `secure` on a narrower path, none otherwise. The crate owns prefixing
+/// entirely — [`CookieName`] rejects explicitly prefixed names, so a
+/// configured name can never contradict the deployment and produce a
+/// `Set-Cookie` the browser silently drops.
+fn security_prefix(secure: bool, path: &str) -> &'static str {
+    if !secure {
+        ""
+    } else if path == "/" {
+        "__Host-"
+    } else {
+        "__Secure-"
+    }
+}
+
 /// Returns the name prefix shared by every login-state cookie under the given
 /// security settings: `{security_prefix}{prefix}_`.
 pub(crate) fn login_state_cookie_name_prefix(secure: bool, path: &str, prefix: &str) -> String {
-    let security_prefix = if secure {
-        if path == "/" { "__Host-" } else { "__Secure-" }
-    } else {
-        ""
-    };
-    format!("{security_prefix}{prefix}_")
+    format!("{}{prefix}_", security_prefix(secure, path))
 }
 
-/// Returns the session cookie base name, prepending `__Host-` when `secure`
-/// and `path` is `"/"`. Names already prefixed are left untouched.
+/// Returns the session cookie name with the derived [`security_prefix`]
+/// prepended.
 pub(crate) fn session_cookie_name(name: &str, secure: bool, path: &str) -> String {
-    if secure && path == "/" && !name.starts_with("__Host-") && !name.starts_with("__Secure-") {
-        format!("__Host-{name}")
-    } else {
-        name.to_owned()
-    }
+    format!("{}{name}", security_prefix(secure, path))
 }
 
 /// Error returned when a configured session cookie name is rejected.
@@ -127,8 +134,10 @@ pub struct InvalidCookieName {
     pub reason: &'static str,
 }
 
-/// A validated session cookie base name: non-empty and restricted to
-/// `[A-Za-z0-9_-]`. Cookie-name counterpart to [`RoutePath`].
+/// A validated session cookie base name: non-empty, restricted to
+/// `[A-Za-z0-9_-]`, and without a `__Host-`/`__Secure-` prefix (the store
+/// derives the right prefix from the deployment). Cookie-name counterpart to
+/// [`RoutePath`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CookieName(String);
 
@@ -136,9 +145,17 @@ impl CookieName {
     /// Validates `name` (non-empty, `[A-Za-z0-9_-]`) and wraps it. `.` is
     /// excluded as it separates the chunk/kid-sidecar namespace.
     ///
+    /// A `__Host-`/`__Secure-` prefix (any casing — browsers match prefixes
+    /// case-insensitively) is rejected: the store derives the strongest valid
+    /// prefix from the deployment's `base_url` scheme and cookie path. An
+    /// explicit prefix could contradict them (`__Host-` without `Secure` or
+    /// off `Path=/`), and browsers *silently discard* such a `Set-Cookie` —
+    /// an undebuggable login loop. Configure the bare name instead.
+    ///
     /// # Errors
     ///
-    /// Returns [`InvalidCookieName`] if `name` is empty or has a disallowed char.
+    /// Returns [`InvalidCookieName`] if `name` is empty, has a disallowed
+    /// char, or carries a security prefix.
     pub fn new(name: impl Into<String>) -> Result<Self, InvalidCookieName> {
         let name = name.into();
         if name.is_empty() {
@@ -154,6 +171,15 @@ impl CookieName {
             return Err(InvalidCookieName {
                 name,
                 reason: "must contain only ASCII letters, digits, '_', or '-'",
+            });
+        }
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with("__host-") || lower.starts_with("__secure-") {
+            return Err(InvalidCookieName {
+                name,
+                reason: "must not start with `__Host-` or `__Secure-`; the security prefix is \
+                         derived from the deployment (base_url scheme and cookie path) — \
+                         configure the bare name",
             });
         }
         Ok(Self(name))
@@ -598,17 +624,15 @@ mod tests {
     }
 
     #[test]
-    fn session_cookie_name_skips_subpath() {
-        assert_eq!(session_cookie_name("sess", true, "/app"), "sess");
+    fn session_cookie_name_secure_subpath_uses_secure_prefix() {
+        // A sub-path scope can't satisfy `__Host-` (which demands `Path=/`),
+        // but `__Secure-` is valid and matches the login-state cookies.
+        assert_eq!(session_cookie_name("sess", true, "/app"), "__Secure-sess");
     }
 
     #[test]
-    fn session_cookie_name_keeps_existing_prefix() {
-        assert_eq!(session_cookie_name("__Host-sess", true, "/"), "__Host-sess");
-        assert_eq!(
-            session_cookie_name("__Secure-sess", true, "/"),
-            "__Secure-sess"
-        );
+    fn session_cookie_name_insecure_subpath_stays_bare() {
+        assert_eq!(session_cookie_name("sess", false, "/app"), "sess");
     }
 
     // -- CookieName tests --
@@ -619,10 +643,6 @@ mod tests {
             CookieName::new("huskarl_session").unwrap().as_str(),
             "huskarl_session"
         );
-        assert_eq!(
-            CookieName::new("__Host-sess").unwrap().as_str(),
-            "__Host-sess"
-        );
         assert_eq!(CookieName::new("").unwrap_err().reason, "must not be empty");
         // Separators that would corrupt/inject into Set-Cookie.
         assert!(CookieName::new("bad;name").is_err());
@@ -630,6 +650,31 @@ mod tests {
         assert!(CookieName::new("has space").is_err());
         // `.` is reserved for the chunk/kid sidecar namespace.
         assert!(CookieName::new("base.kid").is_err());
+    }
+
+    #[test]
+    fn cookie_name_rejects_explicit_security_prefixes() {
+        // The prefix is derived from the deployment; an explicit one could
+        // contradict it (`__Host-` on http or off `Path=/`) and browsers drop
+        // such Set-Cookies silently. Browsers match prefixes
+        // case-insensitively, so validation must too.
+        for name in [
+            "__Host-sess",
+            "__Secure-sess",
+            "__host-sess",
+            "__HOST-sess",
+            "__SeCuRe-sess",
+        ] {
+            let err = CookieName::new(name).unwrap_err();
+            assert!(
+                err.reason.contains("derived from the deployment"),
+                "expected prefix rejection for {name:?}, got: {}",
+                err.reason
+            );
+        }
+        // Similar-looking names that carry no browser prefix semantics pass.
+        assert!(CookieName::new("__internal").is_ok());
+        assert!(CookieName::new("_Host-ish").is_ok());
     }
 
     #[test]
