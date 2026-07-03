@@ -512,7 +512,10 @@ mod tests {
     #[test]
     fn login_state_names_spans_multiple_cookie_headers_and_dedups() {
         let mut headers = http::HeaderMap::new();
-        headers.append(header::COOKIE, "__Host-huskarl_login_aaa=1".parse().unwrap());
+        headers.append(
+            header::COOKIE,
+            "__Host-huskarl_login_aaa=1".parse().unwrap(),
+        );
         headers.append(
             header::COOKIE,
             "__Host-huskarl_login_aaa=dup; __Host-huskarl_login_bbb=2"

@@ -187,6 +187,7 @@ fn valid_session() -> MockSession {
 fn variant_name(loaded: &LoadedSession<MockSession>) -> &'static str {
     match loaded {
         LoadedSession::Missing => "Missing",
+        LoadedSession::RefreshUnavailable => "RefreshUnavailable",
         LoadedSession::Cleared { .. } => "Cleared",
         LoadedSession::Active { .. } => "Active",
         LoadedSession::ActivePending { .. } => "ActivePending",
@@ -1014,11 +1015,9 @@ async fn token_expired_refresh_fails_clears_session() {
     let store = MockSessionStore::with_session(session);
     let e = engine(store).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    // The engine's HTTP double fails non-retryably — a conclusive rejection.
     let (reason, _) = expect_cleared(loaded);
-    assert!(matches!(
-        reason,
-        TeardownReason::RefreshRejected | TeardownReason::RefreshUnavailable
-    ));
+    assert_eq!(reason, TeardownReason::RefreshRejected);
     assert!(e.session_store.delete_called());
 }
 
@@ -1174,15 +1173,46 @@ async fn non_retryable_refresh_failure_clears_session_even_with_valid_token() {
 }
 
 #[tokio::test]
-async fn transient_refresh_failure_with_expired_token_clears_session() {
-    // Past actual expiry there is no valid token to keep serving — transient
-    // or not, the session is torn down.
+async fn transient_refresh_failure_with_expired_token_retains_session_unavailable() {
+    // Past actual expiry there is no valid token to serve THIS request — but
+    // a transient AS failure can't refute the session either. The session and
+    // its cookies must survive for a later retry (the outcome is
+    // `RefreshUnavailable`, not a teardown): deleting here would permanently
+    // destroy sessions that recover by themselves when the AS does.
     let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
     let (e, _) = engine_with_failing_refresh(true, session).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (reason, _) = expect_cleared(loaded);
-    assert_eq!(reason, TeardownReason::RefreshUnavailable);
-    assert!(e.session_store.delete_called());
+    assert!(
+        matches!(loaded, LoadedSession::RefreshUnavailable),
+        "expected RefreshUnavailable, got {}",
+        variant_name(&loaded)
+    );
+    assert!(
+        !e.session_store.delete_called(),
+        "a transient failure must not delete the session"
+    );
+}
+
+#[tokio::test]
+async fn refresh_unavailable_session_recovers_when_the_as_does() {
+    // The companion to the retention test: the same session, presented again
+    // once the AS answers, refreshes and resumes without a fresh login.
+    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    let (e, _) = engine_with_failing_refresh(true, session).await;
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    assert!(matches!(loaded, LoadedSession::RefreshUnavailable));
+
+    // Same (retained) session against a recovered AS.
+    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    let e = LoginEngine::builder()
+        .config(default_config())
+        .grant(test_grant(TokenHttp).await)
+        .session_store(MockSessionStore::with_session(session))
+        .cipher(test_cipher().await)
+        .build();
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    let (recovered, _) = expect_active(loaded);
+    assert!(recovered.token_expiry() > SystemTime::now() + Duration::from_mins(30));
 }
 
 #[tokio::test]
@@ -2056,6 +2086,30 @@ async fn metrics_refresh_failed_retained_on_transient_failure_with_valid_token()
         m.calls(),
         vec![MetricCall::Refresh {
             result: "failed_retained"
+        }]
+    );
+}
+
+#[tokio::test]
+async fn metrics_refresh_failed_unavailable_on_transient_failure_with_expired_token() {
+    // Transient failure past expiry: the session is retained (no teardown
+    // metric) but the request can't be served — a distinct refresh outcome so
+    // dashboards can tell "AS down, users seeing 503s" from both teardowns
+    // and the still-serving retained case.
+    let m = Arc::new(TestEngineMetrics::default());
+    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    let e = LoginEngine::builder()
+        .config(default_config())
+        .grant(test_grant(FailingHttp::new(true).0).await)
+        .session_store(MockSessionStore::with_session(session))
+        .cipher(test_cipher().await)
+        .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
+        .build();
+    let _ = e.load_session(&HeaderMap::new()).await.unwrap();
+    assert_eq!(
+        m.calls(),
+        vec![MetricCall::Refresh {
+            result: "failed_unavailable"
         }]
     );
 }

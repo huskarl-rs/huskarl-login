@@ -137,8 +137,13 @@ pub enum RefreshResult {
     /// The token refresh request failed conclusively — session was cleared.
     Failed,
     /// The refresh failed with a retryable error while the access token was
-    /// still valid — the session was retained and will be re-attempted later.
+    /// still valid — the session was retained and keeps being served.
     FailedRetained,
+    /// The refresh failed with a retryable error after the access token had
+    /// expired — the session was retained for a later retry, but the request
+    /// could not be served
+    /// ([`LoadedSession::RefreshUnavailable`](crate::engine::LoadedSession::RefreshUnavailable)).
+    FailedUnavailable,
 }
 
 impl RefreshResult {

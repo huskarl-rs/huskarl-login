@@ -38,13 +38,27 @@ re-committing the refresh through the same merge-safe path.
 
 ## Transient vs conclusive failure
 
-A *transient* refresh failure (a brief authorization-server blip) while the
-access token is **still valid** does not tear the session down: the session is
-retained and a later request re-enters the refresh window and retries. Only a
-conclusive rejection (the AS rejected the refresh token, e.g. `invalid_grant`),
-or any failure once the access token has actually expired, clears the session.
-Refreshes are retried a few times with exponential backoff and jitter so a
-short outage doesn't produce a synchronized thundering herd.
+A *transient* refresh failure (a brief authorization-server blip) never tears
+the session down — only a conclusive rejection (the AS disowned the refresh
+token, e.g. `invalid_grant`) does. What a transient failure changes is whether
+the *request* can be served:
+
+- access token **still valid** → the session is retained and served as
+  [`Active`](crate::engine::LoadedSession::Active); a later request re-enters
+  the refresh window and retries.
+- access token **expired** → the session is retained but the request cannot be
+  served: [`load_session`](crate::engine::LoginEngine::load_session) yields
+  [`RefreshUnavailable`](crate::engine::LoadedSession::RefreshUnavailable), and
+  the adapter should respond with a retryable error (e.g. `503` with
+  `Retry-After`) — *not* treat the user as anonymous, which would bounce them
+  into a login flow against the same unavailable server.
+
+Failing the request instead of deleting the session matters because deletion is
+irreversible: an AS outage longer than a token lifetime would otherwise destroy
+every idle user's session (and refresh token) even though all of them would
+resume by themselves the moment the AS recovers. Refreshes are retried a few
+times with exponential backoff and jitter so a short outage doesn't produce a
+synchronized thundering herd.
 
 ## Concurrent refresh
 

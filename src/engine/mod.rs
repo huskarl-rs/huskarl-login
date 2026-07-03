@@ -159,6 +159,18 @@ pub enum LoadedSession<S> {
         /// [`load_session`](LoginEngine::load_session) on caching.
         set_cookies: Vec<HeaderValue>,
     },
+    /// A session was presented, its access token has expired, and the token
+    /// refresh failed **transiently** — authentication can be neither
+    /// confirmed nor refuted right now. The session and its cookies are
+    /// retained so a later request can retry the refresh once the
+    /// authorization server recovers.
+    ///
+    /// Serve a retryable error (e.g. `503` with `Retry-After`, via
+    /// [`LoginEngine::render_error`]). Do **not** treat the request as
+    /// anonymous: that would bounce the user into a login flow against the
+    /// same unavailable server, and an anonymous fallback page could leak
+    /// that state into caches keyed on the user.
+    RefreshUnavailable,
     /// Authenticated, with a save owed after the inner handler responds — pass
     /// `session` and `token_response` to [`LoginEngine::persist_session`].
     /// Arises only when the eager persist of a refreshed session failed.
@@ -176,7 +188,7 @@ impl<S> LoadedSession<S> {
     /// Convenience accessor: the session, when the request is authenticated.
     pub fn session(&self) -> Option<&S> {
         match self {
-            Self::Missing | Self::Cleared { .. } => None,
+            Self::Missing | Self::Cleared { .. } | Self::RefreshUnavailable => None,
             Self::Active { session, .. } | Self::ActivePending { session, .. } => Some(session),
         }
     }
@@ -189,6 +201,7 @@ impl<S> std::fmt::Debug for LoadedSession<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Missing => f.write_str("Missing"),
+            Self::RefreshUnavailable => f.write_str("RefreshUnavailable"),
             Self::Cleared { reason, clears } => f
                 .debug_struct("Cleared")
                 .field("reason", reason)
@@ -218,8 +231,6 @@ pub enum TeardownReason {
     /// The authorization server conclusively rejected the refresh token
     /// (e.g. `invalid_grant`).
     RefreshRejected,
-    /// Token refresh failed transiently after the access token had expired.
-    RefreshUnavailable,
     /// The access token expired and the session holds no refresh token.
     NoRefreshToken,
 }
@@ -511,10 +522,12 @@ where
         None
     }
 
-    /// Exchanges the refresh token, or emits cookie clears if refresh is
-    /// unavailable / fails. A transient failure while the access token is still
-    /// valid retains the session for a later retry; conclusive failures and
-    /// failures after token expiry tear it down.
+    /// Exchanges the refresh token. A transient failure while the access token
+    /// is still valid retains the session and keeps serving; a transient
+    /// failure after token expiry retains the session but yields
+    /// [`LoadedSession::RefreshUnavailable`] (fail the request, not the
+    /// session); only a conclusive rejection — or a session with no refresh
+    /// token — tears the session down and emits cookie clears.
     async fn refresh_or_clear(
         &self,
         mut session: SD::SessionType,
@@ -582,13 +595,26 @@ where
                     set_cookies: vec![],
                 }
             }
+            // Transient failure past token expiry: authentication can be
+            // neither confirmed nor refuted, so fail the *request*, not the
+            // session. Deleting here would permanently destroy a session (and
+            // its refresh token) that resumes by itself once the authorization
+            // server recovers — an AS blip at the wrong moment must not force
+            // every idle user back through login.
+            Err(e) if e.is_retryable() => {
+                log::warn!(
+                    "token refresh unavailable; retaining session for a later retry: {}",
+                    error_chain(&e)
+                );
+                self.record_refresh(&RefreshResult::FailedUnavailable);
+                LoadedSession::RefreshUnavailable
+            }
+            // Conclusive rejection (e.g. `invalid_grant`, possibly
+            // reuse-detection revocation): the AS disowned the refresh token,
+            // so the session is dead — tear it down.
             Err(e) => {
                 log::error!("token refresh failed: {}", error_chain(&e));
-                let reason = if e.is_retryable() {
-                    TeardownReason::RefreshUnavailable
-                } else {
-                    TeardownReason::RefreshRejected
-                };
+                let reason = TeardownReason::RefreshRejected;
                 let clears = self.delete_best_effort(&session, headers).await;
                 self.record_refresh(&RefreshResult::Failed);
                 self.record_teardown(reason);
