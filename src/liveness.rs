@@ -8,7 +8,7 @@
 use huskarl::core::platform::{Duration, MaybeSendBoxFuture, MaybeSendSync, SystemTime};
 use uuid::Uuid;
 
-use crate::session::SessionError;
+use crate::{config::ConfigError, session::SessionError};
 
 /// Default minimum interval between liveness writes: one hour.
 const DEFAULT_TOUCH_MIN_INTERVAL: Duration = Duration::from_secs(3600);
@@ -43,17 +43,63 @@ pub trait LivenessStore: MaybeSendSync {
 
 /// Configuration for session liveness tracking, carried alongside the
 /// [`LivenessStore`].
-#[derive(Debug, Clone, bon::Builder)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct LivenessConfig {
     /// Kill the session after this much inactivity. `None` tracks `last_active`
     /// without enforcing an idle timeout.
     pub idle_timeout: Option<Duration>,
 
-    /// Minimum interval between liveness writes for an active session. Keep it
-    /// comfortably below [`idle_timeout`](Self::idle_timeout). Defaults to one hour.
-    #[builder(default = DEFAULT_TOUCH_MIN_INTERVAL)]
+    /// Minimum interval between liveness writes for an active session. Must be
+    /// less than [`idle_timeout`](Self::idle_timeout): `last_active` advances at
+    /// most once per interval, so a longer interval would expire sessions that
+    /// were active the whole time. Defaults to one hour, capped at a quarter of
+    /// `idle_timeout`.
     pub touch_min_interval: Duration,
+}
+
+#[bon::bon]
+impl LivenessConfig {
+    /// Builds a [`LivenessConfig`], validating the intervals against each other.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidDuration`] if `idle_timeout` is zero, or if
+    /// `touch_min_interval` is not less than `idle_timeout`.
+    #[builder]
+    pub fn new(
+        /// Kill the session after this much inactivity. `None` tracks
+        /// `last_active` without enforcing an idle timeout.
+        idle_timeout: Option<Duration>,
+        /// Minimum interval between liveness writes. Must be less than
+        /// `idle_timeout`. Defaults to one hour, capped at `idle_timeout / 4`.
+        touch_min_interval: Option<Duration>,
+    ) -> Result<Self, ConfigError> {
+        if idle_timeout == Some(Duration::ZERO) {
+            return Err(ConfigError::InvalidDuration {
+                field: "idle_timeout",
+                reason: "must be greater than zero (use None for no timeout)",
+            });
+        }
+        let touch_min_interval = match (touch_min_interval, idle_timeout) {
+            // The hard bound: `last_active` advances at most once per
+            // `touch_min_interval`, so an interval reaching `idle_timeout`
+            // expires sessions that received requests the whole time.
+            (Some(touch), Some(idle)) if touch >= idle => {
+                return Err(ConfigError::InvalidDuration {
+                    field: "touch_min_interval",
+                    reason: "must be less than idle_timeout",
+                });
+            }
+            (Some(touch), _) => touch,
+            (None, Some(idle)) => DEFAULT_TOUCH_MIN_INTERVAL.min(idle / 4),
+            (None, None) => DEFAULT_TOUCH_MIN_INTERVAL,
+        };
+        Ok(Self {
+            idle_timeout,
+            touch_min_interval,
+        })
+    }
 }
 
 impl Default for LivenessConfig {
@@ -103,10 +149,10 @@ mod tests {
     const DAY: Duration = Duration::from_hours(24);
 
     fn config(idle_timeout: Option<Duration>) -> LivenessConfig {
-        LivenessConfig {
-            idle_timeout,
-            touch_min_interval: HOUR,
-        }
+        LivenessConfig::builder()
+            .maybe_idle_timeout(idle_timeout)
+            .build()
+            .unwrap()
     }
 
     // ── verdict ───────────────────────────────────────────────────────────
@@ -162,5 +208,87 @@ mod tests {
     #[test]
     fn default_touch_min_interval_is_one_hour() {
         assert_eq!(LivenessConfig::default().touch_min_interval, HOUR);
+    }
+
+    // ── builder validation ────────────────────────────────────────────────
+
+    #[test]
+    fn builder_without_idle_timeout_defaults_touch_to_one_hour() {
+        let config = LivenessConfig::builder().build().unwrap();
+        assert_eq!(config.touch_min_interval, HOUR);
+    }
+
+    #[test]
+    fn builder_derives_touch_as_quarter_of_idle_timeout() {
+        // idle 1h → derived touch 15min, well below the timeout, so a
+        // continuously-active session always re-touches before it can expire.
+        let config = LivenessConfig::builder().idle_timeout(HOUR).build().unwrap();
+        assert_eq!(config.touch_min_interval, HOUR / 4);
+    }
+
+    #[test]
+    fn builder_derived_touch_is_capped_at_one_hour() {
+        // idle 24h → idle/4 would be 6h; the derived default never exceeds
+        // the 1h ceiling (more frequent writes are fine, less frequent aren't).
+        let config = LivenessConfig::builder().idle_timeout(DAY).build().unwrap();
+        assert_eq!(config.touch_min_interval, HOUR);
+    }
+
+    #[test]
+    fn builder_accepts_explicit_touch_below_idle_timeout() {
+        let config = LivenessConfig::builder()
+            .idle_timeout(HOUR)
+            .touch_min_interval(Duration::from_mins(30))
+            .build()
+            .unwrap();
+        assert_eq!(config.touch_min_interval, Duration::from_mins(30));
+    }
+
+    #[test]
+    fn builder_rejects_touch_at_or_above_idle_timeout() {
+        // The footgun this guards: with touch >= idle, `last_active` cannot
+        // advance in time, so continuously-active sessions idle out.
+        for touch in [HOUR, HOUR + Duration::from_secs(1)] {
+            let err = LivenessConfig::builder()
+                .idle_timeout(HOUR)
+                .touch_min_interval(touch)
+                .build()
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    crate::ConfigError::InvalidDuration {
+                        field: "touch_min_interval",
+                        ..
+                    }
+                ),
+                "expected reject for touch {touch:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn builder_accepts_any_explicit_touch_without_idle_timeout() {
+        // No timeout to violate — a long interval only spaces out writes.
+        let config = LivenessConfig::builder()
+            .touch_min_interval(DAY)
+            .build()
+            .unwrap();
+        assert_eq!(config.touch_min_interval, DAY);
+    }
+
+    #[test]
+    fn builder_rejects_zero_idle_timeout() {
+        let err = LivenessConfig::builder()
+            .idle_timeout(Duration::ZERO)
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::ConfigError::InvalidDuration {
+                field: "idle_timeout",
+                ..
+            }
+        ));
     }
 }

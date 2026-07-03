@@ -27,7 +27,12 @@ are:
 - **throttled** — coalesced to one write per
   [`touch_min_interval`](crate::LivenessConfig), so steady traffic is a trickle
   of writes rather than one per request, and the throttle is shared across
-  replicas because it compares against the persisted `last_active`;
+  replicas because it compares against the persisted `last_active`. Because
+  `last_active` advances at most once per interval, the interval must stay
+  below `idle_timeout` or continuously-active sessions would idle out; the
+  [`LivenessConfig`](crate::LivenessConfig) builder enforces this, and by
+  default derives the interval as a quarter of `idle_timeout` (capped at one
+  hour);
 - **conditional** — skipped entirely when the engine's
   [`ActivityPolicy`](crate::ActivityPolicy) classifies the request as
   non-activity (a cross-site embed, a background poll, …), so those requests

@@ -798,7 +798,8 @@ mod tests {
         let liveness = FakeLiveness::default();
         let config = LivenessConfig::builder()
             .idle_timeout(Duration::from_secs(60))
-            .build();
+            .build()
+            .unwrap();
         let store = liveness_store(session.clone(), liveness.clone(), config).await;
 
         let now = SystemTime::now();
@@ -870,7 +871,8 @@ mod tests {
                 FailingLiveness,
                 LivenessConfig::builder()
                     .idle_timeout(Duration::from_secs(1))
-                    .build(),
+                    .build()
+                    .unwrap(),
             );
 
         // Read errors must never expire a session — fail open to Active. The
