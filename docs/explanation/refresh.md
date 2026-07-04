@@ -36,6 +36,20 @@ the token response — so the post-response
 [`PersistFailurePolicy`](crate::PersistFailurePolicy) — acts as the retry,
 re-committing the refresh through the same merge-safe path.
 
+## Returned cookies are part of the persist
+
+For cookie sessions the eager persist only *produces* the re-sealed cookies;
+the write completes when they reach the browser. Discarding them strands the
+rotated refresh token just as surely as a skipped save — the session dies on
+its next request. Cookie clears on a
+[`Cleared`](crate::engine::LoadedSession::Cleared) result matter the same way:
+a dropped clear keeps re-presenting a dead session.
+
+Rust cannot flag a `LoadedSession::Active { session, .. }` pattern that
+discards the cookies at compile time, so the engine hands them out wrapped in
+[`SetCookies`](crate::SetCookies) — a drop guard that logs an error when a
+non-empty value is dropped without being consumed into a response.
+
 ## Transient vs conclusive failure
 
 A *transient* refresh failure (a brief authorization-server blip) never tears

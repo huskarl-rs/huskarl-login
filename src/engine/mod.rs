@@ -137,6 +137,109 @@ impl LoginResponse {
     }
 }
 
+/// Session `Set-Cookie` headers owed to the client's response.
+///
+/// A drop-guard around the cookie headers produced by
+/// [`load_session`](LoginEngine::load_session) and the explicit
+/// persist/save/delete methods. Consume it with
+/// [`into_headers`](Self::into_headers) (or iterate it) and append every
+/// value to the outgoing response.
+///
+/// Dropping a **non-empty**, unconsumed `SetCookies` logs an error; dropping
+/// an empty guard (the steady state) is silent. For what a discarded cookie
+/// costs, see the [refresh explanation](crate::_docs::explanation::refresh).
+#[must_use = "session Set-Cookie headers must be appended to the response"]
+#[derive(Default)]
+pub struct SetCookies {
+    headers: Vec<HeaderValue>,
+    /// Test-only observer incremented when the guard fires, so tests can
+    /// assert drop detection deterministically (a global counter would race
+    /// across parallel tests).
+    #[cfg(test)]
+    drop_probe: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl SetCookies {
+    /// Wraps headers owed to the response. Crate-internal: adapters only
+    /// consume this type.
+    pub(crate) fn new(headers: Vec<HeaderValue>) -> Self {
+        Self {
+            headers,
+            #[cfg(test)]
+            drop_probe: None,
+        }
+    }
+
+    /// `true` when there is nothing to append.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.headers.is_empty()
+    }
+
+    /// Number of `Set-Cookie` headers owed.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.headers.len()
+    }
+
+    /// Consumes the guard, returning the `Set-Cookie` values to append to the
+    /// response.
+    #[must_use = "session Set-Cookie headers must be appended to the response"]
+    pub fn into_headers(mut self) -> Vec<HeaderValue> {
+        std::mem::take(&mut self.headers)
+    }
+
+    /// Attaches the test drop-probe — see [`Self::drop_probe`].
+    #[cfg(test)]
+    pub(crate) fn with_drop_probe(
+        mut self,
+        probe: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.drop_probe = Some(probe);
+        self
+    }
+}
+
+/// Consuming iteration for `response.extend(set_cookies)`-style appends;
+/// defuses the drop guard like [`into_headers`](SetCookies::into_headers).
+impl IntoIterator for SetCookies {
+    type Item = HeaderValue;
+    type IntoIter = std::vec::IntoIter<HeaderValue>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_headers().into_iter()
+    }
+}
+
+// Manual `Debug`: the values are live session cookies — print only the count.
+impl std::fmt::Debug for SetCookies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SetCookies")
+            .field(&self.headers.len())
+            .finish()
+    }
+}
+
+impl Drop for SetCookies {
+    fn drop(&mut self) {
+        // During unwinding the cookies are collateral of the panic — an error
+        // here would misdirect whoever is diagnosing that panic.
+        if self.headers.is_empty() || std::thread::panicking() {
+            return;
+        }
+        #[cfg(test)]
+        if let Some(probe) = &self.drop_probe {
+            probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        log::error!(
+            "{} session Set-Cookie header(s) dropped without reaching a response; \
+             a dropped re-sealed session cookie can strand a rotated refresh token \
+             and kill the session — consume `SetCookies` into the response instead \
+             of discarding it",
+            self.headers.len()
+        );
+    }
+}
+
 /// The result of [`LoginEngine::load_session`] — one variant per session
 /// state the adapter can observe.
 ///
@@ -152,7 +255,7 @@ pub enum LoadedSession<S> {
         /// Why the session was torn down.
         reason: TeardownReason,
         /// `Set-Cookie` clears for the stale session cookies.
-        clears: Vec<HeaderValue>,
+        clears: SetCookies,
     },
     /// Authenticated and fully persisted — nothing is owed after the inner
     /// handler responds.
@@ -162,7 +265,7 @@ pub enum LoadedSession<S> {
         /// `Set-Cookie` headers that must reach the final response (re-sealed
         /// session cookies after an eager refresh, else empty); see
         /// [`load_session`](LoginEngine::load_session) on caching.
-        set_cookies: Vec<HeaderValue>,
+        set_cookies: SetCookies,
     },
     /// A session was presented, its access token has expired, and the token
     /// refresh failed **transiently** — authentication can be neither
@@ -488,7 +591,7 @@ where
 
         Ok(LoadedSession::Active {
             session,
-            set_cookies: vec![],
+            set_cookies: SetCookies::default(),
         })
     }
 
@@ -605,7 +708,7 @@ where
                 {
                     Ok(set_cookies) => LoadedSession::Active {
                         session,
-                        set_cookies,
+                        set_cookies: SetCookies::new(set_cookies),
                     },
                     Err(e) => {
                         log::warn!(
@@ -633,7 +736,7 @@ where
                 // the next request re-evaluates liveness.
                 LoadedSession::Active {
                     session,
-                    set_cookies: vec![],
+                    set_cookies: SetCookies::default(),
                 }
             }
             // Transient failure past token expiry: authentication can be
@@ -665,17 +768,17 @@ where
     }
 
     /// Calls `session_store.delete`, logging on failure and returning an empty
-    /// vec so callers can `.extend(...)` unconditionally.
+    /// set so callers can use the result unconditionally.
     async fn delete_best_effort(
         &self,
         session: &SD::SessionType,
         headers: &HeaderMap,
-    ) -> Vec<HeaderValue> {
+    ) -> SetCookies {
         match self.session_store.delete(session, headers).await {
-            Ok(c) => c,
+            Ok(c) => SetCookies::new(c),
             Err(e) => {
                 log::error!("failed to delete session: {}", error_chain(&e));
-                vec![]
+                SetCookies::default()
             }
         }
     }
@@ -730,7 +833,7 @@ where
     }
 
     /// Commits the refresh owed by a [`LoadedSession::ActivePending`] after the
-    /// inner service responded, returning `Set-Cookie` values to append. Pass
+    /// inner service responded, returning [`SetCookies`] to append. Pass
     /// the variant's `session` and `token_response` back in; the refresh is
     /// re-committed through the same merge-safe path as the eager persist, so
     /// a concurrent [`StoreBackedSessionStore::update`] landing in between is
@@ -749,7 +852,7 @@ where
         session: &mut SD::SessionType,
         token_response: &TokenResponse,
         request_headers: &HeaderMap,
-    ) -> Result<Vec<HeaderValue>, SessionError> {
+    ) -> Result<SetCookies, SessionError> {
         self.session_store
             .apply_refresh_and_save(
                 session,
@@ -758,9 +861,10 @@ where
                 request_headers,
             )
             .await
+            .map(SetCookies::new)
     }
 
-    /// Deletes a session, returning `Set-Cookie` values that clear the session
+    /// Deletes a session, returning [`SetCookies`] that clear the session
     /// cookies. See [`persist_session`](Self::persist_session) for
     /// `request_headers`.
     ///
@@ -771,12 +875,15 @@ where
         &self,
         session: &SD::SessionType,
         request_headers: &HeaderMap,
-    ) -> Result<Vec<HeaderValue>, SessionError> {
-        self.session_store.delete(session, request_headers).await
+    ) -> Result<SetCookies, SessionError> {
+        self.session_store
+            .delete(session, request_headers)
+            .await
+            .map(SetCookies::new)
     }
 
     /// Explicitly and unconditionally saves a session (e.g. after the
-    /// application mutated it), returning `Set-Cookie` values; unlike the
+    /// application mutated it), returning [`SetCookies`]; unlike the
     /// deferred [`persist_session`](Self::persist_session). See
     /// [`persist_session`](Self::persist_session) for `request_headers`.
     ///
@@ -793,8 +900,11 @@ where
         &self,
         session: &SD::SessionType,
         request_headers: &HeaderMap,
-    ) -> Result<Vec<HeaderValue>, SessionError> {
-        self.session_store.save(session, request_headers).await
+    ) -> Result<SetCookies, SessionError> {
+        self.session_store
+            .save(session, request_headers)
+            .await
+            .map(SetCookies::new)
     }
 
     /// Renders an error response through the configured [`ErrorPage`].
