@@ -36,7 +36,7 @@ use super::{
 };
 use crate::{
     ActivityPolicy, CompletedLogin, LivenessVerdict, LoginConfig, LogoutConfig, Session,
-    SessionDriver, SessionError, SessionErrorKind, SessionState,
+    SessionDriver, SessionError, SessionErrorKind, SessionLifetime, SessionState,
     metrics::{LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult},
     session::sealed::Sealed,
     test_support::{header_map as headers, test_cipher},
@@ -288,10 +288,10 @@ struct MockSessionStore {
     /// [`ActivityPolicy`](crate::ActivityPolicy) classification reaches the
     /// store.
     last_record_activity: Mutex<Option<bool>>,
-    /// Records the value the engine stamps via
-    /// [`SessionDriver::apply_cookie_secure`], so a test can assert the
-    /// deployment cookie-security policy reaches the store.
-    applied_secure: Mutex<Option<bool>>,
+    /// Records the values the engine stamps via
+    /// [`SessionDriver::apply_session_policy`], so a test can assert the
+    /// deployment policy (secure flag, lifetime bound) reaches the store.
+    applied_policy: Mutex<Option<(bool, Option<Duration>)>>,
 }
 
 /// The `Set-Cookie` value [`MockSessionStore::save`] returns, so tests can
@@ -307,7 +307,7 @@ impl MockSessionStore {
             fail_save: false,
             verdict: LivenessVerdict::Untracked,
             last_record_activity: Mutex::new(None),
-            applied_secure: Mutex::new(None),
+            applied_policy: Mutex::new(None),
         }
     }
     fn with_session_failing_save(s: MockSession) -> Self {
@@ -332,7 +332,7 @@ impl MockSessionStore {
             fail_save: false,
             verdict: LivenessVerdict::Untracked,
             last_record_activity: Mutex::new(None),
-            applied_secure: Mutex::new(None),
+            applied_policy: Mutex::new(None),
         }
     }
     fn last_record_activity(&self) -> Option<bool> {
@@ -344,8 +344,8 @@ impl MockSessionStore {
     fn delete_called(&self) -> bool {
         *self.delete_called.lock().unwrap()
     }
-    fn applied_secure(&self) -> Option<bool> {
-        *self.applied_secure.lock().unwrap()
+    fn applied_policy(&self) -> Option<(bool, Option<Duration>)> {
+        *self.applied_policy.lock().unwrap()
     }
 }
 
@@ -358,8 +358,8 @@ impl SessionDriver for MockSessionStore {
     type SessionType = MockSession;
     type LoadError = Infallible;
 
-    fn apply_cookie_secure(&mut self, secure: bool) {
-        *self.applied_secure.lock().unwrap() = Some(secure);
+    fn apply_session_policy(&mut self, secure: bool, max_lifetime: Option<Duration>) {
+        *self.applied_policy.lock().unwrap() = Some((secure, max_lifetime));
     }
 
     fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
@@ -433,7 +433,7 @@ impl SessionDriver for ErrorSessionStore {
     type SessionType = MockSession;
     type LoadError = StoreLoadError;
 
-    fn apply_cookie_secure(&mut self, _secure: bool) {}
+    fn apply_session_policy(&mut self, _secure: bool, _max_lifetime: Option<Duration>) {}
 
     fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
         unimplemented!()
@@ -468,6 +468,7 @@ fn default_config() -> LoginConfig {
     LoginConfig::builder()
         .callback_path("/callback".to_owned())
         .scopes(vec![])
+        .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
         .build()
         .unwrap()
@@ -477,6 +478,7 @@ fn config_with_logout() -> LoginConfig {
     LoginConfig::builder()
         .callback_path("/callback".to_owned())
         .scopes(vec![])
+        .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
         .logout(LogoutConfig::builder().path("/logout").build().unwrap())
         .build()
@@ -504,7 +506,7 @@ async fn engine_stamps_store_secure_from_https_base_url() {
     // default_config uses an https base_url, so the engine must stamp the
     // store with the secure policy at construction.
     let e = engine(MockSessionStore::empty()).await;
-    assert_eq!(e.session_store.applied_secure(), Some(true));
+    assert_eq!(e.session_store.applied_policy(), Some((true, None)));
 }
 
 #[tokio::test]
@@ -512,11 +514,30 @@ async fn engine_stamps_store_insecure_from_http_base_url() {
     let http_config = LoginConfig::builder()
         .callback_path("/callback".to_owned())
         .scopes(vec![])
+        .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("http://localhost:6188".parse().unwrap())
         .build()
         .unwrap();
     let e = engine_with_config(MockSessionStore::empty(), http_config).await;
-    assert_eq!(e.session_store.applied_secure(), Some(false));
+    assert_eq!(e.session_store.applied_policy(), Some((false, None)));
+}
+
+#[tokio::test]
+async fn engine_stamps_store_with_bounded_session_lifetime() {
+    // A Bounded lifetime reaches the driver so cookie Max-Age (and any
+    // store-side deadlines) can be clamped to the session cap.
+    let config = LoginConfig::builder()
+        .callback_path("/callback".to_owned())
+        .scopes(vec![])
+        .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(8)))
+        .base_url("https://app.example.com".parse().unwrap())
+        .build()
+        .unwrap();
+    let e = engine_with_config(MockSessionStore::empty(), config).await;
+    assert_eq!(
+        e.session_store.applied_policy(),
+        Some((true, Some(Duration::from_hours(8))))
+    );
 }
 
 // ── Header / URI helpers ──────────────────────────────────────────────────
@@ -819,6 +840,7 @@ async fn login_state_cookie_uses_configured_ttl() {
     let config = LoginConfig::builder()
         .callback_path("/callback".to_owned())
         .scopes(vec![])
+        .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
         .login_state_ttl(Duration::from_mins(30))
         .build()
@@ -917,8 +939,8 @@ async fn max_lifetime_expired_clears_session() {
     let config = LoginConfig::builder()
         .callback_path("/callback".to_owned())
         .scopes(vec![])
+        .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(1)))
         .base_url("https://app.example.com".parse().unwrap())
-        .max_lifetime(Duration::from_hours(1))
         .build()
         .unwrap();
     let e = engine_with_config(MockSessionStore::with_session(session), config).await;
@@ -985,6 +1007,7 @@ async fn activity_policy_navigations_only_excludes_same_origin_fetch() {
     let config = LoginConfig::builder()
         .callback_path("/callback".to_owned())
         .scopes(vec![])
+        .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
         .activity_policy(ActivityPolicy::NavigationsOnly)
         .build()
@@ -1572,6 +1595,7 @@ async fn logout_redirects_to_configured_post_logout_uri() {
     let config = LoginConfig::builder()
         .callback_path("/callback".to_owned())
         .scopes(vec![])
+        .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
         .logout(
             LogoutConfig::builder()
@@ -1604,6 +1628,7 @@ async fn logout_end_session_url_includes_client_id_without_id_token() {
     let config = LoginConfig::builder()
         .callback_path("/callback".to_owned())
         .scopes(vec![])
+        .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
         .logout(
             LogoutConfig::builder()
@@ -1641,6 +1666,7 @@ async fn post_logout_redirect_uri_is_sent_exactly_not_normalized() {
     let config = LoginConfig::builder()
         .callback_path("/callback".to_owned())
         .scopes(vec![])
+        .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
         .logout(
             LogoutConfig::builder()

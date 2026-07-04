@@ -10,13 +10,14 @@ down on an [`Expired`](crate::LivenessVerdict) verdict.
 
 Cookie sessions, and store-backed sessions without a liveness store, report
 [`Untracked`](crate::LivenessVerdict) — idle timeout simply isn't enforced for
-them, and only [`max_lifetime`](crate::LoginConfig) applies.
+them, and only the absolute [`SessionLifetime`](crate::SessionLifetime)
+bound applies.
 
 ## Fail open
 
 A liveness read failure never expires a session: the verdict degrades to
-[`Active`](crate::LivenessVerdict) and idle enforcement falls back to
-`max_lifetime` until the store recovers. An outage of the liveness backend must
+[`Active`](crate::LivenessVerdict) and idle enforcement falls back to the
+absolute session-lifetime bound until the store recovers. An outage of the liveness backend must
 not log every user out.
 
 ## Hot/cold write split
@@ -41,6 +42,7 @@ are:
   it never fails the request.
 
 The absolute expiry handed to the store
-([`expire_at`](crate::LivenessStore::touch)) is the session's `max_lifetime`
-deadline, not a sliding idle TTL — so the liveness entry expires exactly when
+([`expire_at`](crate::LivenessStore::touch)) is the session's
+[`SessionLifetime::Bounded`](crate::SessionLifetime) deadline (absent when the
+lifetime is delegated to the authorization server), not a sliding idle TTL — so the liveness entry expires exactly when
 the session can no longer be valid, which is what keeps fail-open correct.

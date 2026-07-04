@@ -42,6 +42,40 @@ impl ActivityPolicy {
     }
 }
 
+/// Which party bounds the session's absolute lifetime. Required by
+/// [`LoginConfig::builder`] — there is no default, so every deployment states
+/// its choice in code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLifetime {
+    /// The **authorization server** bounds the session: it lives exactly as
+    /// long as the AS keeps honoring the refresh token (re-verified on every
+    /// token refresh), and this crate imposes no cap of its own. Provides no
+    /// re-authentication freshness, no cookie-theft containment, and no
+    /// storage TTL hint — see [the session
+    /// model](crate::_docs::explanation::session_model) for when to choose
+    /// delegation and what to verify about the AS first.
+    DelegatedToAuthorizationServer,
+    /// This crate bounds the session: it is torn down this long after login
+    /// ([`MaxLifetime`](crate::TeardownReason::MaxLifetime)), regardless of
+    /// activity or AS policy. Must be non-zero. The only crate-side lifetime
+    /// bound for cookie sessions, and the TTL handed to external-store
+    /// records and liveness entries.
+    Bounded(Duration),
+}
+
+impl SessionLifetime {
+    /// The crate-enforced cap: `Some` for [`Bounded`](Self::Bounded), `None`
+    /// for
+    /// [`DelegatedToAuthorizationServer`](Self::DelegatedToAuthorizationServer).
+    #[must_use]
+    pub fn bound(self) -> Option<Duration> {
+        match self {
+            Self::DelegatedToAuthorizationServer => None,
+            Self::Bounded(d) => Some(d),
+        }
+    }
+}
+
 /// Errors that can occur when building a [`LoginConfig`].
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
@@ -227,7 +261,7 @@ pub(crate) fn join_base_path(base_url: &http::Uri, segment: &str) -> String {
 
 /// Validates the lifetime/interval settings against each other.
 fn validate_durations(
-    max_lifetime: Option<Duration>,
+    session_lifetime: SessionLifetime,
     token_refresh_margin: Duration,
     default_token_lifetime: Duration,
     login_state_ttl: Duration,
@@ -242,10 +276,11 @@ fn validate_durations(
     if login_state_ttl.is_zero() {
         return Err(zero("login_state_ttl"));
     }
-    if max_lifetime == Some(Duration::ZERO) {
+    if session_lifetime == SessionLifetime::Bounded(Duration::ZERO) {
         return Err(ConfigError::InvalidDuration {
-            field: "max_lifetime",
-            reason: "must be greater than zero (use None for no limit)",
+            field: "session_lifetime",
+            reason: "Bounded lifetime must be greater than zero (use \
+                     DelegatedToAuthorizationServer to delegate the cap)",
         });
     }
     if token_refresh_margin >= default_token_lifetime {
@@ -339,10 +374,10 @@ pub struct LoginConfig {
     /// prefixes. Derived from [`base_url`](Self::base_url): `true` when its
     /// scheme is `https`.
     pub secure: bool,
-    /// Absolute session cap; sessions older than this expire regardless of
-    /// activity. `None` means no limit. The only lifetime bound for cookie
-    /// sessions; idle timeout is configured on the liveness store.
-    pub max_lifetime: Option<Duration>,
+    /// Which party bounds the session's absolute lifetime — see
+    /// [`SessionLifetime`]. Idle timeout is configured separately, on the
+    /// liveness store.
+    pub session_lifetime: SessionLifetime,
     /// Which requests count as user activity. Only affects sessions with a
     /// liveness store. Defaults to [`ActivityPolicy::FirstParty`].
     pub activity_policy: ActivityPolicy,
@@ -387,8 +422,10 @@ impl LoginConfig {
         callback_path: String,
         /// OAuth 2.0 scopes to request (e.g. `vec!["openid".to_owned()]`).
         scopes: Vec<String>,
-        /// Absolute session cap. `None` means no limit.
-        max_lifetime: Option<Duration>,
+        /// Which party bounds the session's absolute lifetime; see
+        /// [`SessionLifetime`] for what each choice implies. Required — there
+        /// is no default.
+        session_lifetime: SessionLifetime,
         /// Which requests count as user activity. Defaults to
         /// [`ActivityPolicy::FirstParty`].
         #[builder(default)]
@@ -472,7 +509,7 @@ impl LoginConfig {
             }
         })?;
         validate_durations(
-            max_lifetime,
+            session_lifetime,
             token_refresh_margin,
             default_token_lifetime,
             login_state_ttl,
@@ -498,7 +535,7 @@ impl LoginConfig {
             callback_path,
             scopes,
             secure,
-            max_lifetime,
+            session_lifetime,
             activity_policy,
             token_refresh_margin,
             default_token_lifetime,
@@ -523,6 +560,7 @@ mod tests {
         LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com".parse().unwrap())
             .build()
             .unwrap()
@@ -538,6 +576,7 @@ mod tests {
         let config = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("http://localhost:6188".parse().unwrap())
             .build()
             .unwrap();
@@ -545,8 +584,16 @@ mod tests {
     }
 
     #[test]
-    fn login_config_max_lifetime_defaults_none() {
-        assert!(default_policy_config().max_lifetime.is_none());
+    fn delegated_session_lifetime_has_no_crate_side_bound() {
+        assert_eq!(
+            default_policy_config().session_lifetime.bound(),
+            None,
+            "delegated lifetime imposes no crate-side cap"
+        );
+        assert_eq!(
+            SessionLifetime::Bounded(Duration::from_hours(8)).bound(),
+            Some(Duration::from_hours(8))
+        );
     }
 
     #[test]
@@ -554,6 +601,7 @@ mod tests {
         let err = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com".parse().unwrap())
             .default_token_lifetime(Duration::ZERO)
             .build()
@@ -572,6 +620,7 @@ mod tests {
         let err = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com".parse().unwrap())
             .login_state_ttl(Duration::ZERO)
             .build()
@@ -586,23 +635,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_max_lifetime_but_allows_none() {
+    fn rejects_zero_bounded_lifetime_but_allows_delegated() {
         let err = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::Bounded(Duration::ZERO))
             .base_url("https://app.example.com".parse().unwrap())
-            .max_lifetime(Duration::ZERO)
             .build()
             .unwrap_err();
         assert!(matches!(
             err,
             ConfigError::InvalidDuration {
-                field: "max_lifetime",
+                field: "session_lifetime",
                 ..
             }
         ));
-        // None (the default) stays valid — it means "no absolute cap".
-        assert!(default_policy_config().max_lifetime.is_none());
+        // Delegation stays valid — the AS bounds the session instead.
+        assert_eq!(default_policy_config().session_lifetime.bound(), None);
     }
 
     #[test]
@@ -610,6 +659,7 @@ mod tests {
         let err = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com".parse().unwrap())
             .default_token_lifetime(Duration::from_secs(60))
             .token_refresh_margin(Duration::from_secs(60))
@@ -734,14 +784,17 @@ mod tests {
         let config = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(1)))
             .base_url("https://app.example.com".parse().unwrap())
-            .max_lifetime(Duration::from_hours(1))
             .token_refresh_margin(Duration::from_mins(1))
             .default_token_lifetime(Duration::from_hours(2))
             .login_state_ttl(Duration::from_mins(30))
             .build()
             .unwrap();
-        assert_eq!(config.max_lifetime, Some(Duration::from_hours(1)));
+        assert_eq!(
+            config.session_lifetime,
+            SessionLifetime::Bounded(Duration::from_hours(1))
+        );
         assert_eq!(config.token_refresh_margin, Duration::from_mins(1));
         assert_eq!(config.default_token_lifetime, Duration::from_hours(2));
         assert_eq!(config.login_state_ttl, Duration::from_mins(30));
@@ -752,6 +805,7 @@ mod tests {
         let err = LoginConfig::builder()
             .callback_path("callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com".parse().unwrap())
             .build()
             .unwrap_err();
@@ -764,6 +818,7 @@ mod tests {
             let err = LoginConfig::builder()
                 .callback_path(path.into())
                 .scopes(vec![])
+                .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
                 .base_url("https://app.example.com".parse().unwrap())
                 .build()
                 .unwrap_err();
@@ -782,6 +837,7 @@ mod tests {
             let err = LoginConfig::builder()
                 .callback_path(path.into())
                 .scopes(vec![])
+                .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
                 .base_url("https://app.example.com".parse().unwrap())
                 .build()
                 .unwrap_err();
@@ -797,6 +853,7 @@ mod tests {
         let err = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com".parse().unwrap())
             .strip_prefix("internal")
             .build()
@@ -810,6 +867,7 @@ mod tests {
             let err = LoginConfig::builder()
                 .callback_path("/callback".into())
                 .scopes(vec![])
+                .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
                 .base_url("https://app.example.com".parse().unwrap())
                 .strip_prefix(prefix)
                 .build()
@@ -828,6 +886,7 @@ mod tests {
         let config = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com".parse().unwrap())
             .logout(LogoutConfig::builder().path("/logout").build().unwrap())
             .build()
@@ -868,6 +927,7 @@ mod tests {
         let err = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com".parse().unwrap())
             .logout(
                 LogoutConfig::builder()
@@ -889,6 +949,7 @@ mod tests {
         let config = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com".parse().unwrap())
             .logout(
                 LogoutConfig::builder()
@@ -912,6 +973,7 @@ mod tests {
             let err = LoginConfig::builder()
                 .callback_path("/callback".into())
                 .scopes(vec![])
+                .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
                 .base_url("https://app.example.com".parse().unwrap())
                 .login_cookie_prefix(prefix.to_owned())
                 .build()
@@ -928,6 +990,7 @@ mod tests {
         let config = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com".parse().unwrap())
             .login_cookie_prefix("my-app_2".to_owned())
             .build()
@@ -942,6 +1005,7 @@ mod tests {
         let config = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com".parse().unwrap())
             .build()
             .unwrap();
@@ -953,6 +1017,7 @@ mod tests {
         let config = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com/base".parse().unwrap())
             .build()
             .unwrap();
@@ -964,6 +1029,7 @@ mod tests {
         let config = LoginConfig::builder()
             .callback_path("/internal/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com".parse().unwrap())
             .strip_prefix("/internal")
             .build()
@@ -976,6 +1042,7 @@ mod tests {
         let config = LoginConfig::builder()
             .callback_path("/internal/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com/base".parse().unwrap())
             .strip_prefix("/internal")
             .build()
@@ -1014,6 +1081,7 @@ mod tests {
         let err = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com/a;b".parse().unwrap())
             .build()
             .unwrap_err();
@@ -1087,6 +1155,7 @@ mod tests {
         let err = LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com".parse().unwrap())
             .strip_prefix("/other")
             .build()
@@ -1099,6 +1168,7 @@ mod tests {
         let err = LoginConfig::builder()
             .callback_path("/internal/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com".parse().unwrap())
             .strip_prefix("/internal")
             .logout(LogoutConfig::builder().path("/logout").build().unwrap())
@@ -1112,6 +1182,7 @@ mod tests {
         let config = LoginConfig::builder()
             .callback_path("/internal/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url("https://app.example.com".parse().unwrap())
             .strip_prefix("/internal")
             .logout(

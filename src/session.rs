@@ -155,10 +155,14 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// The error type returned by [`load`](Self::load).
     type LoadError: std::error::Error + MaybeSendSync + 'static;
 
-    /// Stamp the cookie-security policy (`secure`, from the `base_url` scheme)
-    /// onto this driver, fixing `__Host-`/`__Secure-` naming and the `Secure`
-    /// attribute. Called once at engine construction.
-    fn apply_cookie_secure(&mut self, secure: bool);
+    /// Stamp the engine-derived session policy onto this driver. Called once
+    /// at engine construction, so the values cannot drift from the config:
+    /// `secure` (from the `base_url` scheme) fixes `__Host-`/`__Secure-`
+    /// naming and the `Secure` attribute; `max_lifetime` (the
+    /// [`SessionLifetime::Bounded`](crate::SessionLifetime) cap, `None` when
+    /// delegated) clamps the cookie `Max-Age`, so no session cookie outlives
+    /// the session cap.
+    fn apply_session_policy(&mut self, secure: bool, max_lifetime: Option<std::time::Duration>);
 
     /// The AEAD cipher this driver seals session data with (AAD-domain-separated
     /// from the login-state seal, so the key may be shared).

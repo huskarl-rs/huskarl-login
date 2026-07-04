@@ -89,16 +89,19 @@ impl From<SessionState> for CookieSession {
 ///
 /// The type parameter `C` is the [`CookiePayload`] stored in the cookie,
 /// defaulting to [`CookieSession`]. Decryption failure is treated as "no
-/// session". The `Secure` attribute and `__Host-`/`__Secure-` prefix are
-/// stamped on by the engine via
-/// [`SessionDriver::apply_cookie_secure`](crate::SessionDriver::apply_cookie_secure),
+/// session". The `Secure` attribute, the `__Host-`/`__Secure-` prefix, and the
+/// `Max-Age` clamp to the session-lifetime cap are stamped on by the engine
+/// via
+/// [`SessionDriver::apply_session_policy`](crate::SessionDriver::apply_session_policy),
 /// not configured here.
 ///
 /// Cookie sessions are stateless: [`delete`](SessionDriver::delete) only
 /// clears the cooperating browser's cookie (no server-side revocation, no idle
-/// timeout); a stolen copy stays valid until
-/// [`max_lifetime`](crate::LoginConfig::max_lifetime) elapses. For revocation,
-/// use [`StoreBackedSessionStore`](crate::StoreBackedSessionStore).
+/// timeout); a stolen copy stays valid until the
+/// [`SessionLifetime::Bounded`](crate::SessionLifetime) cap elapses. Prefer a
+/// bounded lifetime with this store — see [the session
+/// model](crate::_docs::explanation::session_model). For revocation, use
+/// [`StoreBackedSessionStore`](crate::StoreBackedSessionStore).
 pub struct CookieSessionStore<C = CookieSession> {
     /// Shared cookie-sealing machinery — see [`CookieSealer`].
     sealer: CookieSealer,
@@ -121,9 +124,10 @@ impl<C> CookieSessionStore<C> {
         cookie_name: CookieName,
         /// Cookie `Path` scope.
         cookie_path: RoutePath,
-        /// Cookie `Max-Age`; defaults to 400 days. Pass `LoginConfig`'s
-        /// `max_lifetime` so the browser discards the cookie when the session
-        /// can no longer be valid.
+        /// Cookie `Max-Age`; defaults to 400 days. The engine clamps it to the
+        /// [`SessionLifetime::Bounded`](crate::SessionLifetime) cap at
+        /// construction, so the browser discards the cookie when the session
+        /// can no longer be valid; set it explicitly only to go *shorter*.
         #[builder(default = DEFAULT_COOKIE_MAX_AGE)]
         max_age: Duration,
         /// Most chunk cookies a saved session may occupy; a save needing more
@@ -385,8 +389,11 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
     type SessionType = C;
     type LoadError = std::convert::Infallible;
 
-    fn apply_cookie_secure(&mut self, secure: bool) {
+    fn apply_session_policy(&mut self, secure: bool, max_lifetime: Option<Duration>) {
         self.sealer.apply_secure(secure);
+        if let Some(max) = max_lifetime {
+            self.sealer.clamp_max_age(max);
+        }
     }
 
     fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
@@ -420,7 +427,7 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
     // Cookie sessions have no server-side liveness — they use the default
     // `check_liveness` (`Untracked`) and `commit_touch` (no-op) from
     // `SessionDriver`, so idle timeout is not enforced and activity is not
-    // recorded. Absolute `max_lifetime` (from `created_at`) still applies.
+    // recorded. The absolute lifetime bound (from `created_at`) still applies.
 
     // Clearing chunk cookies is pure header construction with no I/O; the
     // `async` is only here to satisfy the `SessionDriver` trait signature.
@@ -588,6 +595,42 @@ mod tests {
             "got: {chunk0}"
         );
         assert!(chunk0.contains("Path=/app"));
+    }
+
+    #[tokio::test]
+    async fn session_policy_clamps_max_age_to_bounded_lifetime() {
+        // The engine stamps the Bounded cap at construction; the default
+        // 400-day Max-Age must come down to it so no cookie outlives the
+        // session.
+        let mut store = test_store().await;
+        SessionDriver::apply_session_policy(&mut store, true, Some(Duration::from_hours(8)));
+        let cookies = store
+            .save_session(&CookieSession(test_state()), &HeaderMap::new())
+            .await
+            .unwrap();
+        let chunk0 = cookies[0].to_str().unwrap();
+        assert!(
+            chunk0.contains(&format!("Max-Age={}", 8 * 3600)),
+            "got: {chunk0}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_policy_keeps_shorter_configured_max_age() {
+        // The clamp only ever lowers: an explicitly shorter max_age wins.
+        let mut store = CookieSessionStore::<CookieSession>::builder()
+            .cipher(test_cipher().await)
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .max_age(Duration::from_hours(1))
+            .build();
+        SessionDriver::apply_session_policy(&mut store, true, Some(Duration::from_hours(8)));
+        let cookies = store
+            .save_session(&CookieSession(test_state()), &HeaderMap::new())
+            .await
+            .unwrap();
+        let chunk0 = cookies[0].to_str().unwrap();
+        assert!(chunk0.contains("Max-Age=3600"), "got: {chunk0}");
     }
 
     #[tokio::test]
