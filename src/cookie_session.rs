@@ -65,7 +65,7 @@ impl<T: Session + Serialize + for<'de> Deserialize<'de> + MaybeSendSync + 'stati
 
 /// The default [`CookieSessionStore`] payload: a transparent newtype over
 /// [`SessionState`], carrying no claims beyond its `sub`/`sid`.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CookieSession(SessionState);
 

@@ -9,7 +9,7 @@ have consequences for how you deploy the crate.
 
 A successful refresh is persisted *inside* `load_session`, before it returns —
 not deferred to the adapter's post-response
-[`persist_session`](crate::engine::LoginEngine::persist_session) call.
+[`PendingPersist::commit`](crate::engine::PendingPersist::commit) call.
 
 The reason is refresh-token rotation. When the authorization server rotates
 refresh tokens on each use, a deferred save that never runs — because the
@@ -30,11 +30,12 @@ write; the browser cookie jar is inherently last-writer-wins.
 On success the session is returned as
 [`Active`](crate::engine::LoadedSession::Active) with the re-sealed session
 cookies in `set_cookies`. If the eager persist *fails*, the session is returned
-as [`ActivePending`](crate::engine::LoadedSession::ActivePending) — carrying
-the token response — so the post-response
-[`persist_session`](crate::engine::LoginEngine::persist_session) — and its
-[`PersistFailurePolicy`](crate::PersistFailurePolicy) — acts as the retry,
-re-committing the refresh through the same merge-safe path.
+as [`ActivePending`](crate::engine::LoadedSession::ActivePending), carrying a
+[`PendingPersist`](crate::engine::PendingPersist) that pairs the session with
+the token response. The post-response
+[`commit`](crate::engine::PendingPersist::commit) then acts as the retry,
+re-committing the refresh through the same merge-safe path; a commit failure
+falls to the adapter's [`PersistFailurePolicy`](crate::PersistFailurePolicy).
 
 ## Returned cookies are part of the persist
 
