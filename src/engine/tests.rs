@@ -18,7 +18,7 @@ use huskarl::{
             KeyMatchStrength,
             cipher::{
                 AeadCipher, AeadDecryptor, AeadEncryptor, AeadOutput, AeadSealer as _,
-                AeadV1Cipher, CipherMatch, DecryptError,
+                AeadUnsealer as _, AeadV1Cipher, CipherMatch, DecryptError,
             },
         },
         http::{HttpClient, HttpResponse, Idempotency},
@@ -289,6 +289,10 @@ struct MockSessionStore {
     /// [`SessionDriver::apply_session_policy`], so a test can assert the
     /// deployment policy (secure flag, lifetime bound) reaches the store.
     applied_policy: Mutex<Option<(bool, Option<Duration>)>>,
+    /// The cipher returned from [`SessionDriver::session_aead_cipher`]. `None`
+    /// falls back to [`NoopCipher`]; a test that exercises the engine's
+    /// default-login-state-cipher path sets a real key here.
+    store_cipher: Option<Arc<dyn AeadCipher>>,
 }
 
 /// The `Set-Cookie` value [`MockSessionStore::save`] returns, so tests can
@@ -305,6 +309,7 @@ impl MockSessionStore {
             verdict: LivenessVerdict::Untracked,
             last_record_activity: Mutex::new(None),
             applied_policy: Mutex::new(None),
+            store_cipher: None,
         }
     }
     fn with_session_failing_save(s: MockSession) -> Self {
@@ -330,7 +335,14 @@ impl MockSessionStore {
             verdict: LivenessVerdict::Untracked,
             last_record_activity: Mutex::new(None),
             applied_policy: Mutex::new(None),
+            store_cipher: None,
         }
+    }
+    /// Sets the cipher [`SessionDriver::session_aead_cipher`] returns, so a test
+    /// can exercise the engine defaulting the login-state cipher to the store's.
+    fn with_cipher(mut self, cipher: Arc<dyn AeadCipher>) -> Self {
+        self.store_cipher = Some(cipher);
+        self
     }
     fn last_record_activity(&self) -> Option<bool> {
         *self.last_record_activity.lock().unwrap()
@@ -360,7 +372,9 @@ impl SessionDriver for MockSessionStore {
     }
 
     fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
-        Arc::new(NoopCipher)
+        self.store_cipher
+            .clone()
+            .unwrap_or_else(|| Arc::new(NoopCipher))
     }
 
     async fn create(
@@ -537,6 +551,73 @@ async fn engine_stamps_store_with_bounded_session_lifetime() {
     assert_eq!(
         e.session_store.applied_policy(),
         Some((true, Some(Duration::from_hours(8))))
+    );
+}
+
+#[tokio::test]
+async fn engine_defaults_login_state_cipher_to_store_cipher() {
+    // Omitting `.cipher()` must default the login-state seal to the store's own
+    // AEAD cipher — the two seals are AAD-domain-separated, so sharing one key
+    // is safe. Moving this defaulting into the builder means every adapter gets
+    // it (and its safety argument) for free instead of reimplementing it. Build
+    // the engine WITHOUT a cipher over a store whose `session_aead_cipher()` is
+    // the shared test key, then confirm the login-state cookie it seals unseals
+    // under that same key.
+    let store = MockSessionStore::empty().with_cipher(Arc::new(test_cipher().await));
+    let e = LoginEngine::builder()
+        .config(default_config())
+        .grant(test_grant(FailingHttp::new(false).0).await)
+        .session_store(store)
+        .build();
+
+    let uri = "/dashboard".parse().unwrap();
+    let r = e.redirect_to_login(&nav_headers(), &uri).await;
+    let hdrs = r.headers();
+
+    // The `state` the engine minted is carried in the authorize redirect; it
+    // is the AAD the login-state cookie was sealed under.
+    let location = hdrs
+        .iter()
+        .find(|(n, _)| *n == http::header::LOCATION)
+        .map(|(_, v)| v.to_str().unwrap())
+        .expect("Location header");
+    let state = location
+        .split_once("state=")
+        .and_then(|(_, rest)| rest.split('&').next())
+        .expect("state param");
+
+    // The login-state cookie value the engine emitted.
+    let cookie_value = hdrs
+        .iter()
+        .filter(|(n, _)| *n == http::header::SET_COOKIE)
+        .find_map(|(_, v)| {
+            let s = v.to_str().ok()?;
+            s.contains("huskarl_login_").then(|| {
+                s.split_once('=')
+                    .unwrap()
+                    .1
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+        })
+        .expect("login-state cookie");
+
+    // Independently rebuild a sealer over the same fixed test key and unseal:
+    // success proves the engine sealed with the store's cipher (the default),
+    // not some unrelated key.
+    let bundle = URL_SAFE_NO_PAD.decode(&cookie_value).unwrap();
+    let sealer = AeadV1Cipher::new(test_cipher().await);
+    let plaintext = sealer
+        .unseal(None, &bundle, &super::login_state_aad(state))
+        .await
+        .expect("login-state cookie unseals under the store cipher");
+    let decoded = crate::cookie::decode_payload::<super::LoginStateCookie>(&plaintext).unwrap();
+    assert!(
+        decoded.original_url.contains("dashboard"),
+        "unsealed original_url should round-trip the request path, got {}",
+        decoded.original_url
     );
 }
 

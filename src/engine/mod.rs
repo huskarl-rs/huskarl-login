@@ -612,16 +612,20 @@ where
 {
     /// Builds a [`LoginEngine`]; invoked via `LoginEngine::builder()`.
     ///
-    /// `grant` drives the OAuth flow per its own configuration. `cipher` seals
-    /// only the short-lived login-state cookie; sessions are persisted by the
-    /// session store.
+    /// `grant` drives the OAuth flow per its own configuration.
+    ///
+    /// `cipher` seals the short-lived login-state cookie. Optional: defaults
+    /// to the store's own cipher ([`SessionDriver::session_aead_cipher`]);
+    /// the seals are AAD-domain-separated, so sharing one key is safe — see
+    /// [cookie security](crate::_docs::explanation::cookie_security). Pass it
+    /// only to use a distinct login-state key.
     #[builder]
     pub fn new(
         config: LoginConfig,
         grant: AuthorizationCodeGrant,
         session_store: SD,
         #[builder(with = |cipher: impl AeadCipher + 'static| Arc::new(cipher) as Arc<dyn AeadCipher>)]
-        cipher: Arc<dyn AeadCipher>,
+        cipher: Option<Arc<dyn AeadCipher>>,
         /// Custom error page renderer. Defaults to [`DefaultErrorPage`].
         #[builder(default = Box::new(DefaultErrorPage) as Box<dyn ErrorPage>)]
         error_page: Box<dyn ErrorPage>,
@@ -634,6 +638,9 @@ where
         // `secure`/`__Host-` policy and no cookie outlives the session cap.
         let mut session_store = session_store;
         session_store.apply_session_policy(config.secure, config.session_lifetime.bound());
+        // Default here rather than in each adapter, so every adapter gets the
+        // shared-key setup (and its safety argument) without reimplementing it.
+        let cipher = cipher.unwrap_or_else(|| session_store.session_aead_cipher());
         Self {
             config,
             grant,
