@@ -42,7 +42,10 @@ are:
   it never fails the request.
 
 The absolute expiry handed to the store
-([`expire_at`](crate::LivenessStore::touch)) is the session's
-[`SessionLifetime::Bounded`](crate::SessionLifetime) deadline (absent when the
-lifetime is delegated to the authorization server), not a sliding idle TTL — so the liveness entry expires exactly when
-the session can no longer be valid, which is what keeps fail-open correct.
+([`expire_at`](crate::LivenessStore::touch)) is the session's effective
+deadline — the tighter of the one frozen at login
+([`SessionState::expire_at`](crate::SessionState)) and the live
+[`SessionLifetime::Bounded`](crate::SessionLifetime) cap (absent when the
+lifetime is delegated to the authorization server) — not a sliding idle TTL.
+The liveness entry thus expires exactly when the session can no longer be
+valid, which is what keeps fail-open correct.

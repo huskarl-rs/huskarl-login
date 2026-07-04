@@ -47,7 +47,8 @@ pub trait ExternalSessionStore: MaybeSendSync {
     /// [`SessionErrorKind::Unavailable`](crate::SessionErrorKind::Unavailable).
     type Error: std::error::Error + MaybeSendSync + 'static;
 
-    /// Persist a newly created session. Called once per login, after enrichment.
+    /// Persist a newly created session. Called once per login, after
+    /// enrichment. The retention contract on [`save`](Self::save) applies.
     fn insert(
         &self,
         session: &Self::SessionType,
@@ -60,9 +61,13 @@ pub trait ExternalSessionStore: MaybeSendSync {
     ) -> impl Future<Output = Result<Option<Self::SessionType>, Self::Error>> + MaybeSend;
 
     /// Save a session unconditionally (last-writer-wins), advancing the stored
-    /// [`version`](PersistedSessionState::version). Set the record's TTL to the
-    /// deployment's [`SessionLifetime::Bounded`](crate::SessionLifetime) cap,
-    /// when one is configured.
+    /// [`version`](PersistedSessionState::version).
+    ///
+    /// Retain the record until **at least**
+    /// [`Session::expire_at`](crate::Session::expire_at), re-applying the TTL
+    /// on **every** write and never as a sliding window; `None` means no
+    /// deadline. The TTL is garbage collection, not enforcement — see [the
+    /// external-store guide](crate::_docs::guide::external_store).
     fn save(
         &self,
         session: &Self::SessionType,
@@ -71,7 +76,8 @@ pub trait ExternalSessionStore: MaybeSendSync {
     /// Save `session` only if the stored
     /// [`version`](PersistedSessionState::version) still equals `expected`,
     /// advancing it on success; otherwise returns [`SaveOutcome::Conflict`]
-    /// without writing. Version is compared by equality only.
+    /// without writing. Version is compared by equality only. The retention
+    /// contract on [`save`](Self::save) applies.
     fn compare_and_swap(
         &self,
         session: &Self::SessionType,
@@ -177,6 +183,11 @@ pub struct StoreBackedSessionStore<E: ExternalSessionStore> {
     /// Optional server-side liveness (idle) tracking; `None` disables it.
     /// Attached via [`with_liveness`](Self::with_liveness).
     liveness: Option<(Box<dyn LivenessStore>, LivenessConfig)>,
+    /// The [`SessionLifetime::Bounded`](crate::SessionLifetime) cap, stamped
+    /// by the engine at construction; frozen into each new session's
+    /// [`SessionState::expire_at`](crate::SessionState) at login. `None`
+    /// until stamped (or when the lifetime is delegated).
+    max_lifetime: Option<Duration>,
 }
 
 #[bon::bon]
@@ -208,6 +219,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             enricher,
             sealer: CookieSealer::new(cipher, cookie_name, cookie_path, max_age, metrics),
             liveness: None,
+            max_lifetime: None,
         }
     }
 }
@@ -423,7 +435,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     ) -> Result<(E::SessionType, Vec<HeaderValue>), SessionError> {
         let seed = PersistedSessionState {
             session_key: generate_session_key(),
-            state: SessionState::from_completed(completed, default_lifetime),
+            state: SessionState::from_completed(completed, default_lifetime, self.max_lifetime),
             version: 0,
         };
 
@@ -503,6 +515,8 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
         if let Some(cap) = max_lifetime {
             self.sealer.clamp_max_age(cap);
         }
+        // Retained to freeze `SessionState::expire_at` into new sessions.
+        self.max_lifetime = max_lifetime;
     }
 
     fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
@@ -1054,6 +1068,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_freezes_expire_at_from_stamped_policy() {
+        let cap = Duration::from_hours(8);
+        let mut store = store_over(VersioningStore::with(test_session())).await;
+        store.apply_session_policy(true, Some(cap));
+
+        // The deadline is frozen into the record at login (created_at + cap),
+        // giving external stores the retention deadline for every write.
+        let (session, _cookies) = store
+            .create_session(
+                &completed_with_email("a@example.com"),
+                Duration::from_hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.expire_at(), Some(session.created_at() + cap));
+
+        // The frozen deadline is preserved through later writes.
+        let updated = store
+            .update(session.persisted().session_key, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(updated.expire_at(), session.expire_at());
+    }
+
+    #[tokio::test]
+    async fn create_under_delegated_lifetime_has_no_expire_at() {
+        let mut store = store_over(VersioningStore::with(test_session())).await;
+        store.apply_session_policy(true, None);
+
+        // Delegated lifetime: the AS bounds the session, so there is no
+        // deadline to freeze — and no record TTL for the backend to apply.
+        let (session, _cookies) = store
+            .create_session(
+                &completed_with_email("a@example.com"),
+                Duration::from_hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.expire_at(), None);
+    }
+
+    #[tokio::test]
     async fn update_applies_mutation_and_bumps_version() {
         let session = test_session();
         let key = session.persisted.session_key;
@@ -1096,9 +1152,8 @@ mod tests {
         let session = test_session();
         let key = session.persisted.session_key;
         let ext = VersioningStore {
-            stored: std::sync::Mutex::new(Some(session)),
             always_conflict: true,
-            inject_once: std::sync::Mutex::new(None),
+            ..VersioningStore::with(session)
         };
         let store = store_over(ext).await;
 
@@ -1221,9 +1276,8 @@ mod tests {
         // and retries via persist_session.
         let session = test_session();
         let ext = VersioningStore {
-            stored: std::sync::Mutex::new(Some(session.clone())),
             always_conflict: true,
-            inject_once: std::sync::Mutex::new(None),
+            ..VersioningStore::with(session.clone())
         };
         let store = store_over(ext).await;
 
@@ -1248,8 +1302,7 @@ mod tests {
     async fn update_missing_session_is_not_found() {
         let ext = VersioningStore {
             stored: std::sync::Mutex::new(None),
-            always_conflict: false,
-            inject_once: std::sync::Mutex::new(None),
+            ..VersioningStore::with(test_session())
         };
         let store = store_over(ext).await;
 

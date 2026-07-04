@@ -5,7 +5,7 @@
 use huskarl::{
     core::{
         platform::{Duration, SystemTime},
-        serde_utils::time::unix_secs,
+        serde_utils::time::{option_unix_secs, unix_secs},
     },
     grant::core::TokenResponse,
     token::{IdToken, RefreshToken},
@@ -34,13 +34,23 @@ pub struct SessionState {
     /// When the session was created (initial login).
     #[serde(with = "unix_secs")]
     pub created_at: SystemTime,
+    /// Absolute session deadline, **fixed at login**: `created_at` plus the
+    /// [`SessionLifetime::Bounded`](crate::SessionLifetime) cap in force when
+    /// the session was created; `None` under a delegated lifetime. See
+    /// [`Bounded`](crate::SessionLifetime::Bounded) for how changing the cap
+    /// affects existing sessions.
+    #[serde(with = "option_unix_secs")]
+    pub expire_at: Option<SystemTime>,
 }
 
 impl SessionState {
-    /// Creates a `SessionState` from a completed login.
+    /// Creates a `SessionState` from a completed login. `max_lifetime` is the
+    /// [`SessionLifetime::Bounded`](crate::SessionLifetime) cap stamped onto
+    /// the session store, freezing [`expire_at`](Self::expire_at) at login.
     pub(crate) fn from_completed(
         completed: &crate::CompletedLogin,
         default_lifetime: Duration,
+        max_lifetime: Option<Duration>,
     ) -> Self {
         let now = SystemTime::now();
         let token_response = completed.token_response();
@@ -60,6 +70,7 @@ impl SessionState {
             sub,
             sid,
             created_at: now,
+            expire_at: max_lifetime.map(|max| now + max),
         }
     }
 
@@ -126,6 +137,14 @@ pub trait Session {
     /// When the session was created (initial login).
     fn created_at(&self) -> SystemTime {
         self.state().created_at
+    }
+
+    /// Absolute session deadline fixed at login, if the deployment bounded
+    /// it — see [`SessionState::expire_at`]. External stores retain the
+    /// record until at least this instant; the engine enforces it alongside
+    /// the live config.
+    fn expire_at(&self) -> Option<SystemTime> {
+        self.state().expire_at
     }
 
     /// Apply tokens from a refresh response via [`SessionState::refreshed`].
