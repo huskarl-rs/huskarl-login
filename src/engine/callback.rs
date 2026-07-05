@@ -218,9 +218,19 @@ where
             .map_err(|_| (StatusCode::BAD_REQUEST, "state cookie decryption failed"))?;
         let login_state = decode_payload::<LoginStateCookie>(&plaintext)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "corrupt login state"))?;
-        if super::elapsed_since(login_state.created_at, SystemTime::now())
-            > self.config.login_state_ttl
-        {
+        let now = SystemTime::now();
+        // Symmetric with the session path (`session_teardown_reason`): a
+        // `created_at` implausibly far ahead of the clock means a backwards
+        // clock jump (the payload is sealed, so it cannot be forged), which
+        // `elapsed_since` would otherwise clamp to zero and treat as never
+        // expiring. Reject it rather than let a stale flow linger.
+        if super::is_too_far_future(login_state.created_at, now) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "login state timestamp too far in the future",
+            ));
+        }
+        if super::elapsed_since(login_state.created_at, now) > self.config.login_state_ttl {
             return Err((StatusCode::BAD_REQUEST, "login state expired"));
         }
         Ok(login_state)

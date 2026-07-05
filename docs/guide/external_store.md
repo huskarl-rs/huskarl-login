@@ -10,8 +10,10 @@ from a login is the enricher's job, not the store's.
 
 Your session type embeds a [`PersistedSessionState`](crate::PersistedSessionState)
 (the framework-managed key, token state, and version) and exposes it via
-[`PersistedSession`](crate::PersistedSession). Implement `From<PersistedSessionState>`
-if you want the plain `build()` finisher.
+[`PersistedSession`](crate::PersistedSession). It must be `Clone` —
+[`PendingPersist::commit`](crate::engine::PendingPersist::commit) explains why.
+Implement `From<PersistedSessionState>` if you want the plain `build()`
+finisher.
 
 ## Versioning contract
 

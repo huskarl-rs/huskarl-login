@@ -480,7 +480,7 @@ impl SessionDriver for ErrorSessionStore {
 
 fn default_config() -> LoginConfig {
     LoginConfig::builder()
-        .callback_path("/callback".to_owned())
+        .callback_path("/callback")
         .scopes(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
@@ -490,7 +490,7 @@ fn default_config() -> LoginConfig {
 
 fn config_with_logout() -> LoginConfig {
     LoginConfig::builder()
-        .callback_path("/callback".to_owned())
+        .callback_path("/callback")
         .scopes(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
@@ -526,7 +526,7 @@ async fn engine_stamps_store_secure_from_https_base_url() {
 #[tokio::test]
 async fn engine_stamps_store_insecure_from_http_base_url() {
     let http_config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
+        .callback_path("/callback")
         .scopes(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("http://localhost:6188".parse().unwrap())
@@ -541,7 +541,7 @@ async fn engine_stamps_store_with_bounded_session_lifetime() {
     // A Bounded lifetime reaches the driver so cookie Max-Age (and any
     // store-side deadlines) can be clamped to the session cap.
     let config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
+        .callback_path("/callback")
         .scopes(vec![])
         .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(8)))
         .base_url("https://app.example.com".parse().unwrap())
@@ -919,7 +919,7 @@ async fn active_verdict_yields_active() {
 #[tokio::test]
 async fn login_state_cookie_uses_configured_ttl() {
     let config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
+        .callback_path("/callback")
         .scopes(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
@@ -974,6 +974,33 @@ async fn callback_expired_login_state_returns_400_and_clears_cookie() {
 }
 
 #[tokio::test]
+async fn callback_far_future_login_state_returns_400_and_clears_cookie() {
+    // A sealed `created_at` implausibly far ahead of the clock (beyond the 1m
+    // skew tolerance) means a backwards clock jump, not a fresh flow. Without
+    // the far-future guard `elapsed_since` clamps to zero and the flow would
+    // never expire; it must be rejected and the cookie cleared, symmetric with
+    // the session teardown path.
+    let e = engine(MockSessionStore::empty()).await;
+    let state = "futurestate";
+    let created_at = SystemTime::now() + Duration::from_mins(5);
+    let value = seal_login_cookie_at(state, "https://app.example.com/a", created_at).await;
+    let h = headers_with_login_cookie(state, &value);
+    let uri = format!("/callback?code=abc&state={state}").parse().unwrap();
+    let r = e
+        .try_handle_login_route(&Method::GET, &h, &uri)
+        .await
+        .expect("callback handled");
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let cleared = r.headers().iter().any(|(n, v)| {
+        *n == http::header::SET_COOKIE && {
+            let s = v.to_str().unwrap();
+            s.starts_with(&format!("{}=;", login_cookie_name(state))) && s.contains("Max-Age=0")
+        }
+    });
+    assert!(cleared, "far-future flow's cookie must be cleared");
+}
+
+#[tokio::test]
 async fn callback_pre_created_at_format_treated_as_expired() {
     // A cookie sealed before the created_at field existed deserializes with
     // the epoch default and is uniformly rejected as expired — the documented
@@ -1018,7 +1045,7 @@ async fn max_lifetime_expired_clears_session() {
         SystemTime::now() - Duration::from_secs(7201),
     );
     let config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
+        .callback_path("/callback")
         .scopes(vec![])
         .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(1)))
         .base_url("https://app.example.com".parse().unwrap())
@@ -1045,7 +1072,7 @@ async fn frozen_expire_at_is_enforced_over_a_raised_lifetime() {
     );
     session.state.expire_at = Some(created_at + Duration::from_hours(1));
     let config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
+        .callback_path("/callback")
         .scopes(vec![])
         .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(24)))
         .base_url("https://app.example.com".parse().unwrap())
@@ -1069,7 +1096,7 @@ async fn lowered_lifetime_applies_to_sessions_with_a_longer_frozen_deadline() {
     );
     session.state.expire_at = Some(created_at + Duration::from_hours(48));
     let config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
+        .callback_path("/callback")
         .scopes(vec![])
         .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(1)))
         .base_url("https://app.example.com".parse().unwrap())
@@ -1153,7 +1180,7 @@ async fn activity_policy_first_party_counts_same_origin_fetch() {
 #[tokio::test]
 async fn activity_policy_navigations_only_excludes_same_origin_fetch() {
     let config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
+        .callback_path("/callback")
         .scopes(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
@@ -1802,7 +1829,7 @@ async fn logout_with_session_deletes_session() {
 #[tokio::test]
 async fn logout_redirects_to_configured_post_logout_uri() {
     let config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
+        .callback_path("/callback")
         .scopes(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
@@ -1835,7 +1862,7 @@ async fn logout_end_session_url_includes_client_id_without_id_token() {
     // URL must still identify the RP via client_id — otherwise the OP drops
     // post_logout_redirect_uri (OIDC RP-Initiated Logout 1.0 §2).
     let config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
+        .callback_path("/callback")
         .scopes(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
@@ -1873,7 +1900,7 @@ async fn post_logout_redirect_uri_is_sent_exactly_not_normalized() {
     // An authority-only URL must NOT gain a trailing slash on the way to the
     // wire (parsing through http::Uri would add one), or the OP drops it.
     let config = LoginConfig::builder()
-        .callback_path("/callback".to_owned())
+        .callback_path("/callback")
         .scopes(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())

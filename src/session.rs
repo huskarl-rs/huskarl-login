@@ -150,7 +150,11 @@ pub mod sealed {
 /// wrapping a custom [`ExternalSessionStore`](crate::ExternalSessionStore)).
 pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// The session type stored and retrieved by this driver.
-    type SessionType: Session + MaybeSendSync + 'static;
+    ///
+    /// `Clone` because
+    /// [`PendingPersist::commit`](crate::engine::PendingPersist::commit)
+    /// persists from a clone.
+    type SessionType: Session + Clone + MaybeSendSync + 'static;
 
     /// The error type returned by [`load`](Self::load).
     type LoadError: std::error::Error + MaybeSendSync + 'static;

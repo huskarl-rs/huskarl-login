@@ -363,7 +363,8 @@ pub struct PendingPersist<S> {
     /// and `Some` until [`commit`](Self::commit) or [`abandon`](Self::abandon)
     /// consumes it — `Drop` reports a still-armed guard.
     token_response: Option<Box<TokenResponse>>,
-    /// Test-only observer incremented when the guard fires — see
+    /// Test-only observer incremented when the guard fires, so tests can
+    /// assert drop detection deterministically — same rationale as
     /// [`SetCookies::drop_probe`].
     #[cfg(test)]
     drop_probe: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
@@ -381,6 +382,16 @@ impl<S> PendingPersist<S> {
             #[cfg(test)]
             drop_probe: None,
         }
+    }
+
+    /// Attaches the test drop-probe — see [`Self::drop_probe`].
+    #[cfg(test)]
+    pub(crate) fn with_drop_probe(
+        mut self,
+        probe: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.drop_probe = Some(probe);
+        self
     }
 
     /// The refreshed session (the owed refresh is already applied in memory).
@@ -406,6 +417,10 @@ impl<S> PendingPersist<S> {
     /// cookie-backed stores to clear stale slots); see
     /// [`LoginEngine::load_session`] on response caching.
     ///
+    /// This is why the session type must be `Clone`: a
+    /// [`session_arc`](Self::session_arc) handle still alive at commit time
+    /// keeps its pre-commit view, and the commit proceeds on a clone.
+    ///
     /// [`StoreBackedSessionStore::update`]: crate::StoreBackedSessionStore::update
     ///
     /// # Errors
@@ -418,6 +433,9 @@ impl<S> PendingPersist<S> {
     ) -> Result<SetCookies, SessionError>
     where
         SD: SessionDriver<SessionType = S>,
+        // Always satisfiable: the trait requires `SessionType: Clone`, but
+        // rustc does not carry that bound through the `SessionType = S`
+        // equality, so it is restated here for `Arc::make_mut`.
         S: Clone,
     {
         // Taking the response disarms the drop guard; it is present here by
@@ -446,16 +464,6 @@ impl<S> PendingPersist<S> {
     /// save became moot because the session was deleted instead.
     pub fn abandon(mut self) {
         self.token_response = None;
-    }
-
-    /// Attaches the test drop-probe — see [`Self::drop_probe`].
-    #[cfg(test)]
-    pub(crate) fn with_drop_probe(
-        mut self,
-        probe: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    ) -> Self {
-        self.drop_probe = Some(probe);
-        self
     }
 }
 
