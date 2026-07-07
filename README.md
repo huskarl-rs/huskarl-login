@@ -31,8 +31,8 @@ markers, so the crate also compiles for `wasm32` and WASI targets.
 # Guides and explanation
 
 The API items here are the reference docs. For task-oriented how-to guides
-(enrichment, implementing an external store, refresh-token rotation) and
-design explanation (the session model, liveness, cookie security), see the
-[`_docs`](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/) module.
+(implementing a framework adapter, enrichment, implementing an external
+store, refresh-token rotation) and design explanation (the session model,
+liveness, cookie security), see the [`_docs`](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/) module.
 
 <!-- cargo-reedme: end -->

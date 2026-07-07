@@ -27,9 +27,9 @@
 //! # Guides and explanation
 //!
 //! The API items here are the reference docs. For task-oriented how-to guides
-//! (enrichment, implementing an external store, refresh-token rotation) and
-//! design explanation (the session model, liveness, cookie security), see the
-//! [`_docs`] module.
+//! (implementing a framework adapter, enrichment, implementing an external
+//! store, refresh-token rotation) and design explanation (the session model,
+//! liveness, cookie security), see the [`_docs`] module.
 
 #[cfg(any(doc, docsrs))]
 pub mod _docs;

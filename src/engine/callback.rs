@@ -79,6 +79,11 @@ where
         {
             Ok((token_response, validated_id_token)) => CompletedLogin::builder()
                 .token_response(token_response)
+                .maybe_subject(
+                    validated_id_token
+                        .as_ref()
+                        .and_then(|jwt| jwt.subject.clone()),
+                )
                 .maybe_id_token_claims(validated_id_token.map(|jwt| jwt.claims))
                 .build(),
             Err(e) => {
