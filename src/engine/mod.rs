@@ -27,7 +27,7 @@ use crate::{
     DefaultErrorPage, ErrorPage, LivenessVerdict, LoginConfig, Session, SessionDriver,
     SessionError, SessionErrorKind,
     cookie::SessionCipher,
-    metrics::{LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult},
+    metrics::{LoginCompleteResult, LoginStartResult, RefreshResult},
 };
 
 mod callback;
@@ -608,7 +608,8 @@ pub struct LoginEngine<SD> {
     pub session_store: SD,
     cipher: SessionCipher,
     error_page: Box<dyn ErrorPage>,
-    metrics: Option<Arc<dyn LoginEngineMetrics>>,
+    /// Instance `name` label for emitted counters; `None` omits it.
+    metrics_name: Option<String>,
 }
 
 // ── Constructor ───────────────────────────────────────────────────────────────
@@ -637,15 +638,22 @@ where
         /// Custom error page renderer. Defaults to [`DefaultErrorPage`].
         #[builder(default = Box::new(DefaultErrorPage) as Box<dyn ErrorPage>)]
         error_page: Box<dyn ErrorPage>,
-        /// Optional metrics observer for login-flow events.
-        metrics: Option<Arc<dyn LoginEngineMetrics>>,
+        /// Instance name added as the `name` label on every counter this
+        /// engine and its session store emit, telling engines apart when one
+        /// process runs several. `None` (the default) omits the label.
+        #[builder(into)]
+        metrics_name: Option<String>,
     ) -> Self {
         // Single source of truth for cookie security and session lifetime:
         // stamp the store with the values derived from `base_url` and the
         // `session_lifetime` bound, so session cookies share one
         // `secure`/`__Host-` policy and no cookie outlives the session cap.
         let mut session_store = session_store;
-        session_store.apply_session_policy(config.secure, config.session_lifetime.bound());
+        session_store.apply_session_policy(
+            config.secure,
+            config.session_lifetime.bound(),
+            metrics_name.as_deref(),
+        );
         // Default here rather than in each adapter, so every adapter gets the
         // shared-key setup (and its safety argument) without reimplementing it.
         let cipher = cipher.unwrap_or_else(|| session_store.session_aead_cipher());
@@ -655,7 +663,7 @@ where
             session_store,
             cipher: AeadV1Cipher::new(cipher),
             error_page,
-            metrics,
+            metrics_name,
         }
     }
 }
@@ -987,27 +995,38 @@ where
     }
 
     fn record_login_start(&self, result: &LoginStartResult) {
-        if let Some(m) = &self.metrics {
-            m.record_login_start(result);
-        }
+        crate::metrics::emit_counter(
+            "huskarl.login.start",
+            vec![metrics::Label::new("outcome", result.as_str())],
+            self.metrics_name.as_deref(),
+        );
     }
 
-    fn record_login_complete(&self, result: &LoginCompleteResult, as_error: Option<&str>) {
-        if let Some(m) = &self.metrics {
-            m.record_login_complete(result, as_error);
-        }
+    fn record_login_complete(&self, result: &LoginCompleteResult, as_error: Option<&'static str>) {
+        crate::metrics::emit_counter(
+            "huskarl.login.complete",
+            vec![
+                metrics::Label::new("outcome", result.as_str()),
+                metrics::Label::new("error", as_error.unwrap_or("none")),
+            ],
+            self.metrics_name.as_deref(),
+        );
     }
 
     fn record_refresh(&self, result: &RefreshResult) {
-        if let Some(m) = &self.metrics {
-            m.record_refresh(result);
-        }
+        crate::metrics::emit_counter(
+            "huskarl.session.refresh",
+            vec![metrics::Label::new("outcome", result.as_str())],
+            self.metrics_name.as_deref(),
+        );
     }
 
     fn record_teardown(&self, reason: TeardownReason) {
-        if let Some(m) = &self.metrics {
-            m.record_teardown(&reason);
-        }
+        crate::metrics::emit_counter(
+            "huskarl.session.teardown",
+            vec![metrics::Label::new("reason", reason.as_str())],
+            self.metrics_name.as_deref(),
+        );
     }
 
     /// Deletes a session, returning [`SetCookies`] that clear the session

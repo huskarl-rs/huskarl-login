@@ -1,17 +1,44 @@
-//! Observer traits and result types for login and session-cookie metrics.
+//! Metrics emitted by this crate through the [`metrics`] facade. Install a
+//! recorder (e.g. `metrics-exporter-prometheus`) to collect them; without one
+//! they are no-ops. All are counters, incremented inline on the request path.
 //!
-//! The [`LoginEngineMetrics`] and [`SessionCookieMetrics`] observer traits wire
-//! a metrics backend in; result enums carry the outcome as `&'static str` labels.
+//! | Counter | Labels |
+//! |---------|--------|
+//! | `huskarl.login.start` | `outcome`: `ok`, `error` |
+//! | `huskarl.login.complete` | `outcome`: `ok`, `already_authenticated`, `as_denied`, `invalid_request`, `state_invalid`, `token_exchange_failed`, `session_create_failed`; `error`: the normalized AS error code for `as_denied` (RFC 6749 / OIDC Core codes, else `other`), `none` otherwise |
+//! | `huskarl.session.refresh` | `outcome`: `ok`, `no_refresh_token`, `failed`, `failed_retained`, `failed_unavailable` |
+//! | `huskarl.session.teardown` | `reason`: [`TeardownReason`] values (`max_lifetime`, `idle_timeout`, …) |
+//! | `huskarl.session.superseded_delete` | `outcome`: `deleted`, `not_found`, `load_failed`, `delete_failed` |
+//! | `huskarl.session.liveness_failure` | `op`: `read` (failed open), `touch`, `clear` |
+//! | `huskarl.session_cookie.encrypt` | `cookie`: cookie name; `kid`: active key id, `none` if the key has no identity |
+//! | `huskarl.session_cookie.decrypt` | `cookie`: cookie name; `kid`: matched key id, `unknown` (unmatched sidecar — attacker-suppliable values never become labels), `none` (no sidecar); `outcome`: `ok`, `bad_encoding`, `decrypt_failed`, `payload_invalid` |
+//!
+//! When `metrics_name` is set on the [`LoginEngine`] builder, every counter
+//! additionally carries a `name` label with that value — it tells engine
+//! instances apart when one process runs several (the same label
+//! `huskarl.aead.*` uses for cipher instances).
+//!
+//! [`TeardownReason`]: crate::engine::TeardownReason
+//! [`LoginEngine`]: crate::engine::LoginEngine
 
-use huskarl::core::platform::MaybeSendSync;
+/// Increments counter `name` with `labels`, appending the instance `name`
+/// label when `metrics_name` is set.
+pub(crate) fn emit_counter(
+    name: &'static str,
+    mut labels: Vec<metrics::Label>,
+    metrics_name: Option<&str>,
+) {
+    if let Some(v) = metrics_name {
+        labels.push(metrics::Label::new("name", v.to_owned()));
+    }
+    metrics::counter!(name, labels).increment(1);
+}
 
-use crate::engine::TeardownReason;
-
-/// Outcome of a session cookie decryption attempt.
+/// Outcome of a session cookie decryption attempt; the
+/// `huskarl.session_cookie.decrypt` `outcome` label.
 #[derive(strum::AsRefStr, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
-#[non_exhaustive]
-pub enum DecryptResult {
+pub(crate) enum DecryptResult {
     /// The cookie was successfully decrypted and deserialized.
     Ok,
     /// The cookie value was not valid base64url.
@@ -23,30 +50,16 @@ pub enum DecryptResult {
 }
 
 impl DecryptResult {
-    /// Returns a `&'static str` suitable for use as a Prometheus label value.
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         self.into()
     }
 }
 
-/// Observer for session cookie encrypt/decrypt events. Absent cookies are
-/// silent.
-pub trait SessionCookieMetrics: MaybeSendSync + 'static {
-    /// Record a decryption attempt. `kid` is the identity from the kid sidecar cookie, or `None` if absent/undecodable.
-    fn record_decrypt(&self, cookie_name: &str, kid: Option<&str>, result: &DecryptResult);
-
-    /// Record a completed encryption. `kid` is the active sealer's key ID, or `None` if the key has no identity.
-    fn record_encrypt(&self, cookie_name: &str, kid: Option<&str>);
-}
-
-// ── Login engine metrics ───────────────────────────────────────────────────────
-
-/// Outcome of a login redirect attempt.
+/// Outcome of a login redirect attempt; the `huskarl.login.start` `outcome`
+/// label.
 #[derive(strum::AsRefStr, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
-#[non_exhaustive]
-pub enum LoginStartResult {
+pub(crate) enum LoginStartResult {
     /// The redirect to the authorization server was produced successfully.
     Ok,
     /// Generating the redirect failed (e.g. authorization server unreachable).
@@ -54,18 +67,16 @@ pub enum LoginStartResult {
 }
 
 impl LoginStartResult {
-    /// Returns a `&'static str` suitable for use as a Prometheus label value.
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         self.into()
     }
 }
 
-/// Outcome of processing an OAuth callback (token exchange and session creation).
+/// Outcome of processing an OAuth callback; the `huskarl.login.complete`
+/// `outcome` label.
 #[derive(strum::AsRefStr, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
-#[non_exhaustive]
-pub enum LoginCompleteResult {
+pub(crate) enum LoginCompleteResult {
     /// Login completed successfully — a new session was created.
     Ok,
     /// The callback carried no usable login state but the browser already
@@ -86,9 +97,7 @@ pub enum LoginCompleteResult {
 }
 
 impl LoginCompleteResult {
-    /// Returns a `&'static str` suitable for use as a Prometheus label value.
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         self.into()
     }
 }
@@ -115,9 +124,9 @@ const KNOWN_AS_ERROR_CODES: &[&str] = &[
     "registration_not_supported",
 ];
 
-/// Normalizes an attacker-suppliable AS `error` code: known codes pass through, anything else maps to `"other"`.
-#[must_use]
-pub fn normalize_as_error(error: &str) -> &'static str {
+/// Normalizes an attacker-suppliable AS `error` code: known codes pass
+/// through, anything else maps to `"other"`.
+pub(crate) fn normalize_as_error(error: &str) -> &'static str {
     KNOWN_AS_ERROR_CODES
         .iter()
         .find(|code| **code == error)
@@ -125,11 +134,11 @@ pub fn normalize_as_error(error: &str) -> &'static str {
         .unwrap_or("other")
 }
 
-/// Outcome of a token refresh attempt.
+/// Outcome of a token refresh attempt; the `huskarl.session.refresh`
+/// `outcome` label.
 #[derive(strum::AsRefStr, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
-#[non_exhaustive]
-pub enum RefreshResult {
+pub(crate) enum RefreshResult {
     /// The session had no refresh token — it was cleared.
     NoRefreshToken,
     /// The refresh token was exchanged successfully for new tokens.
@@ -147,27 +156,51 @@ pub enum RefreshResult {
 }
 
 impl RefreshResult {
-    /// Returns a `&'static str` suitable for use as a Prometheus label value.
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         self.into()
     }
 }
 
-/// Observer for [`LoginEngine`](crate::engine::LoginEngine) login-flow events.
-/// Methods are called inline on the request path, so they must not block.
-pub trait LoginEngineMetrics: MaybeSendSync + 'static {
-    /// Record a login redirect attempt.
-    fn record_login_start(&self, result: &LoginStartResult);
+/// Outcome of deleting the record a new login superseded; the
+/// `huskarl.session.superseded_delete` `outcome` label.
+#[derive(strum::AsRefStr, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum SupersededDeleteResult {
+    /// The superseded record was deleted.
+    Deleted,
+    /// The pointer cookie was valid but no record exists for it.
+    NotFound,
+    /// Loading the superseded record failed; it may still be stored.
+    LoadFailed,
+    /// Deleting the superseded record failed; it is still stored.
+    DeleteFailed,
+}
 
-    /// Record the outcome of an OAuth callback. `as_error` is the normalized AS `error` code for [`LoginCompleteResult::AsDenied`], else `None`.
-    fn record_login_complete(&self, result: &LoginCompleteResult, as_error: Option<&str>);
+impl SupersededDeleteResult {
+    pub(crate) fn as_str(&self) -> &'static str {
+        self.into()
+    }
+}
 
-    /// Record the outcome of a token refresh attempt.
-    fn record_refresh(&self, result: &RefreshResult);
+/// A [`LivenessStore`](crate::LivenessStore) operation that failed
+/// (best-effort: the request proceeded); the
+/// `huskarl.session.liveness_failure` `op` label.
+#[derive(strum::AsRefStr, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum LivenessFailure {
+    /// `last_active` could not be read; the session was served as active
+    /// (fail open).
+    Read,
+    /// Recording activity failed; the next advance is delayed.
+    Touch,
+    /// Removing an entry failed; the stale entry remains until its TTL.
+    Clear,
+}
 
-    /// Record why a presented session was dropped rather than served. No-op by default.
-    fn record_teardown(&self, _reason: &TeardownReason) {}
+impl LivenessFailure {
+    pub(crate) fn as_str(&self) -> &'static str {
+        self.into()
+    }
 }
 
 #[cfg(test)]

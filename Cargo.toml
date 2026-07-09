@@ -25,6 +25,7 @@ ciborium = "0.2"
 http = { version = "1", default-features = false }
 huskarl = { version = "0.9", default-features = false }
 log = "0.4"
+metrics = { version = "0.24", default-features = false }
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_html_form = "0.4"
@@ -39,6 +40,7 @@ uuid = { version = "1", features = ["v7", "serde", "js"] }
 [dev-dependencies]
 hex = "0.4"
 huskarl-crypto-native = { version = "0.9" }
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 rand = "0.10"
 rstest = "0.26.1"
 tokio = { version = "1", features = ["full"] }

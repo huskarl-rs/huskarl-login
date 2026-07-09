@@ -68,3 +68,59 @@ pub(crate) fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
     }
     map
 }
+
+/// Counters captured by [`with_metrics`]: `(name, sorted (label, value)
+/// pairs, count)`.
+pub(crate) type CapturedCounters = Vec<(String, Vec<(String, String)>, u64)>;
+
+/// Drives `fut` on a current-thread runtime with a thread-local debugging
+/// recorder installed, returning the output and every counter it emitted.
+pub(crate) fn with_metrics<T>(fut: impl Future<Output = T>) -> (T, CapturedCounters) {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let out = metrics::with_local_recorder(&recorder, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    });
+    let counters = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(key, _unit, _desc, value)| {
+            let DebugValue::Counter(count) = value else {
+                return None;
+            };
+            let key = key.key();
+            let mut labels: Vec<(String, String)> = key
+                .labels()
+                .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                .collect();
+            labels.sort();
+            Some((key.name().to_owned(), labels, count))
+        })
+        .collect();
+    (out, counters)
+}
+
+/// The value of the counter matching `name` and exactly `labels` (order
+/// insensitive), or 0 if never emitted.
+pub(crate) fn counter_value(
+    counters: &CapturedCounters,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> u64 {
+    let mut expected: Vec<(String, String)> = labels
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    expected.sort();
+    counters
+        .iter()
+        .find(|(n, l, _)| n == name && *l == expected)
+        .map_or(0, |(_, _, count)| *count)
+}

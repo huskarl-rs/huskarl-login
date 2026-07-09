@@ -27,7 +27,7 @@ use crate::{
     },
     enrich::{NoEnrichment, SessionEnricher},
     liveness::{LivenessConfig, LivenessStore, LivenessVerdict},
-    metrics::{DecryptResult, SessionCookieMetrics},
+    metrics::{DecryptResult, LivenessFailure, SupersededDeleteResult},
     session::{SessionDriver, SessionError, SessionErrorKind, to_session_err},
     session_state::{Session, SessionState},
 };
@@ -44,6 +44,14 @@ pub trait ExternalSessionStore: MaybeSendSync {
     /// persists from a clone.
     type SessionType: Session + PersistedSession + Clone + MaybeSendSync + 'static;
 
+    /// Optimistic-concurrency token: returned by [`load`](Self::load) with
+    /// the session and handed back unchanged as `expected` to
+    /// [`compare_and_swap`](Self::compare_and_swap). Compared by equality
+    /// only. See the
+    /// [external store guide](crate::_docs::guide::external_store) for
+    /// choosing a representation.
+    type Version: MaybeSendSync + 'static;
+
     /// The backend's own error type (e.g. `sqlx::Error`); transport-failure
     /// channel only. Boxed into
     /// [`SessionErrorKind::Unavailable`](crate::SessionErrorKind::Unavailable).
@@ -56,14 +64,15 @@ pub trait ExternalSessionStore: MaybeSendSync {
         session: &Self::SessionType,
     ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 
-    /// Load a session by its key. Returns `None` if the key does not exist.
+    /// Load a session by its key, together with the stored
+    /// [`Version`](Self::Version). Returns `None` if the key does not exist.
     fn load(
         &self,
         session_key: Uuid,
-    ) -> impl Future<Output = Result<Option<Self::SessionType>, Self::Error>> + MaybeSend;
+    ) -> impl Future<Output = Result<LoadOutcome<Self>, Self::Error>> + MaybeSend;
 
-    /// Save a session unconditionally (last-writer-wins), advancing the stored
-    /// [`version`](PersistedSessionState::version).
+    /// Save a session unconditionally (last-writer-wins). Every write — this
+    /// one included — must change the stored [`Version`](Self::Version).
     ///
     /// Apply [`Session::storage_deadline`](crate::Session::storage_deadline)
     /// as the record's absolute TTL on **every** write — backends like Redis
@@ -75,15 +84,14 @@ pub trait ExternalSessionStore: MaybeSendSync {
         session: &Self::SessionType,
     ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 
-    /// Save `session` only if the stored
-    /// [`version`](PersistedSessionState::version) still equals `expected`,
-    /// advancing it on success; otherwise returns [`SaveOutcome::Conflict`]
-    /// without writing. Version is compared by equality only. The retention
-    /// contract on [`save`](Self::save) applies.
+    /// Save `session` only if the stored [`Version`](Self::Version) still
+    /// equals `expected`, changing it on success; otherwise returns
+    /// [`SaveOutcome::Conflict`] without writing. The retention contract on
+    /// [`save`](Self::save) applies.
     fn compare_and_swap(
         &self,
         session: &Self::SessionType,
-        expected: i32,
+        expected: Self::Version,
     ) -> impl Future<Output = Result<SaveOutcome, Self::Error>> + MaybeSend;
 
     /// Delete the session's stored record. Idempotent: a missing record is
@@ -94,12 +102,19 @@ pub trait ExternalSessionStore: MaybeSendSync {
     ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 }
 
+/// Outcome of [`ExternalSessionStore::load`]: the session and its stored
+/// version, or `None` if the key does not exist.
+pub type LoadOutcome<E> = Option<(
+    <E as ExternalSessionStore>::SessionType,
+    <E as ExternalSessionStore>::Version,
+)>;
+
 /// Outcome of [`ExternalSessionStore::compare_and_swap`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveOutcome {
-    /// The version matched; the session was written and the version advanced.
+    /// The version matched; the session was written and the version changed.
     Committed,
-    /// Another writer advanced the version first; nothing was written.
+    /// Another writer changed the version first; nothing was written.
     Conflict,
 }
 
@@ -124,12 +139,6 @@ pub struct PersistedSessionState {
     pub session_key: Uuid,
     /// Shared token and timing state. See [`SessionState`] for the field set.
     pub state: SessionState,
-    /// Optimistic-concurrency version, advanced on every write; `0` at insert,
-    /// set by the store on [`load`](ExternalSessionStore::load). Compared by
-    /// equality only.
-    #[serde(default)]
-    #[builder(default)]
-    pub version: i32,
 }
 
 impl Session for PersistedSessionState {
@@ -213,13 +222,11 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         /// construction; set it explicitly only to go *shorter*.
         #[builder(default = DEFAULT_COOKIE_MAX_AGE)]
         max_age: Duration,
-        /// Optional metrics observer for encrypt/decrypt events.
-        metrics: Option<Arc<dyn SessionCookieMetrics>>,
     ) -> Self {
         Self {
             external,
             enricher,
-            sealer: CookieSealer::new(cipher, cookie_name, cookie_path, max_age, metrics),
+            sealer: CookieSealer::new(cipher, cookie_name, cookie_path, max_age),
             liveness: None,
             max_lifetime: None,
         }
@@ -331,7 +338,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         F: Fn(&mut E::SessionType) -> Result<(), SessionError> + MaybeSend,
     {
         for _ in 0..UPDATE_MAX_ATTEMPTS {
-            let Some(mut session) = self
+            let Some((mut session, version)) = self
                 .external
                 .load(session_key)
                 .await
@@ -339,15 +346,10 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             else {
                 return Err(SessionError::new(SessionErrorKind::Gone, SessionNotFound));
             };
-            let expected = session.persisted().version;
             mutate(&mut session)?;
-            // Advance the version on the session so stores that persist it from
-            // the record's body see the new value; column-based stores that do
-            // `version + 1` arrive at the same value (stored == expected).
-            session.persisted_mut().version = expected.wrapping_add(1);
             match self
                 .external
-                .compare_and_swap(&session, expected)
+                .compare_and_swap(&session, version)
                 .await
                 .map_err(to_session_err)?
             {
@@ -438,7 +440,6 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         let seed = PersistedSessionState {
             session_key: generate_session_key(),
             state: SessionState::from_completed(completed, default_lifetime, self.max_lifetime),
-            version: 0,
         };
 
         let session = self.enricher.build_session(seed, completed).await?;
@@ -452,6 +453,15 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         Ok((session, cookies))
     }
 
+    /// Counts a failed (best-effort) liveness operation.
+    fn record_liveness_failure(&self, failure: &LivenessFailure) {
+        crate::metrics::emit_counter(
+            "huskarl.session.liveness_failure",
+            vec![metrics::Label::new("op", failure.as_str())],
+            self.sealer.metrics_name.as_deref(),
+        );
+    }
+
     pub(crate) async fn load_session(
         &self,
         headers: &http::HeaderMap,
@@ -460,7 +470,11 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             return Ok(None);
         };
 
-        self.external.load(session_key).await
+        Ok(self
+            .external
+            .load(session_key)
+            .await?
+            .map(|(session, _version)| session))
     }
 
     pub(crate) async fn save_session(
@@ -488,6 +502,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             let key = session.persisted().session_key;
             if let Err(e) = liveness.clear(key).await {
                 log::warn!("failed to clear liveness entry on delete: {e}");
+                self.record_liveness_failure(&LivenessFailure::Clear);
             }
         }
         // Clear the pointer cookie and the kid sidecar.
@@ -514,19 +529,30 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         let Some(old_key) = self.read_pointer_cookie(headers).await else {
             return;
         };
-        match self.external.load(old_key).await {
-            Ok(Some(old)) => {
-                if let Err(e) = self.external.delete(&old).await {
+        let result = match self.external.load(old_key).await {
+            Ok(Some((old, _version))) => match self.external.delete(&old).await {
+                Ok(()) => SupersededDeleteResult::Deleted,
+                Err(e) => {
                     log::warn!("failed to delete superseded session record: {e}");
+                    SupersededDeleteResult::DeleteFailed
                 }
+            },
+            Ok(None) => SupersededDeleteResult::NotFound,
+            Err(e) => {
+                log::warn!("failed to load superseded session record: {e}");
+                SupersededDeleteResult::LoadFailed
             }
-            Ok(None) => {}
-            Err(e) => log::warn!("failed to load superseded session record: {e}"),
-        }
+        };
+        crate::metrics::emit_counter(
+            "huskarl.session.superseded_delete",
+            vec![metrics::Label::new("outcome", result.as_str())],
+            self.sealer.metrics_name.as_deref(),
+        );
         if let Some((liveness, _)) = &self.liveness
             && let Err(e) = liveness.clear(old_key).await
         {
             log::warn!("failed to clear superseded liveness entry: {e}");
+            self.record_liveness_failure(&LivenessFailure::Clear);
         }
     }
 }
@@ -537,8 +563,14 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
     type SessionType = E::SessionType;
     type LoadError = E::Error;
 
-    fn apply_session_policy(&mut self, secure: bool, max_lifetime: Option<std::time::Duration>) {
+    fn apply_session_policy(
+        &mut self,
+        secure: bool,
+        max_lifetime: Option<std::time::Duration>,
+        metrics_name: Option<&str>,
+    ) {
         self.sealer.apply_secure(secure);
+        self.sealer.metrics_name = metrics_name.map(str::to_owned);
         if let Some(cap) = max_lifetime {
             self.sealer.clamp_max_age(cap);
         }
@@ -627,6 +659,7 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
             Ok(last_active) => last_active,
             Err(e) => {
                 log::warn!("liveness read failed; treating session as active: {e}");
+                self.record_liveness_failure(&LivenessFailure::Read);
                 return Ok(LivenessVerdict::Active);
             }
         };
@@ -656,6 +689,7 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
             && let Err(e) = liveness.touch(key, now, deadline).await
         {
             log::warn!("liveness touch failed (best-effort): {e}");
+            self.record_liveness_failure(&LivenessFailure::Touch);
         }
         Ok(verdict)
     }
@@ -720,14 +754,15 @@ mod tests {
     #[allow(clippy::unused_async_trait_impl)]
     impl ExternalSessionStore for MinimalExternalStore {
         type SessionType = MinimalSession;
+        type Version = i32;
         type Error = Infallible;
 
         async fn insert(&self, _: &MinimalSession) -> Result<(), Infallible> {
             Ok(())
         }
 
-        async fn load(&self, _: Uuid) -> Result<Option<MinimalSession>, Infallible> {
-            Ok(Some(self.0.clone()))
+        async fn load(&self, _: Uuid) -> Result<Option<(MinimalSession, i32)>, Infallible> {
+            Ok(Some((self.0.clone(), 0)))
         }
 
         async fn save(&self, _: &MinimalSession) -> Result<(), Infallible> {
@@ -756,7 +791,6 @@ mod tests {
                     .token_expiry(now + std::time::Duration::from_hours(1))
                     .created_at(now)
                     .build(),
-                version: 0,
             },
         }
     }
@@ -1074,39 +1108,49 @@ mod tests {
 
     /// A stateful external store that honours [`compare_and_swap`] versioning,
     /// so the [`StoreBackedSessionStore::update`] retry loop can be exercised.
+    /// The version is a separate "column" next to the record, as the protocol
+    /// intends.
     struct VersioningStore {
-        stored: std::sync::Mutex<Option<MinimalSession>>,
+        stored: std::sync::Mutex<Option<(MinimalSession, i32)>>,
         /// When `true`, every `compare_and_swap` reports a conflict.
         always_conflict: bool,
         /// A simulated concurrent writer applied just before the first
-        /// `compare_and_swap`, to force one conflict-then-retry.
+        /// `compare_and_swap` (advancing the stored version), to force one
+        /// conflict-then-retry.
         inject_once: std::sync::Mutex<Option<fn(&mut MinimalSession)>>,
     }
 
     impl VersioningStore {
         fn with(session: MinimalSession) -> Self {
             Self {
-                stored: std::sync::Mutex::new(Some(session)),
+                stored: std::sync::Mutex::new(Some((session, 0))),
                 always_conflict: false,
                 inject_once: std::sync::Mutex::new(None),
             }
+        }
+
+        fn stored_version(&self) -> i32 {
+            self.stored.lock().unwrap().as_ref().unwrap().1
         }
     }
 
     #[allow(clippy::unused_async_trait_impl)]
     impl ExternalSessionStore for VersioningStore {
         type SessionType = MinimalSession;
+        type Version = i32;
         type Error = Infallible;
 
         async fn insert(&self, s: &MinimalSession) -> Result<(), Infallible> {
-            *self.stored.lock().unwrap() = Some(s.clone());
+            *self.stored.lock().unwrap() = Some((s.clone(), 0));
             Ok(())
         }
-        async fn load(&self, _: Uuid) -> Result<Option<MinimalSession>, Infallible> {
+        async fn load(&self, _: Uuid) -> Result<Option<(MinimalSession, i32)>, Infallible> {
             Ok(self.stored.lock().unwrap().clone())
         }
         async fn save(&self, s: &MinimalSession) -> Result<(), Infallible> {
-            *self.stored.lock().unwrap() = Some(s.clone());
+            let mut stored = self.stored.lock().unwrap();
+            let next = stored.as_ref().map_or(0, |(_, v)| v + 1);
+            *stored = Some((s.clone(), next));
             Ok(())
         }
         async fn compare_and_swap(
@@ -1120,13 +1164,14 @@ mod tests {
             let mut stored = self.stored.lock().unwrap();
             // A concurrent writer landing just before our CAS.
             if let Some(inject) = self.inject_once.lock().unwrap().take()
-                && let Some(cur) = stored.as_mut()
+                && let Some((cur, version)) = stored.as_mut()
             {
                 inject(cur);
+                *version += 1;
             }
             match stored.as_ref() {
-                Some(cur) if cur.persisted.version == expected => {
-                    *stored = Some(s.clone());
+                Some((_, version)) if *version == expected => {
+                    *stored = Some((s.clone(), expected + 1));
                     Ok(SaveOutcome::Committed)
                 }
                 _ => Ok(SaveOutcome::Conflict),
@@ -1151,7 +1196,7 @@ mod tests {
     async fn create_freezes_expire_at_from_stamped_policy() {
         let cap = Duration::from_hours(8);
         let mut store = store_over(VersioningStore::with(test_session())).await;
-        store.apply_session_policy(true, Some(cap));
+        store.apply_session_policy(true, Some(cap), None);
 
         // The deadline is frozen into the record at login (created_at + cap),
         // giving external stores the retention deadline for every write.
@@ -1175,7 +1220,7 @@ mod tests {
     #[tokio::test]
     async fn create_under_delegated_lifetime_has_no_expire_at() {
         let mut store = store_over(VersioningStore::with(test_session())).await;
-        store.apply_session_policy(true, None);
+        store.apply_session_policy(true, None, None);
 
         // Delegated lifetime: the AS bounds the session, so there is no
         // deadline to freeze — and no record TTL for the backend to apply.
@@ -1201,6 +1246,7 @@ mod tests {
     #[allow(clippy::unused_async_trait_impl)]
     impl ExternalSessionStore for MapStore {
         type SessionType = MinimalSession;
+        type Version = i32;
         type Error = Infallible;
 
         async fn insert(&self, s: &MinimalSession) -> Result<(), Infallible> {
@@ -1210,8 +1256,13 @@ mod tests {
                 .insert(s.persisted.session_key, s.clone());
             Ok(())
         }
-        async fn load(&self, key: Uuid) -> Result<Option<MinimalSession>, Infallible> {
-            Ok(self.records.lock().unwrap().get(&key).cloned())
+        async fn load(&self, key: Uuid) -> Result<Option<(MinimalSession, i32)>, Infallible> {
+            Ok(self
+                .records
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(|s| (s.clone(), 0)))
         }
         async fn save(&self, s: &MinimalSession) -> Result<(), Infallible> {
             self.insert(s).await
@@ -1343,17 +1394,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(updated.persisted.state.sub.as_deref(), Some("mine"));
-        assert_eq!(updated.persisted.version, 1);
+        assert_eq!(store.external.stored_version(), 1);
     }
 
     #[tokio::test]
     async fn update_retries_and_preserves_concurrent_change() {
-        let session = test_session(); // version 0
+        let session = test_session(); // stored at version 0
         let key = session.persisted.session_key;
         let mut ext = VersioningStore::with(session);
-        // A concurrent writer bumps to v1 and sets `sid` just before our first CAS.
+        // A concurrent writer sets `sid` just before our first CAS (the store
+        // advances the version to 1).
         *ext.inject_once.get_mut().unwrap() = Some(|s| {
-            s.persisted.version = s.persisted.version.wrapping_add(1);
             s.persisted.state.sid = Some("concurrent".to_owned());
         });
         let store = store_over(ext).await;
@@ -1366,7 +1417,7 @@ mod tests {
         // The first CAS conflicts; the reload + replay keeps BOTH changes.
         assert_eq!(updated.persisted.state.sub.as_deref(), Some("mine"));
         assert_eq!(updated.persisted.state.sid.as_deref(), Some("concurrent"));
-        assert_eq!(updated.persisted.version, 2);
+        assert_eq!(store.external.stored_version(), 2);
     }
 
     #[tokio::test]
@@ -1413,8 +1464,11 @@ mod tests {
             .err()
             .is_some_and(|e| e.kind() == SessionErrorKind::Store);
         assert!(aborted, "closure error must propagate");
-        let stored = store.external.stored.lock().unwrap().clone().unwrap();
-        assert_eq!(stored.persisted.version, 0, "no write on mutation error");
+        assert_eq!(
+            store.external.stored_version(),
+            0,
+            "no write on mutation error"
+        );
     }
 
     #[tokio::test]
@@ -1431,7 +1485,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated.persisted.state.sub.as_deref(), Some("mine"));
-        assert_eq!(updated.persisted.version, 1);
+        assert_eq!(store.external.stored_version(), 1);
     }
 
     // ── apply_refresh_and_save (engine refresh persist) ───────────────────
@@ -1454,11 +1508,11 @@ mod tests {
         // The regression this guards: the engine's refresh persist must not
         // write back its request-scoped snapshot wholesale — an `update`
         // committed by another request in the meantime has to survive.
-        let session = test_session(); // version 0, no sid
+        let session = test_session(); // stored at version 0, no sid
         let mut ext = VersioningStore::with(session.clone());
-        // A concurrent writer commits `sid` just before our first CAS.
+        // A concurrent writer commits `sid` just before our first CAS (the
+        // store advances the version to 1).
         *ext.inject_once.get_mut().unwrap() = Some(|s| {
-            s.persisted.version = s.persisted.version.wrapping_add(1);
             s.persisted.state.sid = Some("concurrent".to_owned());
         });
         let store = store_over(ext).await;
@@ -1484,11 +1538,10 @@ mod tests {
             snapshot.state().token_expiry > std::time::SystemTime::now() + Duration::from_mins(90),
             "refresh must extend token_expiry via default_lifetime"
         );
-        assert_eq!(snapshot.persisted.version, 2);
-        // The store holds the same merged state.
-        let stored = store.external.stored.lock().unwrap().clone().unwrap();
+        // The store holds the same merged state, at the post-merge version.
+        let (stored, version) = store.external.stored.lock().unwrap().clone().unwrap();
         assert_eq!(stored.persisted.state.sid.as_deref(), Some("concurrent"));
-        assert_eq!(stored.persisted.version, 2);
+        assert_eq!(version, 2);
     }
 
     #[tokio::test]
@@ -1691,13 +1744,14 @@ mod tests {
     #[allow(clippy::unused_async_trait_impl)]
     impl ExternalSessionStore for EnrichedExternalStore {
         type SessionType = EnrichedStoreSession;
+        type Version = i32;
         type Error = Infallible;
 
         async fn insert(&self, s: &EnrichedStoreSession) -> Result<(), Infallible> {
             *self.0.lock().unwrap() = Some(s.email.clone());
             Ok(())
         }
-        async fn load(&self, _: Uuid) -> Result<Option<EnrichedStoreSession>, Infallible> {
+        async fn load(&self, _: Uuid) -> Result<Option<(EnrichedStoreSession, i32)>, Infallible> {
             Ok(None)
         }
         async fn save(&self, _: &EnrichedStoreSession) -> Result<(), Infallible> {
@@ -1845,235 +1899,361 @@ mod tests {
         assert!(kid, "expected kid sidecar clear");
     }
 
-    // ── SessionCookieMetrics ──────────────────────────────────────────────
+    // ── Cookie metrics emission ──────────────────────────────────────────
 
-    use std::sync::{Arc, Mutex};
-
-    use crate::metrics::{DecryptResult, SessionCookieMetrics};
-
-    #[derive(Default)]
-    struct RecordingMetrics {
-        encrypts: Mutex<Vec<Option<String>>>,
-        decrypts: Mutex<Vec<(Option<String>, &'static str)>>,
-    }
-
-    impl SessionCookieMetrics for RecordingMetrics {
-        fn record_decrypt(&self, _: &str, kid: Option<&str>, result: &DecryptResult) {
-            self.decrypts
-                .lock()
-                .unwrap()
-                .push((kid.map(str::to_owned), result.as_str()));
-        }
-        fn record_encrypt(&self, _: &str, kid: Option<&str>) {
-            self.encrypts.lock().unwrap().push(kid.map(str::to_owned));
-        }
-    }
-
-    impl RecordingMetrics {
-        fn encrypts(&self) -> Vec<Option<String>> {
-            self.encrypts.lock().unwrap().clone()
-        }
-        fn decrypts(&self) -> Vec<(Option<String>, &'static str)> {
-            self.decrypts.lock().unwrap().clone()
-        }
-    }
+    use crate::test_support::{counter_value, with_metrics};
 
     fn test_session_and_store() -> (MinimalSession, MinimalExternalStore) {
         let s = test_session();
         (s.clone(), MinimalExternalStore(s))
     }
 
-    #[tokio::test]
-    async fn metrics_pointer_cookie_records_encrypt() {
-        let (session, external) = test_session_and_store();
-        let m = Arc::new(RecordingMetrics::default());
-        let store = StoreBackedSessionStore::builder()
-            .external(external)
-            .cipher(test_cipher().await)
-            .cookie_name("session".parse().unwrap())
-            .cookie_path("/".parse().unwrap())
-            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
-            .build();
-        store
-            .pointer_cookie_headers(session.persisted.session_key)
-            .await
-            .unwrap();
-        assert_eq!(m.encrypts(), vec![None]);
+    /// Counter labels for a pointer-cookie decrypt with the given kid and outcome.
+    fn decrypt_labels<'a>(kid: &'a str, outcome: &'a str) -> [(&'a str, &'a str); 3] {
+        [
+            ("cookie", "__Host-session"),
+            ("kid", kid),
+            ("outcome", outcome),
+        ]
     }
 
-    #[tokio::test]
-    async fn metrics_pointer_cookie_records_kid_when_cipher_has_identity() {
-        let (session, external) = test_session_and_store();
-        let m = Arc::new(RecordingMetrics::default());
-        let store = StoreBackedSessionStore::builder()
-            .external(external)
-            .cipher(test_cipher_with_kid("v5").await)
-            .cookie_name("session".parse().unwrap())
-            .cookie_path("/".parse().unwrap())
-            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
-            .build();
-        store
-            .pointer_cookie_headers(session.persisted.session_key)
-            .await
-            .unwrap();
-        assert_eq!(m.encrypts(), vec![Some("v5".to_owned())]);
-    }
-
-    #[tokio::test]
-    async fn metrics_read_pointer_cookie_absent_is_silent() {
-        let (_, external) = test_session_and_store();
-        let m = Arc::new(RecordingMetrics::default());
-        let store = StoreBackedSessionStore::builder()
-            .external(external)
-            .cipher(test_cipher().await)
-            .cookie_name("session".parse().unwrap())
-            .cookie_path("/".parse().unwrap())
-            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
-            .build();
-        store.read_pointer_cookie(&http::HeaderMap::new()).await;
-        assert!(m.decrypts().is_empty());
-    }
-
-    #[tokio::test]
-    async fn metrics_read_pointer_cookie_bad_encoding() {
-        let (_, external) = test_session_and_store();
-        let m = Arc::new(RecordingMetrics::default());
-        let store = StoreBackedSessionStore::builder()
-            .external(external)
-            .cipher(test_cipher().await)
-            .cookie_name("session".parse().unwrap())
-            .cookie_path("/".parse().unwrap())
-            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
-            .build();
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            http::header::COOKIE,
-            "__Host-session=not!!valid!!base64".parse().unwrap(),
+    #[test]
+    fn metrics_pointer_cookie_records_encrypt() {
+        let ((), counters) = with_metrics(async {
+            let (session, external) = test_session_and_store();
+            let store = StoreBackedSessionStore::builder()
+                .external(external)
+                .cipher(test_cipher().await)
+                .cookie_name("session".parse().unwrap())
+                .cookie_path("/".parse().unwrap())
+                .build();
+            store
+                .pointer_cookie_headers(session.persisted.session_key)
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.encrypt",
+                &[("cookie", "__Host-session"), ("kid", "none")],
+            ),
+            1
         );
-        store.read_pointer_cookie(&headers).await;
-        assert_eq!(m.decrypts(), vec![(None, "bad_encoding")]);
     }
 
-    #[tokio::test]
-    async fn metrics_read_pointer_cookie_tampered_records_decrypt_failed() {
-        let (_, external) = test_session_and_store();
-        let m = Arc::new(RecordingMetrics::default());
-        let store = StoreBackedSessionStore::builder()
-            .external(external)
-            .cipher(test_cipher().await)
-            .cookie_name("session".parse().unwrap())
-            .cookie_path("/".parse().unwrap())
-            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
-            .build();
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            http::header::COOKIE,
-            "__Host-session=AAAAAAAAAAAA".parse().unwrap(),
+    #[test]
+    fn metrics_pointer_cookie_records_kid_when_cipher_has_identity() {
+        let ((), counters) = with_metrics(async {
+            let (session, external) = test_session_and_store();
+            let store = StoreBackedSessionStore::builder()
+                .external(external)
+                .cipher(test_cipher_with_kid("v5").await)
+                .cookie_name("session".parse().unwrap())
+                .cookie_path("/".parse().unwrap())
+                .build();
+            store
+                .pointer_cookie_headers(session.persisted.session_key)
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.encrypt",
+                &[("cookie", "__Host-session"), ("kid", "v5")],
+            ),
+            1
         );
-        store.read_pointer_cookie(&headers).await;
-        assert_eq!(m.decrypts(), vec![(None, "decrypt_failed")]);
     }
 
-    #[tokio::test]
-    async fn metrics_read_pointer_cookie_payload_invalid_when_not_16_bytes() {
-        let (_, external) = test_session_and_store();
-        let m = Arc::new(RecordingMetrics::default());
-        let store = StoreBackedSessionStore::builder()
-            .external(external)
-            .cipher(test_cipher().await)
-            .cookie_name("session".parse().unwrap())
-            .cookie_path("/".parse().unwrap())
-            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
-            .build();
-        // Seal 17 bytes under session_ptr AAD — AEAD passes but the UUID
-        // conversion ([u8; 16]) fails, exercising PayloadInvalid.
-        let bundle = AeadV1Cipher::new(test_cipher().await)
-            .seal(&[0u8; 17], &store.sealer.aad("session_ptr"))
-            .await
-            .unwrap();
-        let encoded = URL_SAFE_NO_PAD.encode(&bundle);
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            http::header::COOKIE,
-            format!("__Host-session={encoded}").parse().unwrap(),
+    #[test]
+    fn metrics_read_pointer_cookie_absent_is_silent() {
+        let ((), counters) = with_metrics(async {
+            let (_, external) = test_session_and_store();
+            let store = StoreBackedSessionStore::builder()
+                .external(external)
+                .cipher(test_cipher().await)
+                .cookie_name("session".parse().unwrap())
+                .cookie_path("/".parse().unwrap())
+                .build();
+            store.read_pointer_cookie(&http::HeaderMap::new()).await;
+        });
+        assert!(
+            !counters
+                .iter()
+                .any(|(name, _, _)| name == "huskarl.session_cookie.decrypt"),
+            "absent cookie must not record a decrypt"
         );
-        store.read_pointer_cookie(&headers).await;
-        assert_eq!(m.decrypts(), vec![(None, "payload_invalid")]);
     }
 
-    #[tokio::test]
-    async fn metrics_read_pointer_cookie_success_records_ok_with_kid() {
-        let (session, external) = test_session_and_store();
-        let m = Arc::new(RecordingMetrics::default());
-        let store = StoreBackedSessionStore::builder()
-            .external(external)
-            .cipher(test_cipher_with_kid("v5").await)
-            .cookie_name("session".parse().unwrap())
-            .cookie_path("/".parse().unwrap())
-            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
-            .build();
-        let headers_out = store
-            .pointer_cookie_headers(session.persisted.session_key)
-            .await
-            .unwrap();
-        // Simulate the browser sending back both the pointer cookie and the kid sidecar.
-        let pairs: String = headers_out
-            .iter()
-            .filter_map(|h| {
-                let s = h.to_str().ok()?;
-                let pair = s.split(';').next()?;
-                let (_, v) = pair.split_once('=')?;
-                (!v.is_empty()).then(|| pair.to_owned())
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        let mut req = http::HeaderMap::new();
-        if !pairs.is_empty() {
-            req.insert(http::header::COOKIE, pairs.parse().unwrap());
-        }
-        store.read_pointer_cookie(&req).await;
-        assert_eq!(m.decrypts(), vec![(Some("v5".to_owned()), "ok")]);
+    #[test]
+    fn metrics_read_pointer_cookie_bad_encoding() {
+        let ((), counters) = with_metrics(async {
+            let (_, external) = test_session_and_store();
+            let store = StoreBackedSessionStore::builder()
+                .external(external)
+                .cipher(test_cipher().await)
+                .cookie_name("session".parse().unwrap())
+                .cookie_path("/".parse().unwrap())
+                .build();
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::COOKIE,
+                "__Host-session=not!!valid!!base64".parse().unwrap(),
+            );
+            store.read_pointer_cookie(&headers).await;
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.decrypt",
+                &decrypt_labels("none", "bad_encoding"),
+            ),
+            1
+        );
     }
 
-    #[tokio::test]
-    async fn metrics_read_pointer_cookie_forged_kid_is_normalized_to_unknown() {
+    #[test]
+    fn metrics_read_pointer_cookie_tampered_records_decrypt_failed() {
+        let ((), counters) = with_metrics(async {
+            let (_, external) = test_session_and_store();
+            let store = StoreBackedSessionStore::builder()
+                .external(external)
+                .cipher(test_cipher().await)
+                .cookie_name("session".parse().unwrap())
+                .cookie_path("/".parse().unwrap())
+                .build();
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::COOKIE,
+                "__Host-session=AAAAAAAAAAAA".parse().unwrap(),
+            );
+            store.read_pointer_cookie(&headers).await;
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.decrypt",
+                &decrypt_labels("none", "decrypt_failed"),
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn metrics_read_pointer_cookie_payload_invalid_when_not_16_bytes() {
+        let ((), counters) = with_metrics(async {
+            let (_, external) = test_session_and_store();
+            let store = StoreBackedSessionStore::builder()
+                .external(external)
+                .cipher(test_cipher().await)
+                .cookie_name("session".parse().unwrap())
+                .cookie_path("/".parse().unwrap())
+                .build();
+            // Seal 17 bytes under session_ptr AAD — AEAD passes but the UUID
+            // conversion ([u8; 16]) fails, exercising PayloadInvalid.
+            let bundle = AeadV1Cipher::new(test_cipher().await)
+                .seal(&[0u8; 17], &store.sealer.aad("session_ptr"))
+                .await
+                .unwrap();
+            let encoded = URL_SAFE_NO_PAD.encode(&bundle);
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::COOKIE,
+                format!("__Host-session={encoded}").parse().unwrap(),
+            );
+            store.read_pointer_cookie(&headers).await;
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.decrypt",
+                &decrypt_labels("none", "payload_invalid"),
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn metrics_read_pointer_cookie_success_records_ok_with_kid() {
+        let ((), counters) = with_metrics(async {
+            let (session, external) = test_session_and_store();
+            let store = StoreBackedSessionStore::builder()
+                .external(external)
+                .cipher(test_cipher_with_kid("v5").await)
+                .cookie_name("session".parse().unwrap())
+                .cookie_path("/".parse().unwrap())
+                .build();
+            let headers_out = store
+                .pointer_cookie_headers(session.persisted.session_key)
+                .await
+                .unwrap();
+            // Simulate the browser sending back both the pointer cookie and
+            // the kid sidecar.
+            let pairs: String = headers_out
+                .iter()
+                .filter_map(|h| {
+                    let s = h.to_str().ok()?;
+                    let pair = s.split(';').next()?;
+                    let (_, v) = pair.split_once('=')?;
+                    (!v.is_empty()).then(|| pair.to_owned())
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let mut req = http::HeaderMap::new();
+            if !pairs.is_empty() {
+                req.insert(http::header::COOKIE, pairs.parse().unwrap());
+            }
+            store.read_pointer_cookie(&req).await;
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.decrypt",
+                &decrypt_labels("v5", "ok"),
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn metrics_read_pointer_cookie_forged_kid_is_normalized_to_unknown() {
         // The sidecar is client-supplied: a pointer sealed under "v5" carrying
         // an attacker-chosen kid must not let that value reach the metrics
         // label. The read still succeeds (kid is a hint, not a filter), but the
         // label collapses to "unknown".
-        let (session, external) = test_session_and_store();
-        let m = Arc::new(RecordingMetrics::default());
-        let store = StoreBackedSessionStore::builder()
-            .external(external)
-            .cipher(test_cipher_with_kid("v5").await)
-            .cookie_name("session".parse().unwrap())
-            .cookie_path("/".parse().unwrap())
-            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
-            .build();
-        let headers_out = store
-            .pointer_cookie_headers(session.persisted.session_key)
-            .await
-            .unwrap();
-        let pointer_value = headers_out
-            .iter()
-            .find_map(|h| {
-                let s = h.to_str().ok()?;
-                let pair = s.split(';').next()?;
-                let (name, v) = pair.split_once('=')?;
-                (name.trim() == "__Host-session" && !v.is_empty()).then(|| v.to_owned())
-            })
-            .expect("pointer cookie present");
-        let mut req = http::HeaderMap::new();
-        req.insert(
-            http::header::COOKIE,
-            format!(
-                "__Host-session={pointer_value}; __Host-session.kid={}",
-                encode_kid("totally-bogus")
-            )
-            .parse()
-            .unwrap(),
+        let ((), counters) = with_metrics(async {
+            let (session, external) = test_session_and_store();
+            let store = StoreBackedSessionStore::builder()
+                .external(external)
+                .cipher(test_cipher_with_kid("v5").await)
+                .cookie_name("session".parse().unwrap())
+                .cookie_path("/".parse().unwrap())
+                .build();
+            let headers_out = store
+                .pointer_cookie_headers(session.persisted.session_key)
+                .await
+                .unwrap();
+            let pointer_value = headers_out
+                .iter()
+                .find_map(|h| {
+                    let s = h.to_str().ok()?;
+                    let pair = s.split(';').next()?;
+                    let (name, v) = pair.split_once('=')?;
+                    (name.trim() == "__Host-session" && !v.is_empty()).then(|| v.to_owned())
+                })
+                .expect("pointer cookie present");
+            let mut req = http::HeaderMap::new();
+            req.insert(
+                http::header::COOKIE,
+                format!(
+                    "__Host-session={pointer_value}; __Host-session.kid={}",
+                    encode_kid("totally-bogus")
+                )
+                .parse()
+                .unwrap(),
+            );
+            store.read_pointer_cookie(&req).await;
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.decrypt",
+                &decrypt_labels("unknown", "ok"),
+            ),
+            1
         );
-        store.read_pointer_cookie(&req).await;
-        assert_eq!(m.decrypts(), vec![(Some("unknown".to_owned()), "ok")]);
+    }
+
+    #[test]
+    fn metrics_name_stamped_via_session_policy_labels_store_counters() {
+        let ((), counters) = with_metrics(async {
+            let (session, external) = test_session_and_store();
+            let mut store = StoreBackedSessionStore::builder()
+                .external(external)
+                .cipher(test_cipher().await)
+                .cookie_name("session".parse().unwrap())
+                .cookie_path("/".parse().unwrap())
+                .build();
+            store.apply_session_policy(true, None, Some("tenant-b"));
+            store
+                .pointer_cookie_headers(session.persisted.session_key)
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.encrypt",
+                &[
+                    ("cookie", "__Host-session"),
+                    ("kid", "none"),
+                    ("name", "tenant-b"),
+                ],
+            ),
+            1
+        );
+    }
+
+    // ── Storage metrics emission ─────────────────────────────────────────
+
+    #[test]
+    fn metrics_superseded_delete_records_deleted() {
+        let ((), counters) = with_metrics(async {
+            let old = test_session();
+            let old_key = old.persisted.session_key;
+            let external = MapStore::default();
+            external.insert(&old).await.unwrap();
+            let store = StoreBackedSessionStore::builder()
+                .external(external)
+                .cipher(test_cipher().await)
+                .cookie_name("session".parse().unwrap())
+                .cookie_path("/".parse().unwrap())
+                .build();
+            let req = request_with_pointer(&store.pointer_cookie_headers(old_key).await.unwrap());
+            store
+                .create(
+                    completed_with_email("a@example.com"),
+                    Duration::from_hours(1),
+                    &req,
+                )
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session.superseded_delete",
+                &[("outcome", "deleted")],
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn metrics_liveness_read_failure_records_fail_open() {
+        let ((), counters) = with_metrics(async {
+            let session = test_session();
+            let store = StoreBackedSessionStore::builder()
+                .external(MinimalExternalStore(session.clone()))
+                .cipher(test_cipher().await)
+                .cookie_name("session".parse().unwrap())
+                .cookie_path("/".parse().unwrap())
+                .build()
+                .with_liveness(FailingLiveness, LivenessConfig::default());
+            store
+                .check_liveness(&session, SystemTime::now(), true, None)
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session.liveness_failure",
+                &[("op", "read")],
+            ),
+            1
+        );
     }
 }

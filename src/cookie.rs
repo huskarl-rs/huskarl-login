@@ -16,7 +16,7 @@ use snafu::Snafu;
 
 use crate::{
     config::RoutePath,
-    metrics::{DecryptResult, SessionCookieMetrics},
+    metrics::DecryptResult,
     session::{SessionError, SessionErrorKind},
 };
 
@@ -253,7 +253,9 @@ pub(crate) struct CookieSealer {
     pub(crate) secure: bool,
     cookie_path: RoutePath,
     max_age: Duration,
-    metrics: Option<Arc<dyn SessionCookieMetrics>>,
+    /// Instance `name` label for emitted counters; stamped by
+    /// [`SessionDriver::apply_session_policy`](crate::SessionDriver::apply_session_policy).
+    pub(crate) metrics_name: Option<String>,
 }
 
 impl CookieSealer {
@@ -265,7 +267,6 @@ impl CookieSealer {
         cookie_name: CookieName,
         cookie_path: RoutePath,
         max_age: Duration,
-        metrics: Option<Arc<dyn SessionCookieMetrics>>,
     ) -> Self {
         let secure = true;
         let raw_cookie_name = cookie_name;
@@ -279,7 +280,7 @@ impl CookieSealer {
             secure,
             cookie_path,
             max_age,
-            metrics,
+            metrics_name: None,
         }
     }
 
@@ -341,20 +342,34 @@ impl CookieSealer {
         HeaderValue::from_str(&value).map_err(|e| SessionError::new(SessionErrorKind::Encoding, e))
     }
 
-    /// Records an encrypt event (active key id) if metrics are configured.
+    /// Records an encrypt event (active key id).
     pub(crate) fn record_encrypt(&self, kid: Option<&str>) {
-        if let Some(m) = &self.metrics {
-            m.record_encrypt(&self.cookie_name, kid);
-        }
+        crate::metrics::emit_counter(
+            "huskarl.session_cookie.encrypt",
+            vec![
+                metrics::Label::new("cookie", self.cookie_name.clone()),
+                metrics::Label::new("kid", kid.map_or_else(|| "none".to_owned(), str::to_owned)),
+            ],
+            self.metrics_name.as_deref(),
+        );
     }
 
-    /// Records a decrypt outcome if metrics are configured, bounding the
-    /// client-supplied kid label via [`normalize_kid_label`].
+    /// Records a decrypt outcome, bounding the client-supplied kid label via
+    /// [`normalize_kid_label`].
     pub(crate) fn record_decrypt(&self, kid: Option<&str>, result: &DecryptResult) {
         let label = normalize_kid_label(&*self.aead, &self.cookie_name, kid);
-        if let Some(m) = &self.metrics {
-            m.record_decrypt(&self.cookie_name, label, result);
-        }
+        crate::metrics::emit_counter(
+            "huskarl.session_cookie.decrypt",
+            vec![
+                metrics::Label::new("cookie", self.cookie_name.clone()),
+                metrics::Label::new(
+                    "kid",
+                    label.map_or_else(|| "none".to_owned(), str::to_owned),
+                ),
+                metrics::Label::new("outcome", result.as_str()),
+            ],
+            self.metrics_name.as_deref(),
+        );
     }
 }
 

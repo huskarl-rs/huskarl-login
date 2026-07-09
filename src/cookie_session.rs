@@ -21,7 +21,7 @@ use crate::{
         get_kid_cookie, kid_cookie_name, unseal_with_kid_fallback,
     },
     enrich::{NoEnrichment, SessionEnricher},
-    metrics::{DecryptResult, SessionCookieMetrics},
+    metrics::DecryptResult,
     session::{SessionDriver, SessionError, SessionErrorKind},
     session_state::{Session, SessionState},
 };
@@ -152,11 +152,9 @@ impl<C> CookieSessionStore<C> {
         /// Values below 1 are treated as 1.
         #[builder(default = DEFAULT_MAX_CHUNKS)]
         max_chunks: usize,
-        /// Optional metrics observer for encrypt/decrypt events.
-        metrics: Option<Arc<dyn SessionCookieMetrics>>,
     ) -> Self {
         Self {
-            sealer: CookieSealer::new(cipher, cookie_name, cookie_path, max_age, metrics),
+            sealer: CookieSealer::new(cipher, cookie_name, cookie_path, max_age),
             enricher,
             max_chunks: max_chunks.max(1),
             max_lifetime: None,
@@ -399,8 +397,14 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
     type SessionType = C;
     type LoadError = std::convert::Infallible;
 
-    fn apply_session_policy(&mut self, secure: bool, max_lifetime: Option<Duration>) {
+    fn apply_session_policy(
+        &mut self,
+        secure: bool,
+        max_lifetime: Option<Duration>,
+        metrics_name: Option<&str>,
+    ) {
         self.sealer.apply_secure(secure);
+        self.sealer.metrics_name = metrics_name.map(str::to_owned);
         if let Some(max) = max_lifetime {
             self.sealer.clamp_max_age(max);
         }
@@ -615,7 +619,7 @@ mod tests {
         // 400-day Max-Age must come down to it so no cookie outlives the
         // session.
         let mut store = test_store().await;
-        SessionDriver::apply_session_policy(&mut store, true, Some(Duration::from_hours(8)));
+        SessionDriver::apply_session_policy(&mut store, true, Some(Duration::from_hours(8)), None);
         let cookies = store
             .save_session(&CookieSession(test_state()), &HeaderMap::new())
             .await
@@ -636,7 +640,7 @@ mod tests {
             .cookie_path("/".parse().unwrap())
             .max_age(Duration::from_hours(1))
             .build();
-        SessionDriver::apply_session_policy(&mut store, true, Some(Duration::from_hours(8)));
+        SessionDriver::apply_session_policy(&mut store, true, Some(Duration::from_hours(8)), None);
         let cookies = store
             .save_session(&CookieSession(test_state()), &HeaderMap::new())
             .await
@@ -887,14 +891,12 @@ mod tests {
             "app_a".parse().unwrap(),
             "/".parse().unwrap(),
             DEFAULT_COOKIE_MAX_AGE,
-            None,
         );
         let sealer_b = CookieSealer::new(
             cipher.clone(),
             "app_b".parse().unwrap(),
             "/".parse().unwrap(),
             DEFAULT_COOKIE_MAX_AGE,
-            None,
         );
 
         let bundle = sealer_a
@@ -1474,216 +1476,262 @@ mod tests {
         assert!(out.ends_with("c63"));
     }
 
-    // ── SessionCookieMetrics ──────────────────────────────────────────────
+    // ── Cookie metrics emission ──────────────────────────────────────────
 
-    use std::sync::{Arc, Mutex};
+    use crate::test_support::{counter_value, with_metrics};
 
-    use crate::metrics::{DecryptResult, SessionCookieMetrics};
-
-    #[derive(Default)]
-    struct RecordingMetrics {
-        encrypts: Mutex<Vec<Option<String>>>,
-        decrypts: Mutex<Vec<(Option<String>, &'static str)>>,
+    /// Counter labels for a session-cookie decrypt with the given kid and outcome.
+    fn decrypt_labels<'a>(kid: &'a str, outcome: &'a str) -> [(&'a str, &'a str); 3] {
+        [
+            ("cookie", "__Host-huskarl_session"),
+            ("kid", kid),
+            ("outcome", outcome),
+        ]
     }
 
-    impl SessionCookieMetrics for RecordingMetrics {
-        fn record_decrypt(&self, _: &str, kid: Option<&str>, result: &DecryptResult) {
-            self.decrypts
-                .lock()
-                .unwrap()
-                .push((kid.map(str::to_owned), result.as_str()));
-        }
-        fn record_encrypt(&self, _: &str, kid: Option<&str>) {
-            self.encrypts.lock().unwrap().push(kid.map(str::to_owned));
-        }
-    }
-
-    impl RecordingMetrics {
-        fn encrypts(&self) -> Vec<Option<String>> {
-            self.encrypts.lock().unwrap().clone()
-        }
-        fn decrypts(&self) -> Vec<(Option<String>, &'static str)> {
-            self.decrypts.lock().unwrap().clone()
-        }
-    }
-
-    async fn store_with_metrics() -> (CookieSessionStore<CookieSession>, Arc<RecordingMetrics>) {
-        let m = Arc::new(RecordingMetrics::default());
-        let s = CookieSessionStore::builder()
+    async fn plain_store() -> CookieSessionStore<CookieSession> {
+        CookieSessionStore::builder()
             .cipher(test_cipher().await)
             .cookie_name("huskarl_session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
-            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
-            .build();
-        (s, m)
+            .build()
     }
 
-    #[tokio::test]
-    async fn metrics_save_records_encrypt() {
-        let (store, m) = store_with_metrics().await;
-        store
-            .save_session(&CookieSession(test_state()), &HeaderMap::new())
-            .await
-            .unwrap();
-        assert_eq!(m.encrypts(), vec![None]);
-    }
-
-    #[tokio::test]
-    async fn metrics_save_records_kid_when_cipher_has_identity() {
-        let m = Arc::new(RecordingMetrics::default());
-        let store = CookieSessionStore::<CookieSession>::builder()
+    async fn kid_store() -> CookieSessionStore<CookieSession> {
+        CookieSessionStore::builder()
             .cipher(test_cipher_with_kid("v5").await)
             .cookie_name("huskarl_session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
-            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
-            .build();
-        store
-            .save_session(&CookieSession(test_state()), &HeaderMap::new())
-            .await
-            .unwrap();
-        assert_eq!(m.encrypts(), vec![Some("v5".to_owned())]);
+            .build()
     }
 
-    #[tokio::test]
-    async fn metrics_load_absent_session_is_silent() {
-        let (store, m) = store_with_metrics().await;
-        store.load_session(&HeaderMap::new()).await;
-        assert!(m.decrypts().is_empty());
-    }
-
-    #[tokio::test]
-    async fn metrics_load_bad_base64_records_bad_encoding() {
-        let (store, m) = store_with_metrics().await;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::COOKIE,
-            "__Host-huskarl_session.0=not!!valid!!base64"
-                .parse()
-                .unwrap(),
+    #[test]
+    fn metrics_save_records_encrypt() {
+        let ((), counters) = with_metrics(async {
+            plain_store()
+                .await
+                .save_session(&CookieSession(test_state()), &HeaderMap::new())
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.encrypt",
+                &[("cookie", "__Host-huskarl_session"), ("kid", "none")],
+            ),
+            1
         );
-        store.load_session(&headers).await;
-        assert_eq!(m.decrypts(), vec![(None, "bad_encoding")]);
     }
 
-    #[tokio::test]
-    async fn metrics_load_tampered_ciphertext_records_decrypt_failed() {
-        let (store, m) = store_with_metrics().await;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::COOKIE,
-            "__Host-huskarl_session.0=AAAAAAAAAAAA".parse().unwrap(),
+    #[test]
+    fn metrics_save_records_kid_when_cipher_has_identity() {
+        let ((), counters) = with_metrics(async {
+            kid_store()
+                .await
+                .save_session(&CookieSession(test_state()), &HeaderMap::new())
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.encrypt",
+                &[("cookie", "__Host-huskarl_session"), ("kid", "v5")],
+            ),
+            1
         );
-        store.load_session(&headers).await;
-        assert_eq!(m.decrypts(), vec![(None, "decrypt_failed")]);
     }
 
-    #[tokio::test]
-    async fn metrics_load_success_records_ok() {
-        let (store, m) = store_with_metrics().await;
-        let set_cookies = store
-            .save_session(&CookieSession(test_state()), &HeaderMap::new())
-            .await
-            .unwrap();
-        let req = request_cookies_from_set_cookies(&set_cookies);
-        store.load_session(&req).await;
-        // No kid sidecar (identity-less cipher), so kid=None.
-        assert_eq!(m.decrypts(), vec![(None, "ok")]);
-    }
-
-    #[tokio::test]
-    async fn metrics_load_records_kid_from_sidecar_cookie() {
-        let m = Arc::new(RecordingMetrics::default());
-        let store = CookieSessionStore::<CookieSession>::builder()
-            .cipher(test_cipher_with_kid("v5").await)
-            .cookie_name("huskarl_session".parse().unwrap())
-            .cookie_path("/".parse().unwrap())
-            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
-            .build();
-        let set_cookies = store
-            .save_session(&CookieSession(test_state()), &HeaderMap::new())
-            .await
-            .unwrap();
-        let req = request_cookies_from_set_cookies(&set_cookies);
-        store.load_session(&req).await;
-        assert_eq!(m.decrypts(), vec![(Some("v5".to_owned()), "ok")]);
-    }
-
-    #[tokio::test]
-    async fn metrics_load_payload_invalid_when_plaintext_is_not_valid_session() {
-        let (store, m) = store_with_metrics().await;
-        // Seal garbage bytes under the session AAD — AEAD passes but CBOR
-        // deserialization of CookieSession fails, exercising PayloadInvalid.
-        let bundle = AeadV1Cipher::new(test_cipher().await)
-            .seal(b"not cbor", &store.sealer.aad("session"))
-            .await
-            .unwrap();
-        let encoded = URL_SAFE_NO_PAD.encode(&bundle);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::COOKIE,
-            format!("__Host-huskarl_session.0={encoded}")
-                .parse()
-                .unwrap(),
+    #[test]
+    fn metrics_load_absent_session_is_silent() {
+        let ((), counters) = with_metrics(async {
+            plain_store().await.load_session(&HeaderMap::new()).await;
+        });
+        assert!(
+            !counters
+                .iter()
+                .any(|(name, _, _)| name == "huskarl.session_cookie.decrypt"),
+            "absent cookies must not record a decrypt"
         );
-        store.load_session(&headers).await;
-        assert_eq!(m.decrypts(), vec![(None, "payload_invalid")]);
     }
 
-    #[tokio::test]
-    async fn metrics_load_forged_kid_is_normalized_to_unknown() {
+    #[test]
+    fn metrics_load_bad_base64_records_bad_encoding() {
+        let ((), counters) = with_metrics(async {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::COOKIE,
+                "__Host-huskarl_session.0=not!!valid!!base64"
+                    .parse()
+                    .unwrap(),
+            );
+            plain_store().await.load_session(&headers).await;
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.decrypt",
+                &decrypt_labels("none", "bad_encoding"),
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn metrics_load_tampered_ciphertext_records_decrypt_failed() {
+        let ((), counters) = with_metrics(async {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::COOKIE,
+                "__Host-huskarl_session.0=AAAAAAAAAAAA".parse().unwrap(),
+            );
+            plain_store().await.load_session(&headers).await;
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.decrypt",
+                &decrypt_labels("none", "decrypt_failed"),
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn metrics_load_success_records_ok() {
+        let ((), counters) = with_metrics(async {
+            let store = plain_store().await;
+            let set_cookies = store
+                .save_session(&CookieSession(test_state()), &HeaderMap::new())
+                .await
+                .unwrap();
+            let req = request_cookies_from_set_cookies(&set_cookies);
+            store.load_session(&req).await;
+        });
+        // No kid sidecar (identity-less cipher), so kid=none.
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.decrypt",
+                &decrypt_labels("none", "ok"),
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn metrics_load_records_kid_from_sidecar_cookie() {
+        let ((), counters) = with_metrics(async {
+            let store = kid_store().await;
+            let set_cookies = store
+                .save_session(&CookieSession(test_state()), &HeaderMap::new())
+                .await
+                .unwrap();
+            let req = request_cookies_from_set_cookies(&set_cookies);
+            store.load_session(&req).await;
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.decrypt",
+                &decrypt_labels("v5", "ok"),
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn metrics_load_payload_invalid_when_plaintext_is_not_valid_session() {
+        let ((), counters) = with_metrics(async {
+            let store = plain_store().await;
+            // Seal garbage bytes under the session AAD — AEAD passes but CBOR
+            // deserialization of CookieSession fails, exercising PayloadInvalid.
+            let bundle = AeadV1Cipher::new(test_cipher().await)
+                .seal(b"not cbor", &store.sealer.aad("session"))
+                .await
+                .unwrap();
+            let encoded = URL_SAFE_NO_PAD.encode(&bundle);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::COOKIE,
+                format!("__Host-huskarl_session.0={encoded}")
+                    .parse()
+                    .unwrap(),
+            );
+            store.load_session(&headers).await;
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.decrypt",
+                &decrypt_labels("none", "payload_invalid"),
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn metrics_load_forged_kid_is_normalized_to_unknown() {
         // The sidecar is client-supplied: a session sealed under "v5" but
         // carrying an attacker-chosen kid must not let that value reach the
         // metrics label. The decrypt still succeeds (kid is a hint, not a
         // filter), but the label collapses to "unknown".
-        let m = Arc::new(RecordingMetrics::default());
-        let store = CookieSessionStore::<CookieSession>::builder()
-            .cipher(test_cipher_with_kid("v5").await)
-            .cookie_name("huskarl_session".parse().unwrap())
-            .cookie_path("/".parse().unwrap())
-            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
-            .build();
-        let set_cookies = store
-            .save_session(&CookieSession(test_state()), &HeaderMap::new())
-            .await
-            .unwrap();
-        let mut req = request_cookies_from_set_cookies(&set_cookies);
-        override_kid_cookie(&mut req, &encode_kid("totally-bogus"));
-        store.load_session(&req).await;
-        assert_eq!(m.decrypts(), vec![(Some("unknown".to_owned()), "ok")]);
+        let ((), counters) = with_metrics(async {
+            let store = kid_store().await;
+            let set_cookies = store
+                .save_session(&CookieSession(test_state()), &HeaderMap::new())
+                .await
+                .unwrap();
+            let mut req = request_cookies_from_set_cookies(&set_cookies);
+            override_kid_cookie(&mut req, &encode_kid("totally-bogus"));
+            store.load_session(&req).await;
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.decrypt",
+                &decrypt_labels("unknown", "ok"),
+            ),
+            1
+        );
     }
 
-    #[tokio::test]
-    async fn metrics_load_without_kid_sidecar_records_none_kid() {
-        let m = Arc::new(RecordingMetrics::default());
-        let store = CookieSessionStore::<CookieSession>::builder()
-            .cipher(test_cipher_with_kid("v5").await)
-            .cookie_name("huskarl_session".parse().unwrap())
-            .cookie_path("/".parse().unwrap())
-            .metrics(Arc::clone(&m) as Arc<dyn SessionCookieMetrics>)
-            .build();
-        let set_cookies = store
-            .save_session(&CookieSession(test_state()), &HeaderMap::new())
-            .await
-            .unwrap();
-        // Strip the kid sidecar from the simulated request so the unsealer
-        // falls back to trial-decrypt and the metric receives kid=None.
-        let mut req = HeaderMap::new();
-        let pairs: Vec<String> = request_cookies_from_set_cookies(&set_cookies)
-            .get_all(http::header::COOKIE)
-            .iter()
-            .flat_map(|v| {
-                v.to_str()
-                    .unwrap()
-                    .split(';')
-                    .map(str::trim)
-                    .map(str::to_owned)
-            })
-            .filter(|p| !p.starts_with("__Host-huskarl_session.kid="))
-            .collect();
-        if !pairs.is_empty() {
-            req.insert(http::header::COOKIE, pairs.join("; ").parse().unwrap());
-        }
-        store.load_session(&req).await;
-        assert_eq!(m.decrypts(), vec![(None, "ok")]);
+    #[test]
+    fn metrics_load_without_kid_sidecar_records_none_kid() {
+        let ((), counters) = with_metrics(async {
+            let store = kid_store().await;
+            let set_cookies = store
+                .save_session(&CookieSession(test_state()), &HeaderMap::new())
+                .await
+                .unwrap();
+            // Strip the kid sidecar from the simulated request so the unsealer
+            // falls back to trial-decrypt and the metric receives kid=none.
+            let mut req = HeaderMap::new();
+            let pairs: Vec<String> = request_cookies_from_set_cookies(&set_cookies)
+                .get_all(http::header::COOKIE)
+                .iter()
+                .flat_map(|v| {
+                    v.to_str()
+                        .unwrap()
+                        .split(';')
+                        .map(str::trim)
+                        .map(str::to_owned)
+                })
+                .filter(|p| !p.starts_with("__Host-huskarl_session.kid="))
+                .collect();
+            if !pairs.is_empty() {
+                req.insert(http::header::COOKIE, pairs.join("; ").parse().unwrap());
+            }
+            store.load_session(&req).await;
+        });
+        assert_eq!(
+            counter_value(
+                &counters,
+                "huskarl.session_cookie.decrypt",
+                &decrypt_labels("none", "ok"),
+            ),
+            1
+        );
     }
 }

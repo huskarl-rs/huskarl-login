@@ -7,7 +7,7 @@ Three pieces collaborate:
    application's behalf after a successful OAuth callback. For cookie sessions
    the seed is [`SessionState`](crate::SessionState); for store-backed sessions
    it is [`PersistedSessionState`](crate::PersistedSessionState), which adds the
-   generated session key and an optimistic-concurrency version.
+   generated session key.
 2. **The enricher** — a [`SessionEnricher`](crate::SessionEnricher) turns the
    seed plus the [`CompletedLogin`](crate::CompletedLogin) (validated ID token
    claims and the token response) into the application's session type.
