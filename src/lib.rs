@@ -65,7 +65,7 @@ pub use engine::{DefaultPersistFailurePolicy, PersistFailurePolicy, TeardownReas
 pub use enrich::{NoEnrichment, SessionEnricher};
 pub use error_page::{DefaultErrorPage, ErrorPage, ErrorPageResponse};
 pub use huskarl::core::EndpointUrl;
-pub use liveness::{LivenessConfig, LivenessStore, LivenessVerdict};
+pub use liveness::{DEFAULT_IDLE_TIMEOUT, LivenessConfig, LivenessStore, LivenessVerdict};
 pub use metrics::{
     DecryptResult, LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult,
     SessionCookieMetrics, normalize_as_error,

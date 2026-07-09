@@ -65,11 +65,11 @@ pub trait ExternalSessionStore: MaybeSendSync {
     /// Save a session unconditionally (last-writer-wins), advancing the stored
     /// [`version`](PersistedSessionState::version).
     ///
-    /// Retain the record until **at least**
-    /// [`Session::expire_at`](crate::Session::expire_at), re-applying the TTL
-    /// on **every** write and never as a sliding window; `None` means no
-    /// deadline. The TTL is garbage collection, not enforcement — see [the
-    /// external-store guide](crate::_docs::guide::external_store).
+    /// Apply [`Session::storage_deadline`](crate::Session::storage_deadline)
+    /// as the record's absolute TTL on **every** write — backends like Redis
+    /// drop a key's TTL on a plain overwrite — and never as a sliding window.
+    /// See the [external store guide](crate::_docs::guide::external_store)
+    /// for the full retention contract.
     fn save(
         &self,
         session: &Self::SessionType,
@@ -504,6 +504,31 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         }
         Ok(headers)
     }
+
+    /// Delete the record a still-valid incoming pointer cookie references,
+    /// before a new login's cookie overwrites the pointer: a fresh login
+    /// supersedes the old session, so an exfiltrated copy of its pointer must
+    /// not keep working until the storage deadline reaps it. Best-effort:
+    /// failures are logged and must not fail the login.
+    async fn delete_superseded_session(&self, headers: &http::HeaderMap) {
+        let Some(old_key) = self.read_pointer_cookie(headers).await else {
+            return;
+        };
+        match self.external.load(old_key).await {
+            Ok(Some(old)) => {
+                if let Err(e) = self.external.delete(&old).await {
+                    log::warn!("failed to delete superseded session record: {e}");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => log::warn!("failed to load superseded session record: {e}"),
+        }
+        if let Some((liveness, _)) = &self.liveness
+            && let Err(e) = liveness.clear(old_key).await
+        {
+            log::warn!("failed to clear superseded liveness entry: {e}");
+        }
+    }
 }
 
 impl<E: ExternalSessionStore> crate::session::sealed::Sealed for StoreBackedSessionStore<E> {}
@@ -529,8 +554,9 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
         &self,
         completed: crate::CompletedLogin,
         default_lifetime: std::time::Duration,
-        _headers: &http::HeaderMap,
+        headers: &http::HeaderMap,
     ) -> Result<(E::SessionType, Vec<HeaderValue>), SessionError> {
+        self.delete_superseded_session(headers).await;
         self.create_session(&completed, default_lifetime).await
     }
 
@@ -618,10 +644,16 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
                 now.duration_since(prev).unwrap_or(Duration::ZERO) >= config.touch_min_interval
             }
         };
+        // Entry TTL: the record deadline, tightened by the engine's effective
+        // deadline. An entry must not expire before its record — a missing
+        // entry reads as active, which would resurrect an idle session whose
+        // record is still stored. See the liveness explanation page.
+        let horizon = session.token_expiry().max(now) + config.idle_timeout;
+        let deadline = Some(expire_at.map_or(horizon, |e| e.min(horizon)));
         if record_activity
             && verdict == LivenessVerdict::Active
             && due
-            && let Err(e) = liveness.touch(key, now, expire_at).await
+            && let Err(e) = liveness.touch(key, now, deadline).await
         {
             log::warn!("liveness touch failed (best-effort): {e}");
         }
@@ -759,19 +791,25 @@ mod tests {
         assert_session_driver(&store);
     }
 
-    /// In-memory [`LivenessStore`] that records every write, shareable for
-    /// inspection.
+    /// `last_active` and the touch deadline, as [`FakeLiveness`] records them.
+    type FakeEntries = std::collections::HashMap<Uuid, (SystemTime, Option<SystemTime>)>;
+
+    /// In-memory [`LivenessStore`] that records every write — `last_active`
+    /// and the touch deadline — shareable for inspection.
     #[derive(Clone, Default)]
     struct FakeLiveness {
-        entries: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, SystemTime>>>,
+        entries: Arc<std::sync::Mutex<FakeEntries>>,
     }
 
     impl FakeLiveness {
         fn set(&self, key: Uuid, at: SystemTime) {
-            self.entries.lock().unwrap().insert(key, at);
+            self.entries.lock().unwrap().insert(key, (at, None));
         }
         fn get(&self, key: Uuid) -> Option<SystemTime> {
-            self.entries.lock().unwrap().get(&key).copied()
+            self.entries.lock().unwrap().get(&key).map(|(at, _)| *at)
+        }
+        fn deadline(&self, key: Uuid) -> Option<SystemTime> {
+            self.entries.lock().unwrap().get(&key).and_then(|(_, d)| *d)
         }
     }
 
@@ -787,9 +825,9 @@ mod tests {
             &self,
             key: Uuid,
             now: SystemTime,
-            _expire_at: Option<SystemTime>,
+            deadline: Option<SystemTime>,
         ) -> MaybeSendBoxFuture<'_, Result<(), SessionError>> {
-            self.set(key, now);
+            self.entries.lock().unwrap().insert(key, (now, deadline));
             Box::pin(async move { Ok(()) })
         }
         fn clear(&self, key: Uuid) -> MaybeSendBoxFuture<'_, Result<(), SessionError>> {
@@ -992,6 +1030,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn liveness_touch_deadline_is_activity_horizon_when_delegated() {
+        let session = test_session(); // no expire_at → delegated lifetime
+        let key = session.persisted.session_key;
+        let liveness = FakeLiveness::default();
+        let config = LivenessConfig::default();
+        let idle = config.idle_timeout;
+        let store = liveness_store(session.clone(), liveness.clone(), config).await;
+
+        let now = SystemTime::now();
+        store
+            .check_liveness(&session, now, true, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            liveness.deadline(key),
+            Some(session.token_expiry() + idle),
+            "entry TTL anchors at token_expiry so it cannot expire before the record"
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_touch_deadline_tightened_by_engine_deadline() {
+        let session = test_session();
+        let key = session.persisted.session_key;
+        let liveness = FakeLiveness::default();
+        let store =
+            liveness_store(session.clone(), liveness.clone(), LivenessConfig::default()).await;
+
+        let now = SystemTime::now();
+        let engine_deadline = now + Duration::from_mins(1); // sooner than the horizon
+        store
+            .check_liveness(&session, now, true, Some(engine_deadline))
+            .await
+            .unwrap();
+
+        assert_eq!(liveness.deadline(key), Some(engine_deadline));
+    }
+
     // ── Optimistic update (OCC) ───────────────────────────────────────────
 
     /// A stateful external store that honours [`compare_and_swap`] versioning,
@@ -1109,6 +1187,148 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session.expire_at(), None);
+    }
+
+    // ── Superseded-record cleanup on re-login ────────────────────────────
+
+    /// Multi-record store keyed by session key, so a superseded record and
+    /// the new login's record can coexist. Shareable for inspection.
+    #[derive(Clone, Default)]
+    struct MapStore {
+        records: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, MinimalSession>>>,
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    impl ExternalSessionStore for MapStore {
+        type SessionType = MinimalSession;
+        type Error = Infallible;
+
+        async fn insert(&self, s: &MinimalSession) -> Result<(), Infallible> {
+            self.records
+                .lock()
+                .unwrap()
+                .insert(s.persisted.session_key, s.clone());
+            Ok(())
+        }
+        async fn load(&self, key: Uuid) -> Result<Option<MinimalSession>, Infallible> {
+            Ok(self.records.lock().unwrap().get(&key).cloned())
+        }
+        async fn save(&self, s: &MinimalSession) -> Result<(), Infallible> {
+            self.insert(s).await
+        }
+        async fn compare_and_swap(
+            &self,
+            s: &MinimalSession,
+            _: i32,
+        ) -> Result<SaveOutcome, Infallible> {
+            self.insert(s).await?;
+            Ok(SaveOutcome::Committed)
+        }
+        async fn delete(&self, s: &MinimalSession) -> Result<(), Infallible> {
+            self.records
+                .lock()
+                .unwrap()
+                .remove(&s.persisted.session_key);
+            Ok(())
+        }
+    }
+
+    /// Extracts the sealed pointer-cookie value from `Set-Cookie` header
+    /// values and builds request headers presenting it back.
+    fn request_with_pointer(headers_out: &[HeaderValue]) -> http::HeaderMap {
+        let pointer_value = headers_out
+            .iter()
+            .find_map(|h| {
+                let s = h.to_str().ok()?;
+                let pair = s.split(';').next()?;
+                let (name, value) = pair.split_once('=')?;
+                (name.trim() == "__Host-session" && !value.is_empty()).then(|| value.to_owned())
+            })
+            .expect("pointer cookie present");
+        let mut req = http::HeaderMap::new();
+        req.insert(
+            http::header::COOKIE,
+            format!("__Host-session={pointer_value}").parse().unwrap(),
+        );
+        req
+    }
+
+    #[tokio::test]
+    async fn create_deletes_superseded_record_and_liveness_entry() {
+        let old = test_session();
+        let old_key = old.persisted.session_key;
+        let external = MapStore::default();
+        external.insert(&old).await.unwrap();
+        let liveness = FakeLiveness::default();
+        liveness.set(old_key, SystemTime::now());
+
+        let store = StoreBackedSessionStore::builder()
+            .external(external.clone())
+            .cipher(test_cipher().await)
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .build()
+            .with_liveness(liveness.clone(), LivenessConfig::default());
+
+        // A re-login: the request still carries a valid pointer cookie for
+        // the old session.
+        let req = request_with_pointer(&store.pointer_cookie_headers(old_key).await.unwrap());
+        let (new_session, _cookies) = store
+            .create(
+                completed_with_email("a@example.com"),
+                Duration::from_hours(1),
+                &req,
+            )
+            .await
+            .unwrap();
+
+        let records = external.records.lock().unwrap();
+        assert!(
+            !records.contains_key(&old_key),
+            "superseded record must be deleted, not orphaned"
+        );
+        assert!(
+            records.contains_key(&new_session.persisted.session_key),
+            "new record inserted"
+        );
+        drop(records);
+        assert!(
+            liveness.get(old_key).is_none(),
+            "superseded liveness entry cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_without_pointer_cookie_touches_no_other_records() {
+        let unrelated = test_session();
+        let unrelated_key = unrelated.persisted.session_key;
+        let external = MapStore::default();
+        external.insert(&unrelated).await.unwrap();
+
+        let store = StoreBackedSessionStore::builder()
+            .external(external.clone())
+            .cipher(test_cipher().await)
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .build();
+
+        store
+            .create(
+                completed_with_email("a@example.com"),
+                Duration::from_hours(1),
+                &http::HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            external
+                .records
+                .lock()
+                .unwrap()
+                .contains_key(&unrelated_key),
+            "a login without a pointer cookie must not delete anything"
+        );
     }
 
     #[tokio::test]

@@ -13,6 +13,9 @@ use crate::{config::ConfigError, session::SessionError};
 /// Default minimum interval between liveness writes: one hour.
 const DEFAULT_TOUCH_MIN_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// Default [`idle_timeout`](LivenessConfig::idle_timeout): 30 days.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_hours(30 * 24);
+
 /// A server-side store for session liveness (`last_active`) timestamps, keyed
 /// by the store-backed session's `Uuid`.
 ///
@@ -27,14 +30,14 @@ pub trait LivenessStore: MaybeSendSync {
         key: Uuid,
     ) -> MaybeSendBoxFuture<'_, Result<Option<SystemTime>, SessionError>>;
 
-    /// Records activity for `key` at `now`. `expire_at` is the session's
-    /// absolute deadline (or `None` if unset); apply it as the entry's TTL, not
-    /// a sliding idle TTL. A plain monotonic write; no debounce needed.
+    /// Records activity for `key` at `now`. Apply `deadline` as the entry's
+    /// absolute TTL (`None` applies none). A plain monotonic write; no
+    /// debounce needed.
     fn touch(
         &self,
         key: Uuid,
         now: SystemTime,
-        expire_at: Option<SystemTime>,
+        deadline: Option<SystemTime>,
     ) -> MaybeSendBoxFuture<'_, Result<(), SessionError>>;
 
     /// Removes the liveness entry for `key` (called when a session is deleted).
@@ -46,9 +49,10 @@ pub trait LivenessStore: MaybeSendSync {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct LivenessConfig {
-    /// Kill the session after this much inactivity. `None` tracks `last_active`
-    /// without enforcing an idle timeout.
-    pub idle_timeout: Option<Duration>,
+    /// Kill the session after this much inactivity. Defaults to
+    /// [`DEFAULT_IDLE_TIMEOUT`]. Also the activity window for record TTLs —
+    /// see [`Session::storage_deadline`](crate::Session::storage_deadline).
+    pub idle_timeout: Duration,
 
     /// Minimum interval between liveness writes for an active session. Must be
     /// less than [`idle_timeout`](Self::idle_timeout): `last_active` advances at
@@ -68,32 +72,32 @@ impl LivenessConfig {
     /// `touch_min_interval` is not less than `idle_timeout`.
     #[builder]
     pub fn new(
-        /// Kill the session after this much inactivity. `None` tracks
-        /// `last_active` without enforcing an idle timeout.
+        /// Kill the session after this much inactivity. Defaults to
+        /// [`DEFAULT_IDLE_TIMEOUT`] (30 days).
         idle_timeout: Option<Duration>,
         /// Minimum interval between liveness writes. Must be less than
         /// `idle_timeout`. Defaults to one hour, capped at `idle_timeout / 4`.
         touch_min_interval: Option<Duration>,
     ) -> Result<Self, ConfigError> {
-        if idle_timeout == Some(Duration::ZERO) {
+        let idle_timeout = idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT);
+        if idle_timeout == Duration::ZERO {
             return Err(ConfigError::InvalidDuration {
                 field: "idle_timeout",
-                reason: "must be greater than zero (use None for no timeout)",
+                reason: "must be greater than zero",
             });
         }
-        let touch_min_interval = match (touch_min_interval, idle_timeout) {
+        let touch_min_interval = match touch_min_interval {
             // The hard bound: `last_active` advances at most once per
             // `touch_min_interval`, so an interval reaching `idle_timeout`
             // expires sessions that received requests the whole time.
-            (Some(touch), Some(idle)) if touch >= idle => {
+            Some(touch) if touch >= idle_timeout => {
                 return Err(ConfigError::InvalidDuration {
                     field: "touch_min_interval",
                     reason: "must be less than idle_timeout",
                 });
             }
-            (Some(touch), _) => touch,
-            (None, Some(idle)) => DEFAULT_TOUCH_MIN_INTERVAL.min(idle / 4),
-            (None, None) => DEFAULT_TOUCH_MIN_INTERVAL,
+            Some(touch) => touch,
+            None => DEFAULT_TOUCH_MIN_INTERVAL.min(idle_timeout / 4),
         };
         Ok(Self {
             idle_timeout,
@@ -105,7 +109,7 @@ impl LivenessConfig {
 impl Default for LivenessConfig {
     fn default() -> Self {
         Self {
-            idle_timeout: None,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             touch_min_interval: DEFAULT_TOUCH_MIN_INTERVAL,
         }
     }
@@ -134,9 +138,10 @@ impl LivenessConfig {
             return LivenessVerdict::Active;
         };
         let idle = now.duration_since(last_active).unwrap_or(Duration::ZERO);
-        match self.idle_timeout {
-            Some(timeout) if idle > timeout => LivenessVerdict::Expired,
-            _ => LivenessVerdict::Active,
+        if idle > self.idle_timeout {
+            LivenessVerdict::Expired
+        } else {
+            LivenessVerdict::Active
         }
     }
 }
@@ -148,9 +153,9 @@ mod tests {
     const HOUR: Duration = Duration::from_hours(1);
     const DAY: Duration = Duration::from_hours(24);
 
-    fn config(idle_timeout: Option<Duration>) -> LivenessConfig {
+    fn config(idle_timeout: Duration) -> LivenessConfig {
         LivenessConfig::builder()
-            .maybe_idle_timeout(idle_timeout)
+            .idle_timeout(idle_timeout)
             .build()
             .unwrap()
     }
@@ -160,10 +165,7 @@ mod tests {
     #[test]
     fn missing_entry_is_fail_open_active() {
         let now = SystemTime::UNIX_EPOCH + DAY;
-        assert_eq!(
-            config(Some(HOUR)).verdict(None, now),
-            LivenessVerdict::Active
-        );
+        assert_eq!(config(HOUR).verdict(None, now), LivenessVerdict::Active);
     }
 
     #[test]
@@ -171,7 +173,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + DAY;
         let last_active = now - Duration::from_secs(60);
         assert_eq!(
-            config(Some(HOUR)).verdict(Some(last_active), now),
+            config(HOUR).verdict(Some(last_active), now),
             LivenessVerdict::Active
         );
     }
@@ -181,17 +183,8 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + DAY;
         let last_active = now - (HOUR + Duration::from_secs(1));
         assert_eq!(
-            config(Some(HOUR)).verdict(Some(last_active), now),
+            config(HOUR).verdict(Some(last_active), now),
             LivenessVerdict::Expired
-        );
-    }
-
-    #[test]
-    fn no_idle_timeout_never_expires() {
-        let now = SystemTime::UNIX_EPOCH + DAY;
-        assert_eq!(
-            config(None).verdict(Some(SystemTime::UNIX_EPOCH), now),
-            LivenessVerdict::Active
         );
     }
 
@@ -200,14 +193,23 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + DAY;
         let last_active = now + HOUR; // clock skew into the future
         assert_eq!(
-            config(Some(HOUR)).verdict(Some(last_active), now),
+            config(HOUR).verdict(Some(last_active), now),
             LivenessVerdict::Active
         );
     }
 
     #[test]
-    fn default_touch_min_interval_is_one_hour() {
-        assert_eq!(LivenessConfig::default().touch_min_interval, HOUR);
+    fn default_config_bounds_idle_at_thirty_days() {
+        let config = LivenessConfig::default();
+        assert_eq!(config.idle_timeout, DEFAULT_IDLE_TIMEOUT);
+        assert_eq!(config.touch_min_interval, HOUR);
+
+        // The default is a real bound, not a tracking-only mode.
+        let now = SystemTime::UNIX_EPOCH + DAY * 40;
+        assert_eq!(
+            config.verdict(Some(SystemTime::UNIX_EPOCH), now),
+            LivenessVerdict::Expired
+        );
     }
 
     // ── builder validation ────────────────────────────────────────────────
@@ -271,13 +273,13 @@ mod tests {
     }
 
     #[test]
-    fn builder_accepts_any_explicit_touch_without_idle_timeout() {
-        // No timeout to violate — a long interval only spaces out writes.
+    fn builder_accepts_explicit_touch_below_default_idle_timeout() {
         let config = LivenessConfig::builder()
             .touch_min_interval(DAY)
             .build()
             .unwrap();
         assert_eq!(config.touch_min_interval, DAY);
+        assert_eq!(config.idle_timeout, DEFAULT_IDLE_TIMEOUT);
     }
 
     #[test]

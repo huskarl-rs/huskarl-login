@@ -49,9 +49,11 @@ impl ActivityPolicy {
 pub enum SessionLifetime {
     /// The **authorization server** bounds the session: it lives exactly as
     /// long as the AS keeps honoring the refresh token (re-verified on every
-    /// token refresh), and this crate imposes no cap of its own. Provides no
-    /// re-authentication freshness, no cookie-theft containment, and no
-    /// storage TTL hint — see [the session
+    /// token refresh), and this crate imposes no cap of its own; storage
+    /// stays bounded by the activity horizon
+    /// ([`Session::storage_deadline`](crate::Session::storage_deadline)).
+    /// Provides no re-authentication freshness and no cookie-theft
+    /// containment — see [the session
     /// model](crate::_docs::explanation::session_model) for when to choose
     /// delegation and what to verify about the AS first.
     DelegatedToAuthorizationServer,
