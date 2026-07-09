@@ -705,6 +705,38 @@ fn headers_with_login_cookie(state: &str, value: &str) -> HeaderMap {
 #[case::sec_fetch_mode_overrides_accept(&[("sec-fetch-mode", "cors"), ("accept", "text/html")], false)]
 // Mode/Dest take precedence over Sec-Fetch-User: a non-navigation Mode wins.
 #[case::sec_fetch_mode_overrides_user(&[("sec-fetch-mode", "cors"), ("sec-fetch-user", "?1")], false)]
+// Frame loads send `mode=navigate` too — only `dest=document` is a real
+// top-level navigation.
+#[case::navigate_into_document(
+    &[("sec-fetch-mode", "navigate"), ("sec-fetch-dest", "document")],
+    true
+)]
+#[case::navigate_into_iframe(
+    &[("sec-fetch-mode", "navigate"), ("sec-fetch-dest", "iframe")],
+    false
+)]
+#[case::navigate_into_embed(
+    &[("sec-fetch-mode", "navigate"), ("sec-fetch-dest", "embed")],
+    false
+)]
+// Speculative loads are never navigations, whatever the fetch metadata says.
+#[case::sec_purpose_prefetch(
+    &[("sec-fetch-mode", "navigate"), ("sec-fetch-dest", "document"), ("sec-purpose", "prefetch")],
+    false
+)]
+#[case::sec_purpose_prerender(
+    &[
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+        ("sec-purpose", "prefetch;prerender")
+    ],
+    false
+)]
+#[case::legacy_purpose_prefetch(
+    &[("purpose", "prefetch"), ("accept", "text/html")],
+    false
+)]
+#[case::purpose_other_value_ignored(&[("purpose", "preview"), ("sec-fetch-mode", "navigate")], true)]
 fn is_navigation_request_cases(#[case] pairs: &[(&str, &str)], #[case] expected: bool) {
     assert_eq!(is_navigation_request(&headers(pairs)), expected);
 }
@@ -1297,7 +1329,7 @@ async fn refresh_success_persists_eagerly() {
     assert!(e.session_store.save_called());
     // The refresh response carried expires_in=3600 — expiry moved well past now.
     assert!(session.token_expiry() > SystemTime::now() + Duration::from_mins(30));
-    // The eager save's Set-Cookie headers ride back on the loaded result.
+    // The eager save's Set-Cookie headers come back on the loaded result.
     assert_eq!(
         set_cookies,
         vec![HeaderValue::from_static(MOCK_SAVE_COOKIE)]

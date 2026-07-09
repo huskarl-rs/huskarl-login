@@ -54,7 +54,7 @@ routinely need more than one chunk, prefer a
 ## Login-state cookie hygiene
 
 Each login start mints one login-state cookie, scoped to the callback path so
-it rides only on callback requests. Abandoned flows expire with the
+it is sent only on callback requests. Abandoned flows expire with the
 `login_state_ttl` `Max-Age`, and a **successful callback sweeps every pending
 login-state cookie** (not just its own flow's): the session now exists, so
 other pending flows are moot, and the sweep keeps flow bursts from piling
