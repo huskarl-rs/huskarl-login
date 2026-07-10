@@ -1024,14 +1024,14 @@ async fn callback_expired_login_state_returns_400_and_clears_cookie() {
 
 #[tokio::test]
 async fn callback_far_future_login_state_returns_400_and_clears_cookie() {
-    // A sealed `created_at` implausibly far ahead of the clock (beyond the 1m
+    // A sealed `created_at` implausibly far ahead of the clock (beyond the 5m
     // skew tolerance) means a backwards clock jump, not a fresh flow. Without
     // the far-future guard `elapsed_since` clamps to zero and the flow would
     // never expire; it must be rejected and the cookie cleared, symmetric with
     // the session teardown path.
     let e = engine(MockSessionStore::empty()).await;
     let state = "futurestate";
-    let created_at = SystemTime::now() + Duration::from_mins(5);
+    let created_at = SystemTime::now() + Duration::from_mins(10);
     let value = seal_login_cookie_at(state, "https://app.example.com/a", created_at).await;
     let h = headers_with_login_cookie(state, &value);
     let uri = format!("/callback?code=abc&state={state}").parse().unwrap();
@@ -2054,15 +2054,15 @@ async fn future_created_at_clears_session() {
 
 #[tokio::test]
 async fn skew_just_under_limit_is_tolerated() {
-    // created_at 55s in the future — just inside MAX_CLOCK_SKEW (60s), so the
-    // session is served, not torn down. Together with
+    // created_at 4m55s in the future — just inside MAX_CLOCK_SKEW (5min), so
+    // the session is served, not torn down. Together with
     // `skew_just_over_limit_clears_session` this brackets the threshold to a
     // few seconds, where `small_future_skew_is_tolerated` (10s) only proves
     // it is somewhere above 10s.
     let session = session_with(
         SystemTime::now() + Duration::from_hours(1),
         None,
-        SystemTime::now() + Duration::from_secs(55),
+        SystemTime::now() + Duration::from_secs(4 * 60 + 55),
     );
     let e = engine(MockSessionStore::with_session(session)).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
@@ -2072,12 +2072,12 @@ async fn skew_just_under_limit_is_tolerated() {
 
 #[tokio::test]
 async fn skew_just_over_limit_clears_session() {
-    // created_at 70s in the future — just past MAX_CLOCK_SKEW (60s), so the
-    // session is treated as clock-skew corrupted and cleared.
+    // created_at 5m10s in the future — just past MAX_CLOCK_SKEW (5min), so
+    // the session is treated as clock-skew corrupted and cleared.
     let session = session_with(
         SystemTime::now() + Duration::from_hours(1),
         None,
-        SystemTime::now() + Duration::from_secs(70),
+        SystemTime::now() + Duration::from_secs(5 * 60 + 10),
     );
     let e = engine(MockSessionStore::with_session(session)).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();

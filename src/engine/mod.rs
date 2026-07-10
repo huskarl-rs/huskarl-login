@@ -1112,10 +1112,18 @@ fn refresh_retry_delay(attempt: u32) -> Duration {
     base + Duration::from_millis(jitter_ms)
 }
 
-/// Maximum tolerated clock skew when validating session timestamps. A session
-/// whose `created_at` is further than this ahead of the wall clock is treated
-/// as corrupted and expired.
-const MAX_CLOCK_SKEW: Duration = Duration::from_mins(1);
+/// Maximum tolerated clock skew when validating sealed timestamps: a session
+/// or login-state `created_at` further than this ahead of the wall clock is
+/// treated as corrupted and rejected.
+///
+/// Within the tolerance the record is served as-is: a future `created_at`
+/// can only extend the absolute deadline (or the login-state TTL window) by
+/// the skew amount, and [`elapsed_since`] already clamps future timestamps
+/// to zero. The value is sized for real fleet incidents (one node with a
+/// stalled NTP daemon or a paused VM), where records minted on healthy nodes
+/// look future to the lagging one — rejecting them there would destroy valid
+/// sessions fleet-wide.
+const MAX_CLOCK_SKEW: Duration = Duration::from_mins(5);
 
 /// Returns `true` if `timestamp` is more than [`MAX_CLOCK_SKEW`] ahead of `now`.
 fn is_too_far_future(timestamp: SystemTime, now: SystemTime) -> bool {
