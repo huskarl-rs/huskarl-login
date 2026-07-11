@@ -1116,7 +1116,10 @@ mod tests {
 
         let result = store
             .try_update(key, |_| {
-                Err(SessionError::new(SessionErrorKind::Store, "app rule violated"))
+                Err(SessionError::new(
+                    SessionErrorKind::Store,
+                    "app rule violated",
+                ))
             })
             .await;
         // The closure's error comes back as-is (the session types here aren't

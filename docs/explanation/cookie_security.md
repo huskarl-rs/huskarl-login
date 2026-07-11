@@ -27,9 +27,13 @@ strongest prefix the deployment can honor.
 Sealed cookies bind context as AEAD associated data (AAD), so a ciphertext
 can't be lifted from one slot and replayed in another:
 
-- session cookies bind the cookie **name**, and
-- the login-state cookie binds the OAuth `state` value, tying it to one
-  in-flight authorization request.
+- session cookies bind the cookie **name** (`session:{name}` /
+  `session_ptr:{name}`), and
+- the login-state cookie binds the OAuth `state` value
+  (`login_state:{state}`), tying it to one in-flight authorization request.
+
+Each seal's AAD carries a distinct purpose prefix, so the domains stay
+separate by construction and one AEAD key can safely serve all of them.
 
 ## Chunking and the size budget
 

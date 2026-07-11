@@ -273,9 +273,7 @@ impl PersistFailurePolicy for DefaultPersistFailurePolicy {
     fn handle(&self, error: &SessionError) -> Option<LoginResponse> {
         let status = match error.kind() {
             SessionErrorKind::Conflict => StatusCode::CONFLICT,
-            SessionErrorKind::Crypto | SessionErrorKind::Store => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            SessionErrorKind::Crypto | SessionErrorKind::Store => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::SERVICE_UNAVAILABLE,
         };
         Some(LoginResponse::Rendered {
@@ -290,8 +288,8 @@ impl PersistFailurePolicy for DefaultPersistFailurePolicy {
 
 // ── Internal types ────────────────────────────────────────────────────────────
 
-/// Encrypted payload stored in the per-flow login-state cookie. The flow's
-/// `state` value is the AEAD associated data.
+/// Encrypted payload stored in the per-flow login-state cookie. The AEAD
+/// associated data is [`login_state_aad`] over the flow's `state` value.
 #[derive(Serialize, Deserialize)]
 struct LoginStateCookie {
     original_url: String,
@@ -306,6 +304,15 @@ struct LoginStateCookie {
 /// `#[serde(default)]` helper — see [`LoginStateCookie::created_at`].
 fn unix_epoch() -> SystemTime {
     SystemTime::UNIX_EPOCH
+}
+
+/// AEAD associated data for the login-state cookie: `"login_state:{state}"`.
+/// The `login_state:` prefix domain-separates this seal from the session
+/// seals (`"session:{name}"` / `"session_ptr:{name}"`) by construction, so a
+/// shared AEAD key can never confuse the two — independent of the state's
+/// charset.
+pub(super) fn login_state_aad(state: &str) -> Vec<u8> {
+    format!("login_state:{state}").into_bytes()
 }
 
 // ── LoginEngine ───────────────────────────────────────────────────────────────
