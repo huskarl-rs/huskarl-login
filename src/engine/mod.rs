@@ -256,8 +256,8 @@ impl TeardownReason {
 pub trait PersistFailurePolicy: MaybeSendSync + 'static {
     /// Decide what to do after a [`LoadedSession::ActivePending`] save failed.
     /// `Some(response)` replaces the handler's response; `None` lets it pass
-    /// through. `error` may downcast to [`SessionError`].
-    fn handle(&self, error: &(dyn std::error::Error + 'static)) -> Option<LoginResponse>;
+    /// through.
+    fn handle(&self, error: &SessionError) -> Option<LoginResponse>;
 }
 
 /// Default policy: fail closed when the refreshed-session save fails, replacing
@@ -270,10 +270,10 @@ pub trait PersistFailurePolicy: MaybeSendSync + 'static {
 pub struct DefaultPersistFailurePolicy;
 
 impl PersistFailurePolicy for DefaultPersistFailurePolicy {
-    fn handle(&self, error: &(dyn std::error::Error + 'static)) -> Option<LoginResponse> {
-        let status = match error.downcast_ref::<SessionError>().map(SessionError::kind) {
-            Some(SessionErrorKind::Conflict) => StatusCode::CONFLICT,
-            Some(SessionErrorKind::Crypto | SessionErrorKind::Store) => {
+    fn handle(&self, error: &SessionError) -> Option<LoginResponse> {
+        let status = match error.kind() {
+            SessionErrorKind::Conflict => StatusCode::CONFLICT,
+            SessionErrorKind::Crypto | SessionErrorKind::Store => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             _ => StatusCode::SERVICE_UNAVAILABLE,
