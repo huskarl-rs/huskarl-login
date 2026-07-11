@@ -281,8 +281,8 @@ impl<C: CookiePayload> CookieSessionStore<C> {
         session: &C,
         request_headers: &http::HeaderMap,
     ) -> Result<Vec<HeaderValue>, SessionError> {
-        let payload =
-            encode_payload(session).map_err(|e| SessionError::new(SessionErrorKind::Store, e))?;
+        let payload = encode_payload(session)
+            .map_err(|e| SessionError::new(SessionErrorKind::Encoding, e))?;
         let aad = self.sealer.aad("session");
         let bundle = self
             .sealer
@@ -299,7 +299,7 @@ impl<C: CookiePayload> CookieSessionStore<C> {
         // Max-Age. Failing the save surfaces the problem at login instead.
         if num_chunks > self.max_chunks {
             return Err(SessionError::new(
-                SessionErrorKind::Store,
+                SessionErrorKind::Encoding,
                 SessionTooLarge {
                     encoded_len: cookie_value.len(),
                     chunks: num_chunks,
@@ -333,7 +333,7 @@ impl<C: CookiePayload> CookieSessionStore<C> {
         attrs: &str,
     ) -> Result<HeaderValue, SessionError> {
         HeaderValue::from_str(&format!("{}.{i}={chunk}; {attrs}", self.sealer.cookie_name))
-            .map_err(|e| SessionError::new(SessionErrorKind::Store, e))
+            .map_err(|e| SessionError::new(SessionErrorKind::Encoding, e))
     }
 
     /// Appends `Max-Age=0` clears for every chunk slot the browser sent that
@@ -1170,7 +1170,7 @@ mod tests {
         // instead of emitting cookies that can trip request-header limits and
         // lock the client out.
         assert!(
-            matches!(&result, Err(e) if e.kind() == SessionErrorKind::Store
+            matches!(&result, Err(e) if e.kind() == SessionErrorKind::Encoding
                 && std::error::Error::source(e)
                     .is_some_and(|s| s.to_string().contains("max_chunks"))),
             "oversized session must fail the save with the budget in the message"

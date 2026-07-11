@@ -265,15 +265,17 @@ pub trait PersistFailurePolicy: MaybeSendSync + 'static {
 ///
 /// The replacement status is derived from a [`SessionError`]'s
 /// [`SessionErrorKind`]: [`Conflict`](SessionErrorKind::Conflict) → `409`,
-/// [`Crypto`](SessionErrorKind::Crypto)/[`Store`](SessionErrorKind::Store) →
-/// `500`, anything else → `503`.
+/// [`Crypto`](SessionErrorKind::Crypto)/[`Encoding`](SessionErrorKind::Encoding)/
+/// [`Store`](SessionErrorKind::Store) → `500`, anything else → `503`.
 pub struct DefaultPersistFailurePolicy;
 
 impl PersistFailurePolicy for DefaultPersistFailurePolicy {
     fn handle(&self, error: &SessionError) -> Option<LoginResponse> {
         let status = match error.kind() {
             SessionErrorKind::Conflict => StatusCode::CONFLICT,
-            SessionErrorKind::Crypto | SessionErrorKind::Store => StatusCode::INTERNAL_SERVER_ERROR,
+            SessionErrorKind::Crypto | SessionErrorKind::Encoding | SessionErrorKind::Store => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             _ => StatusCode::SERVICE_UNAVAILABLE,
         };
         Some(LoginResponse::Rendered {

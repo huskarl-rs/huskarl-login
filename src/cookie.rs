@@ -327,7 +327,7 @@ impl CookieSealer {
             Some(k) => format!("{name}={}; {}", encode_kid(k), self.cookie_attrs()),
             None => format!("{name}=; {}; Max-Age=0", self.base_cookie_attrs()),
         };
-        HeaderValue::from_str(&value).map_err(|e| SessionError::new(SessionErrorKind::Store, e))
+        HeaderValue::from_str(&value).map_err(|e| SessionError::new(SessionErrorKind::Encoding, e))
     }
 
     /// Records an encrypt event (active key id) if metrics are configured.

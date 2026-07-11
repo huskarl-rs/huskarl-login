@@ -40,6 +40,9 @@ pub enum SessionErrorKind {
     Gone,
     /// A cookie seal/unseal or other cryptographic operation failed.
     Crypto,
+    /// A value could not be encoded into its cookie or header representation
+    /// (serialization failure, invalid header bytes, or an oversized session).
+    Encoding,
     /// The store violated its contract (deserialize failure, invalid header, etc.).
     Store,
 }
@@ -115,6 +118,7 @@ impl fmt::Display for SessionErrorKind {
             Self::Conflict => "session update conflict",
             Self::Gone => "session no longer exists",
             Self::Crypto => "session cryptographic operation failed",
+            Self::Encoding => "session could not be encoded for cookies or headers",
             Self::Store => "session store failure",
         })
     }
