@@ -642,8 +642,9 @@ async fn logout_path_is_handled_when_configured() {
         .try_handle_login_route(&Method::POST, &HeaderMap::new(), &uri)
         .await
         .expect("configured /logout path must be claimed, not fall through");
-    // No session present is not an error for logout: it still redirects.
-    assert_eq!(resp.status(), StatusCode::FOUND);
+    // No session present is not an error for logout: it still redirects
+    // (303: logout is a POST, See Other pins the follow-up to GET).
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
 }
 
 #[tokio::test]
@@ -673,7 +674,7 @@ async fn logout_accepts_post() {
         .try_handle_login_route(&Method::POST, &HeaderMap::new(), &uri)
         .await
         .expect("logout handles POST");
-    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
 }
 
 #[tokio::test]
@@ -1505,7 +1506,7 @@ async fn logout_without_session_redirects_to_base_url() {
         .try_handle_login_route(&Method::POST, &HeaderMap::new(), &uri)
         .await
         .expect("logout handled");
-    assert_eq!(r.status(), StatusCode::FOUND);
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
     let hdrs = r.headers();
     let loc = hdrs
         .iter()
@@ -1672,7 +1673,7 @@ async fn logout_allows_same_origin_request() {
         .try_handle_login_route(&Method::POST, &h, &uri)
         .await
         .expect("logout handled");
-    assert_eq!(r.status(), StatusCode::FOUND);
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
     assert!(e.session_store.delete_called());
 }
 

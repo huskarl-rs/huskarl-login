@@ -49,7 +49,11 @@ where
                 .await;
         }
 
+        // 303, not 302: logout is a POST, and See Other pins the follow-up
+        // request to GET (302 leaves the method to the client's discretion —
+        // browsers switch to GET, other clients may re-POST).
         LoginResponse::Redirect {
+            status: StatusCode::SEE_OTHER,
             location,
             set_cookies,
         }

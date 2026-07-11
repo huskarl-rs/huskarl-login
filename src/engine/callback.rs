@@ -139,6 +139,7 @@ where
     /// A plain `302 Found` to the configured `base_url`.
     fn redirect_to_base_url(&self) -> LoginResponse {
         LoginResponse::Redirect {
+            status: StatusCode::FOUND,
             location: HeaderValue::from_str(&base_url_as_string(&self.config))
                 .unwrap_or_else(|_| HeaderValue::from_static("/")),
             set_cookies: vec![],
@@ -192,6 +193,7 @@ where
         }
         set_cookies.extend(session_cookies);
         LoginResponse::Redirect {
+            status: StatusCode::FOUND,
             location,
             set_cookies,
         }
