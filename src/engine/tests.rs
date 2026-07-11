@@ -1266,6 +1266,37 @@ fn token_response_fixture() -> huskarl::grant::core::TokenResponse {
         .unwrap()
 }
 
+// ── DefaultPersistFailurePolicy ───────────────────────────────────────────
+
+#[test]
+fn default_persist_failure_policy_maps_kinds_and_is_no_store() {
+    use super::PersistFailurePolicy as _;
+    use crate::DefaultPersistFailurePolicy;
+    let policy = DefaultPersistFailurePolicy;
+    for (kind, expected) in [
+        (SessionErrorKind::Conflict, StatusCode::CONFLICT),
+        (SessionErrorKind::Crypto, StatusCode::INTERNAL_SERVER_ERROR),
+        (SessionErrorKind::Store, StatusCode::INTERNAL_SERVER_ERROR),
+        (
+            SessionErrorKind::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (SessionErrorKind::Gone, StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let err = SessionError::from(kind);
+        let resp = policy
+            .handle(&err)
+            .expect("default policy replaces the response");
+        assert_eq!(resp.status(), expected, "kind {kind:?}");
+        // Session-adjacent responses are never cacheable.
+        let no_store = resp
+            .headers()
+            .iter()
+            .any(|(n, v)| *n == http::header::CACHE_CONTROL && v.as_bytes() == b"no-store");
+        assert!(no_store, "persist-failure response must be no-store");
+    }
+}
+
 // ── Callback handler ──────────────────────────────────────────────────────
 
 async fn callback_status(path_and_query: &str, request_headers: &HeaderMap) -> StatusCode {
