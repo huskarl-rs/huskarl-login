@@ -61,7 +61,8 @@ pub trait ExternalSessionStore: MaybeSendSync {
 
     /// Save a session unconditionally (last-writer-wins), advancing the stored
     /// [`version`](PersistedSessionState::version). Set the record's TTL to the
-    /// deployment's `max_lifetime`.
+    /// deployment's [`SessionLifetime::Bounded`](crate::SessionLifetime) cap,
+    /// when one is configured.
     fn save(
         &self,
         session: &Self::SessionType,
@@ -194,7 +195,9 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         cookie_name: CookieName,
         /// Cookie `Path` scope.
         cookie_path: RoutePath,
-        /// Cookie `Max-Age`; defaults to 400 days. Pass `max_lifetime` when set.
+        /// Cookie `Max-Age`; defaults to 400 days. The engine clamps it to the
+        /// [`SessionLifetime::Bounded`](crate::SessionLifetime) cap at
+        /// construction; set it explicitly only to go *shorter*.
         #[builder(default = DEFAULT_COOKIE_MAX_AGE)]
         max_age: Duration,
         /// Optional metrics observer for encrypt/decrypt events.
@@ -495,8 +498,11 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
     type SessionType = E::SessionType;
     type LoadError = E::Error;
 
-    fn apply_cookie_secure(&mut self, secure: bool) {
+    fn apply_session_policy(&mut self, secure: bool, max_lifetime: Option<std::time::Duration>) {
         self.sealer.apply_secure(secure);
+        if let Some(cap) = max_lifetime {
+            self.sealer.clamp_max_age(cap);
+        }
     }
 
     fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
@@ -573,7 +579,8 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
         let key = session.persisted().session_key;
         // Fail open: a read failure must not tear the session down (and leaves
         // us without a timestamp to throttle against, so we skip the write).
-        // Idle enforcement degrades to `max_lifetime` until the store recovers.
+        // Idle enforcement degrades to the absolute lifetime bound (crate- or
+        // AS-side) until the store recovers.
         let last_active = match liveness.last_active(key).await {
             Ok(last_active) => last_active,
             Err(e) => {

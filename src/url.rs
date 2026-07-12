@@ -112,11 +112,13 @@ pub fn default_post_logout_redirect(config: &LoginConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SessionLifetime;
 
     fn make_config_with_base(base_url: &str) -> LoginConfig {
         LoginConfig::builder()
             .callback_path("/callback".into())
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url(base_url.parse().unwrap())
             .build()
             .unwrap()
@@ -126,6 +128,7 @@ mod tests {
         LoginConfig::builder()
             .callback_path(format!("{strip}/callback"))
             .scopes(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url(base_url.parse().unwrap())
             .strip_prefix(strip)
             .build()

@@ -226,7 +226,8 @@ impl<S> std::fmt::Debug for LoadedSession<S> {
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
 pub enum TeardownReason {
-    /// [`LoginConfig::max_lifetime`](crate::LoginConfig::max_lifetime) exceeded.
+    /// The [`SessionLifetime::Bounded`](crate::SessionLifetime::Bounded) cap
+    /// exceeded.
     MaxLifetime,
     /// Idle timeout exceeded (server-side liveness verdict
     /// [`crate::LivenessVerdict::Expired`]).
@@ -360,11 +361,12 @@ where
         /// Optional metrics observer for login-flow events.
         metrics: Option<Arc<dyn LoginEngineMetrics>>,
     ) -> Self {
-        // Single source of truth for cookie security: stamp the store with the
-        // value derived from `base_url`, so session cookies and login-state
-        // cookies share one `secure`/`__Host-` policy.
+        // Single source of truth for cookie security and session lifetime:
+        // stamp the store with the values derived from `base_url` and the
+        // `session_lifetime` bound, so session cookies share one
+        // `secure`/`__Host-` policy and no cookie outlives the session cap.
         let mut session_store = session_store;
-        session_store.apply_cookie_secure(config.secure);
+        session_store.apply_session_policy(config.secure, config.session_lifetime.bound());
         Self {
             config,
             grant,
@@ -465,10 +467,12 @@ where
         let record_activity = self.config.activity_policy.counts_as_activity(headers);
         // Absolute deadline handed to the liveness store so its entry expires
         // exactly when the session can no longer be valid (never on a sliding
-        // idle TTL, which would break fail-open).
+        // idle TTL, which would break fail-open). `None` under a delegated
+        // session lifetime — the AS's bound is not observable here.
         let expire_at = self
             .config
-            .max_lifetime
+            .session_lifetime
+            .bound()
             .map(|max| session.created_at() + max);
         if self
             .session_store
@@ -537,7 +541,7 @@ where
             log::warn!("session timestamps are too far in the future — treating as expired");
             return Some(TeardownReason::ClockSkew);
         }
-        if let Some(max_lifetime) = self.config.max_lifetime
+        if let Some(max_lifetime) = self.config.session_lifetime.bound()
             && elapsed_since(session.created_at(), now) > max_lifetime
         {
             return Some(TeardownReason::MaxLifetime);

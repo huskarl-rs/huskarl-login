@@ -55,6 +55,7 @@ mod test_support;
 pub use completed_login::CompletedLogin;
 pub use config::{
     ActivityPolicy, ConfigError, InvalidRoutePath, LoginConfig, LogoutConfig, RoutePath,
+    SessionLifetime,
 };
 pub use cookie::{CookieName, InvalidCookieName};
 pub use cookie_session::{

@@ -24,7 +24,11 @@ Each record carries a [`version`](crate::PersistedSessionState):
   and returning [`SaveOutcome::Conflict`](crate::SaveOutcome) otherwise. Version
   is compared by **equality only** — a column-based `version + 1` and a
   body-persisted version both work as long as a matched swap ends one higher.
-- Set each record's TTL to your deployment's `max_lifetime`.
+- Set each record's TTL to your deployment's
+  [`SessionLifetime::Bounded`](crate::SessionLifetime) cap. Under a
+  [delegated](crate::SessionLifetime::DelegatedToAuthorizationServer) lifetime
+  there is no TTL hint — plan your own garbage collection for abandoned
+  records.
 
 A complete in-memory implementation:
 

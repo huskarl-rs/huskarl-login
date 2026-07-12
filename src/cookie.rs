@@ -295,6 +295,17 @@ impl CookieSealer {
         format!("{purpose}:{}", self.cookie_name).into_bytes()
     }
 
+    /// Clamps the cookie `Max-Age` to `limit` (the deployment's
+    /// `SessionLifetime::Bounded` cap), so the browser discards the cookie
+    /// once the session can no longer be valid. Only ever lowers the
+    /// configured value; a
+    /// shorter configured `max_age` is kept. `Max-Age` counts from each
+    /// `Set-Cookie` write, so this is a hygiene bound — expiry enforcement
+    /// stays server-side, from `created_at`.
+    pub(crate) fn clamp_max_age(&mut self, limit: Duration) {
+        self.max_age = self.max_age.min(limit);
+    }
+
     /// Re-derives `cookie_name` for the deployment's real `secure` flag.
     pub(crate) fn apply_secure(&mut self, secure: bool) {
         self.secure = secure;
