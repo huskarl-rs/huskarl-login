@@ -85,7 +85,7 @@ Two contract points, both covered in depth elsewhere:
   session; the guard logs an error if it happens. The one legitimate
   non-delivery — the response is already gone — is spelled
   [`discard`](crate::engine::SetCookies::discard).
-- **`Cache-Control: no-store` is part of delivery.** The engine marks its own
+- **`Cache-Control: no-store` goes out with the cookies.** The engine marks its own
   responses; cookies attached to the *inner handler's* response are the
   adapter's responsibility — see the
   [response-caching guide](crate::_docs::guide::caching).
@@ -240,6 +240,34 @@ only arises when an eager persist fails — which is why
 [`PendingPersist::new`](crate::engine::PendingPersist::new) is public: adapter
 tests can fabricate the deferred-persist path without arranging a failing
 store.
+
+## Speculative loads and frames
+
+The 302-versus-401 choice in
+[`redirect_to_login`](crate::engine::LoginEngine::redirect_to_login) is made
+by [`is_navigation_request`](crate::engine::is_navigation_request), and two kinds
+of request that look like navigations are deliberately classified out:
+
+- **Frame loads.** An `<iframe>` navigation sends `Sec-Fetch-Mode: navigate`
+  too; only `Sec-Fetch-Dest: document` is a top-level navigation. An
+  unauthenticated frame therefore gets the 401, not a redirect into an
+  authorization server that will typically refuse framing anyway.
+- **Prefetch and prerender.** Requests carrying `Sec-Purpose` (or the legacy
+  `Purpose: prefetch`) are speculative — the user may never look at the
+  result — so the engine starts no login flow and mints no login-state cookie.
+
+Rejection is how these protocols are meant to be used: a non-2xx response
+makes the browser discard the prefetch or cancel the prerender, and the user's
+real click performs a fresh navigation that takes the normal login redirect.
+Each rejection is still one wasted request, though, and only the application
+can prevent that — there is no response header that forbids future prefetches.
+Same-site prefetching of protected pages is almost always app-authored
+(`<link rel="prefetch">`, speculation rules, framework link components that
+prefetch by default, like Next.js `<Link>`), so exclude the authenticated area
+from those hints — `prefetch={false}`, or a speculation-rules `where` clause
+such as `{ "not": { "href_matches": "/app/*" } }`. The exception is Chrome's
+address-bar prerendering, which has no server-side opt-out; the `Sec-Purpose`
+rejection is the backstop there.
 
 ## Serving the session on public routes
 

@@ -1122,6 +1122,8 @@ static SEC_FETCH_USER: LazyLock<HeaderName> =
     LazyLock::new(|| HeaderName::from_static("sec-fetch-user"));
 static X_REQUESTED_WITH: LazyLock<HeaderName> =
     LazyLock::new(|| HeaderName::from_static("x-requested-with"));
+static SEC_PURPOSE: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_static("sec-purpose"));
+static PURPOSE: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_static("purpose"));
 
 /// Returns `true` for a CORS preflight (`OPTIONS` + `Access-Control-Request-Method`).
 pub fn is_cors_preflight(method: &Method, headers: &HeaderMap) -> bool {
@@ -1131,6 +1133,9 @@ pub fn is_cors_preflight(method: &Method, headers: &HeaderMap) -> bool {
 /// Returns `true` if this looks like a top-level browser navigation, using
 /// fetch-metadata headers (`Sec-Fetch-Mode`/`-Dest`/`-User`,
 /// `X-Requested-With`) with an `Accept: text/html` fallback for older clients.
+/// Frame loads (`Sec-Fetch-Dest: iframe` etc.) and speculative
+/// prefetch/prerender loads (`Sec-Purpose`) are not navigations — see
+/// [the adapter guide](crate::_docs::guide::adapter#speculative-loads-and-frames).
 pub fn is_navigation_request(headers: &HeaderMap) -> bool {
     // Classic XHR signal — never a top-level navigation.
     if headers
@@ -1140,9 +1145,26 @@ pub fn is_navigation_request(headers: &HeaderMap) -> bool {
         return false;
     }
 
+    // Speculative prefetch/prerender — the user may never look at the result,
+    // so don't start a login flow for it. `Sec-Purpose` is only ever sent on
+    // such loads (`prefetch`, `prefetch;prerender`, ...); `Purpose: prefetch`
+    // is the legacy spelling still sent by Chrome and Safari.
+    if headers.contains_key(&*SEC_PURPOSE)
+        || headers
+            .get(&*PURPOSE)
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"prefetch"))
+    {
+        return false;
+    }
+
     // Fetch Metadata (all modern browsers send both).
     if let Some(mode) = headers.get(&*SEC_FETCH_MODE) {
-        return mode.as_bytes() == b"navigate";
+        // Iframe/embed loads also send `mode=navigate`; when the browser also
+        // says where the response lands, require a top-level document.
+        return mode.as_bytes() == b"navigate"
+            && headers
+                .get(&*SEC_FETCH_DEST)
+                .is_none_or(|dest| dest.as_bytes() == b"document");
     }
     if let Some(dest) = headers.get(&*SEC_FETCH_DEST) {
         return dest.as_bytes() == b"document";

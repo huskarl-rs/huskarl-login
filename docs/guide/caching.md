@@ -13,8 +13,8 @@ authorization server, error pages, the callback and logout responses —
 
 ## What the adapter must guarantee
 
-Some session `Set-Cookie` values reach the client on the **inner handler's**
-response, whose caching the engine does not control:
+Some session `Set-Cookie` values go out on the **inner handler's** response, whose
+caching the engine does not control:
 
 - the re-sealed session cookies on an
   [`Active`](crate::engine::LoadedSession::Active) result after an eager token
