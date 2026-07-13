@@ -58,8 +58,13 @@ pub enum SessionLifetime {
     /// This crate bounds the session: it is torn down this long after login
     /// ([`MaxLifetime`](crate::TeardownReason::MaxLifetime)), regardless of
     /// activity or AS policy. Must be non-zero. The only crate-side lifetime
-    /// bound for cookie sessions, and the TTL handed to external-store
-    /// records and liveness entries.
+    /// bound for cookie sessions.
+    ///
+    /// The deadline is frozen into each session at login
+    /// ([`SessionState::expire_at`](crate::SessionState)), making cap changes
+    /// one-directional for existing sessions: lowering applies immediately,
+    /// raising reaches new logins only — see [the session
+    /// model](crate::_docs::explanation::session_model).
     Bounded(Duration),
 }
 

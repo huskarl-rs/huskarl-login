@@ -108,6 +108,11 @@ pub struct CookieSessionStore<C = CookieSession> {
     enricher: Box<dyn SessionEnricher<SessionState, C>>,
     /// Chunk budget enforced on save — see the builder's `max_chunks`.
     max_chunks: usize,
+    /// The [`SessionLifetime::Bounded`](crate::SessionLifetime) cap, stamped
+    /// by the engine at construction; frozen into each new session's
+    /// [`SessionState::expire_at`] at login. `None` until stamped (or when
+    /// the lifetime is delegated).
+    max_lifetime: Option<Duration>,
 }
 
 #[bon::bon]
@@ -150,6 +155,7 @@ impl<C> CookieSessionStore<C> {
             sealer: CookieSealer::new(cipher, cookie_name, cookie_path, max_age, metrics),
             enricher,
             max_chunks: max_chunks.max(1),
+            max_lifetime: None,
         }
     }
 }
@@ -394,6 +400,8 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
         if let Some(max) = max_lifetime {
             self.sealer.clamp_max_age(max);
         }
+        // Retained to freeze `SessionState::expire_at` into new sessions.
+        self.max_lifetime = max_lifetime;
     }
 
     fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
@@ -406,7 +414,7 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
         default_lifetime: std::time::Duration,
         headers: &http::HeaderMap,
     ) -> Result<(C, Vec<HeaderValue>), SessionError> {
-        let state = SessionState::from_completed(&completed, default_lifetime);
+        let state = SessionState::from_completed(&completed, default_lifetime, self.max_lifetime);
         let session = self.enricher.build_session(state, &completed).await?;
         let cookies = self.save_session(&session, headers).await?;
         Ok((session, cookies))
@@ -1011,6 +1019,27 @@ mod tests {
             secs(loaded.state().created_at),
             secs(original_state.created_at)
         );
+    }
+
+    #[tokio::test]
+    async fn save_then_load_roundtrips_frozen_expire_at() {
+        let store = test_store().await;
+        let mut state = test_state();
+        let deadline = state.created_at + Duration::from_hours(8);
+        state.expire_at = Some(deadline);
+
+        let set_cookies = store
+            .save_session(&CookieSession(state), &HeaderMap::new())
+            .await
+            .unwrap();
+        let req_headers = request_cookies_from_set_cookies(&set_cookies);
+        let loaded = store
+            .load_session(&req_headers)
+            .await
+            .expect("session loads");
+
+        let secs = |t: SystemTime| t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(loaded.state().expire_at.map(secs), Some(secs(deadline)));
     }
 
     // ── SessionEnricher / CookiePayload ───────────────────────────────────

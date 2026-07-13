@@ -469,11 +469,7 @@ where
         // exactly when the session can no longer be valid (never on a sliding
         // idle TTL, which would break fail-open). `None` under a delegated
         // session lifetime — the AS's bound is not observable here.
-        let expire_at = self
-            .config
-            .session_lifetime
-            .bound()
-            .map(|max| session.created_at() + max);
+        let expire_at = self.session_deadline(&session);
         if self
             .session_store
             .check_liveness(&session, now, record_activity, expire_at)
@@ -529,6 +525,24 @@ where
         }
     }
 
+    /// The session's effective absolute deadline: the earlier of the deadline
+    /// frozen into the session at login ([`Session::expire_at`]) and the one
+    /// the live config implies (`created_at` + the current
+    /// [`SessionLifetime::Bounded`](crate::SessionLifetime) cap). The minimum
+    /// is what makes cap changes one-directional for existing sessions — see
+    /// [`Bounded`](crate::SessionLifetime::Bounded).
+    fn session_deadline(&self, session: &SD::SessionType) -> Option<SystemTime> {
+        let configured = self
+            .config
+            .session_lifetime
+            .bound()
+            .map(|max| session.created_at() + max);
+        match (session.expire_at(), configured) {
+            (Some(frozen), Some(configured)) => Some(frozen.min(configured)),
+            (frozen, configured) => frozen.or(configured),
+        }
+    }
+
     /// Returns the teardown reason from the absolute checks (clock skew, max
     /// lifetime), or `None`. Idle timeout is enforced separately via
     /// [`SessionDriver::check_liveness`].
@@ -541,8 +555,8 @@ where
             log::warn!("session timestamps are too far in the future — treating as expired");
             return Some(TeardownReason::ClockSkew);
         }
-        if let Some(max_lifetime) = self.config.session_lifetime.bound()
-            && elapsed_since(session.created_at(), now) > max_lifetime
+        if let Some(deadline) = self.session_deadline(session)
+            && now > deadline
         {
             return Some(TeardownReason::MaxLifetime);
         }

@@ -372,9 +372,12 @@ impl SessionDriver for MockSessionStore {
         default_lifetime: Duration,
         _: &HeaderMap,
     ) -> Result<(MockSession, Vec<HeaderValue>), SessionError> {
+        // Honor the stamped policy like the real stores: freeze `expire_at`
+        // from the max_lifetime the engine applied at construction.
+        let max_lifetime = self.applied_policy().and_then(|(_, max)| max);
         Ok((
             MockSession {
-                state: SessionState::from_completed(&completed, default_lifetime),
+                state: SessionState::from_completed(&completed, default_lifetime, max_lifetime),
             },
             vec![],
         ))
@@ -948,6 +951,73 @@ async fn max_lifetime_expired_clears_session() {
     let (reason, _) = expect_cleared(loaded);
     assert_eq!(reason, TeardownReason::MaxLifetime);
     assert!(e.session_store.delete_called());
+}
+
+#[tokio::test]
+async fn frozen_expire_at_is_enforced_over_a_raised_lifetime() {
+    // The session was created under a 1h cap (expire_at frozen at login) and
+    // that hour has passed. The config has since been raised to 24h — but the
+    // session's cookies and store records were stamped with the old deadline,
+    // so the engine honors the frozen (tighter) one and tears down.
+    let created_at = SystemTime::now() - Duration::from_secs(7200);
+    let mut session = session_with(
+        SystemTime::now() + Duration::from_hours(1),
+        None,
+        created_at,
+    );
+    session.state.expire_at = Some(created_at + Duration::from_hours(1));
+    let config = LoginConfig::builder()
+        .callback_path("/callback".to_owned())
+        .scopes(vec![])
+        .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(24)))
+        .base_url("https://app.example.com".parse().unwrap())
+        .build()
+        .unwrap();
+    let e = engine_with_config(MockSessionStore::with_session(session), config).await;
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    let (reason, _) = expect_cleared(loaded);
+    assert_eq!(reason, TeardownReason::MaxLifetime);
+}
+
+#[tokio::test]
+async fn lowered_lifetime_applies_to_sessions_with_a_longer_frozen_deadline() {
+    // Tightening is the security direction: the live config wins over a
+    // frozen deadline that would keep the session alive for another day.
+    let created_at = SystemTime::now() - Duration::from_secs(7200);
+    let mut session = session_with(
+        SystemTime::now() + Duration::from_hours(1),
+        None,
+        created_at,
+    );
+    session.state.expire_at = Some(created_at + Duration::from_hours(48));
+    let config = LoginConfig::builder()
+        .callback_path("/callback".to_owned())
+        .scopes(vec![])
+        .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(1)))
+        .base_url("https://app.example.com".parse().unwrap())
+        .build()
+        .unwrap();
+    let e = engine_with_config(MockSessionStore::with_session(session), config).await;
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    let (reason, _) = expect_cleared(loaded);
+    assert_eq!(reason, TeardownReason::MaxLifetime);
+}
+
+#[tokio::test]
+async fn frozen_expire_at_is_enforced_under_a_delegated_config() {
+    // Switching the config to delegated does not resurrect sessions created
+    // under a bounded lifetime — their frozen deadline still applies.
+    let created_at = SystemTime::now() - Duration::from_secs(7200);
+    let mut session = session_with(
+        SystemTime::now() + Duration::from_hours(1),
+        None,
+        created_at,
+    );
+    session.state.expire_at = Some(created_at + Duration::from_hours(1));
+    let e = engine(MockSessionStore::with_session(session)).await; // delegated config
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    let (reason, _) = expect_cleared(loaded);
+    assert_eq!(reason, TeardownReason::MaxLifetime);
 }
 
 #[tokio::test]

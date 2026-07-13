@@ -78,10 +78,19 @@ What delegation does **not** provide:
 ### Bounding in this crate
 
 [`Bounded`](crate::SessionLifetime::Bounded) tears the session down a fixed
-duration after login, regardless of activity or AS policy. The cap also
-bounds storage: it becomes the TTL handed to external-store records and
-liveness entries, and the engine clamps the session cookie's `Max-Age` to it
-so the browser discards a cookie that can no longer be valid.
+duration after login, regardless of activity or AS policy. The deadline is
+frozen into each session at login
+([`SessionState::expire_at`](crate::SessionState)); cookie `Max-Age`,
+external-store record TTLs, and liveness-entry TTLs all derive from that one
+stored value, so the configured lifetime lives in exactly one place.
+
+Freezing makes changing the cap one-directional for existing sessions. The
+engine enforces the tighter of the frozen and configured deadlines, so
+lowering the cap — the security direction — applies to them immediately.
+Raising it cannot extend sessions already issued: their cookies and store
+records were stamped with the old deadline and would be discarded under it
+regardless of what the engine now accepts. Current users therefore log out
+once at the old cap and get the new one on their next login.
 
 Both variants bound the *absolute* lifetime; idle timeout is separate,
 configured on the liveness store — see

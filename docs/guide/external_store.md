@@ -24,11 +24,34 @@ Each record carries a [`version`](crate::PersistedSessionState):
   and returning [`SaveOutcome::Conflict`](crate::SaveOutcome) otherwise. Version
   is compared by **equality only** — a column-based `version + 1` and a
   body-persisted version both work as long as a matched swap ends one higher.
-- Set each record's TTL to your deployment's
-  [`SessionLifetime::Bounded`](crate::SessionLifetime) cap. Under a
-  [delegated](crate::SessionLifetime::DelegatedToAuthorizationServer) lifetime
-  there is no TTL hint — plan your own garbage collection for abandoned
-  records.
+
+## TTL contract
+
+The record's deadline is stored on the session itself:
+[`Session::expire_at`](crate::Session::expire_at) is **frozen at login**
+(`created_at` plus the [`SessionLifetime::Bounded`](crate::SessionLifetime)
+cap in force at the time), computed by the framework so you never repeat the
+configured lifetime in your store. Retain the record until **at least** that
+instant. The TTL is garbage collection, not enforcement — the engine checks
+the deadline on every load — so deleting early logs a user out while deleting
+late only costs storage. Err late:
+
+- `expire_at` is measured on the application's clock, so a backend expiring
+  exactly at it by its own clock can already be early — retaining until "at
+  least" that instant requires a margin covering the clock skew between the
+  two. Rounding up further is free.
+- Re-apply the TTL on **every** write — backends like Redis drop a key's TTL
+  on a plain overwrite.
+- Never use a sliding window: one shorter than the remaining lifetime deletes
+  an idle-but-valid record out from under its user.
+- On backends whose TTLs are relative (Cassandra, etcd leases), compute
+  `expire_at − now` at write time and clamp up to a small positive value
+  rather than deleting.
+
+Under a
+[delegated](crate::SessionLifetime::DelegatedToAuthorizationServer) lifetime
+`expire_at` is `None` — there is no deadline to retain until, so plan your own
+garbage collection for abandoned records.
 
 A complete in-memory implementation:
 
@@ -72,6 +95,8 @@ impl ExternalSessionStore for InMemoryStore {
     type SessionType = MySession;
     type Error = Infallible;
 
+    // A real backend retains each record until at least `session.expire_at()`
+    // (see "TTL contract" above); this in-memory demo skips it.
     async fn insert(&self, session: &MySession) -> Result<(), Infallible> {
         let key = session.persisted().session_key;
         self.rows.lock().unwrap().insert(key, (session.clone(), 0));
