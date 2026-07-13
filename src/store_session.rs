@@ -39,8 +39,10 @@ use crate::{
 /// [`SessionEnricher`](crate::SessionEnricher) attached to the store, not here.
 pub trait ExternalSessionStore: MaybeSendSync {
     /// The session type returned by this store. Must implement [`Session`] and
-    /// [`PersistedSession`].
-    type SessionType: Session + PersistedSession + MaybeSendSync + 'static;
+    /// [`PersistedSession`]. `Clone` because
+    /// [`PendingPersist::commit`](crate::engine::PendingPersist::commit)
+    /// persists from a clone.
+    type SessionType: Session + PersistedSession + Clone + MaybeSendSync + 'static;
 
     /// The backend's own error type (e.g. `sqlx::Error`); transport-failure
     /// channel only. Boxed into

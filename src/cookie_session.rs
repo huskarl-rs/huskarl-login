@@ -53,13 +53,17 @@ struct SessionTooLarge {
 
 /// A [`Session`] that round-trips through serde, sealable into the session
 /// cookie. Blanket-implemented; build custom payloads via a [`SessionEnricher`].
+///
+/// `Clone` because
+/// [`PendingPersist::commit`](crate::engine::PendingPersist::commit) persists
+/// from a clone.
 pub trait CookiePayload:
-    Session + Serialize + for<'de> Deserialize<'de> + MaybeSendSync + 'static
+    Session + Clone + Serialize + for<'de> Deserialize<'de> + MaybeSendSync + 'static
 {
 }
 
-impl<T: Session + Serialize + for<'de> Deserialize<'de> + MaybeSendSync + 'static> CookiePayload
-    for T
+impl<T: Session + Clone + Serialize + for<'de> Deserialize<'de> + MaybeSendSync + 'static>
+    CookiePayload for T
 {
 }
 
@@ -1046,7 +1050,7 @@ mod tests {
 
     /// An enrichment-built session type: `email` is required, so there is no
     /// `From<SessionState>` and it must be built by an enricher.
-    #[derive(Serialize, Deserialize)]
+    #[derive(Clone, Serialize, Deserialize)]
     struct EnrichedSession {
         state: SessionState,
         email: String,

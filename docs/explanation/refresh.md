@@ -48,7 +48,7 @@ a dropped clear keeps re-presenting a dead session.
 
 Rust cannot flag a `LoadedSession::Active { session, .. }` pattern that
 discards the cookies at compile time, so the engine hands them out wrapped in
-[`SetCookies`](crate::SetCookies) — a drop guard that logs an error when a
+[`SetCookies`](crate::engine::SetCookies) — a drop guard that logs an error when a
 non-empty value is dropped without being consumed into a response.
 
 ## Transient vs conclusive failure

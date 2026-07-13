@@ -116,7 +116,7 @@ mod tests {
 
     fn make_config_with_base(base_url: &str) -> LoginConfig {
         LoginConfig::builder()
-            .callback_path("/callback".into())
+            .callback_path("/callback")
             .scopes(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url(base_url.parse().unwrap())

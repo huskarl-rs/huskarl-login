@@ -8,6 +8,9 @@ recipes below go from least to most involved. All use
 [`StoreBackedSessionStore`](crate::StoreBackedSessionStore) only the seed type
 changes (to [`PersistedSessionState`](crate::PersistedSessionState)).
 
+Whatever the recipe, the session type must be `Clone` (derive it) —
+[`PendingPersist::commit`](crate::engine::PendingPersist::commit) explains why.
+
 ## 1. No claims, no I/O — `build()`
 
 If the session type implements `From<Seed>`, finish the builder with `build()`
