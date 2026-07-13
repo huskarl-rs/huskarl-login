@@ -140,16 +140,75 @@ pub trait Session {
     }
 
     /// Absolute session deadline fixed at login, if the deployment bounded
-    /// it — see [`SessionState::expire_at`]. External stores retain the
-    /// record until at least this instant; the engine enforces it alongside
-    /// the live config.
+    /// it — see [`SessionState::expire_at`]. The engine enforces it alongside
+    /// the live config; storage deadlines derive from it via
+    /// [`storage_deadline`](Self::storage_deadline).
     fn expire_at(&self) -> Option<SystemTime> {
         self.state().expire_at
+    }
+
+    /// Absolute storage deadline for a record written at `now`: the sooner of
+    /// [`expire_at`](Self::expire_at) and the activity horizon
+    /// `max(now, token_expiry) + idle_timeout`. External stores apply this as
+    /// the record TTL on every write, with the
+    /// [`idle_timeout`](crate::LivenessConfig::idle_timeout) they configured —
+    /// see the [external store guide](crate::_docs::guide::external_store).
+    fn storage_deadline(&self, now: SystemTime, idle_timeout: Duration) -> SystemTime {
+        let horizon = self.token_expiry().max(now) + idle_timeout;
+        self.expire_at().map_or(horizon, |e| e.min(horizon))
     }
 
     /// Apply tokens from a refresh response via [`SessionState::refreshed`].
     fn apply_refresh(&mut self, token_response: &TokenResponse, default_lifetime: Duration) {
         let new_state = self.state().refreshed(token_response, default_lifetime);
         self.set_state(new_state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    const HOUR: Duration = Duration::from_hours(1);
+    const DAY: Duration = Duration::from_hours(24);
+
+    struct S(SessionState);
+
+    impl Session for S {
+        fn state(&self) -> &SessionState {
+            &self.0
+        }
+        fn set_state(&mut self, s: SessionState) {
+            self.0 = s;
+        }
+    }
+
+    /// `offset` past the epoch; `now` in the cases below is `at(DAY)`.
+    fn at(offset: Duration) -> SystemTime {
+        SystemTime::UNIX_EPOCH + offset
+    }
+
+    #[rstest]
+    #[case::activity_horizon_when_unbounded(at(DAY + HOUR), None, at(DAY * 2 + HOUR))]
+    #[case::anchors_at_now_when_token_expired(at(HOUR * 23), None, at(DAY * 2))]
+    #[case::expire_at_when_sooner(at(DAY + HOUR), Some(at(DAY + HOUR)), at(DAY + HOUR))]
+    #[case::horizon_when_sooner_than_expire_at(
+        at(DAY + HOUR),
+        Some(at(DAY * 400)),
+        at(DAY * 2 + HOUR)
+    )]
+    fn storage_deadline(
+        #[case] token_expiry: SystemTime,
+        #[case] expire_at: Option<SystemTime>,
+        #[case] expected: SystemTime,
+    ) {
+        let s = S(SessionState::builder()
+            .token_expiry(token_expiry)
+            .created_at(SystemTime::UNIX_EPOCH)
+            .maybe_expire_at(expire_at)
+            .build());
+        assert_eq!(s.storage_deadline(at(DAY), DAY), expected);
     }
 }

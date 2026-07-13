@@ -29,31 +29,56 @@ Each record carries a [`version`](crate::PersistedSessionState):
 
 ## TTL contract
 
-The record's deadline is stored on the session itself:
-[`Session::expire_at`](crate::Session::expire_at) is **frozen at login**
-(`created_at` plus the [`SessionLifetime::Bounded`](crate::SessionLifetime)
-cap in force at the time), computed by the framework so you never repeat the
-configured lifetime in your store. Retain the record until **at least** that
-instant. The TTL is garbage collection, not enforcement — the engine checks
-the deadline on every load — so deleting early logs a user out while deleting
-late only costs storage. Err late:
+Every record gets an absolute deadline:
+[`Session::storage_deadline`](crate::Session::storage_deadline), the sooner of
+the [`expire_at`](crate::Session::expire_at) frozen at login (under a
+[`Bounded`](crate::SessionLifetime) lifetime) and the activity horizon
+`max(now, token_expiry) + idle_timeout`. Pass the same
+[`idle_timeout`](crate::LivenessConfig::idle_timeout) you configure on the
+liveness side, or [`DEFAULT_IDLE_TIMEOUT`](crate::DEFAULT_IDLE_TIMEOUT) (30
+days) when you attach no liveness store. Apply the deadline as the record's
+absolute TTL on **every** write, erring late:
 
-- `expire_at` is measured on the application's clock, so a backend expiring
-  exactly at it by its own clock can already be early — retaining until "at
-  least" that instant requires a margin covering the clock skew between the
-  two. Rounding up further is free.
+- The deadline is measured on the application's clock, so a backend expiring
+  exactly at it by its own clock can already be early — deleting early logs a
+  user out, while a late delete costs storage and stretches the idle bound by
+  at most the skew. Add a margin; rounding up is free.
 - Re-apply the TTL on **every** write — backends like Redis drop a key's TTL
   on a plain overwrite.
-- Never use a sliding window: one shorter than the remaining lifetime deletes
+- Never use a sliding window: one shorter than the remaining deadline deletes
   an idle-but-valid record out from under its user.
 - On backends whose TTLs are relative (Cassandra, etcd leases), compute
-  `expire_at − now` at write time and clamp up to a small positive value
-  rather than deleting.
+  `deadline − now` at write time and clamp up to a small positive value rather
+  than deleting.
 
-Under a
-[delegated](crate::SessionLifetime::DelegatedToAuthorizationServer) lifetime
-`expire_at` is `None` — there is no deadline to retain until, so plan your own
-garbage collection for abandoned records.
+The horizon renews with every write: an active session refreshes its tokens
+(roughly once per access-token lifetime), each refresh writes the record, and
+the deadline moves out. A session nobody uses stops being written, so its
+record — refresh token included — expires even under a
+[delegated](crate::SessionLifetime::DelegatedToAuthorizationServer) lifetime,
+where `expire_at` is `None`.
+
+## Detecting and deleting stale sessions
+
+The framework deletes what it can reach: logout deletes the session, and a new
+login that still presents the old pointer cookie deletes the record it names.
+Records it cannot reach — the pointer cookie was cleared, or its cookie key
+was rotated out without a grace period — are the backend's to reap, and
+`storage_deadline` is the detector: a record past its deadline is one your
+lifetime cap or activity bound says must not be served again, so deleting it
+is always safe. Deleting it is also what *enforces* the bound: liveness fails
+open, so once the liveness entry is gone, a record that is still stored would
+serve — and refresh — an idle-expired session.
+
+- **Backends with native TTLs** (Redis `EXPIREAT`, a DynamoDB TTL attribute):
+  set the deadline on every write and the backend reaps for you.
+- **Queryable backends** (SQL and friends): persist the deadline as its own
+  column on every write and sweep periodically —
+  `DELETE FROM sessions WHERE deadline < now()`.
+- **Liveness entries** reap the same way: the deadline handed to
+  [`touch`](crate::LivenessStore::touch) never falls before the record's, so
+  applying it as the entry's TTL is likewise safe.
+>>>>>>> conflict 1 of 2 ends
 
 A complete in-memory implementation:
 
@@ -97,8 +122,9 @@ impl ExternalSessionStore for InMemoryStore {
     type SessionType = MySession;
     type Error = Infallible;
 
-    // A real backend retains each record until at least `session.expire_at()`
-    // (see "TTL contract" above); this in-memory demo skips it.
+    // A real backend applies `session.storage_deadline(now, idle_timeout)`
+    // as the record's absolute TTL on every write (see "TTL contract" above);
+    // this in-memory demo skips it.
     async fn insert(&self, session: &MySession) -> Result<(), Infallible> {
         let key = session.persisted().session_key;
         self.rows.lock().unwrap().insert(key, (session.clone(), 0));
@@ -186,7 +212,10 @@ It errors with [`Gone`](crate::SessionErrorKind) if the key is absent,
 
 ## Idle-timeout tracking
 
-Idle timeout is optional and orthogonal to the data store — attach a
+Every deployment has an idle bound
+([`idle_timeout`](crate::LivenessConfig::idle_timeout), default 30 days); the
+TTL contract above enforces it coarsely by reaping records whose horizon has
+passed. For precise per-request enforcement, attach a
 [`LivenessStore`](crate::LivenessStore) with
 [`with_liveness`](crate::StoreBackedSessionStore::with_liveness). See the
 [liveness explanation](crate::_docs::explanation::liveness).

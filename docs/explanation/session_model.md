@@ -71,9 +71,12 @@ What delegation does **not** provide:
   [`CookieSessionStore`](crate::CookieSessionStore) the refresh token travels
   in the cookie, so a stolen copy refreshes as well as the original; prefer a
   bounded lifetime with that store.
-- **Storage bounds** — external-store records and liveness entries get no TTL
-  hint, so abandoned sessions are only cleaned up if the user returns — see
-  the [external store guide](crate::_docs::guide::external_store).
+- **Storage bounds from the AS** — the AS's refresh-token lifetime is not
+  observable here, so external-store records and liveness entries are bounded
+  by the activity horizon instead
+  ([`Session::storage_deadline`](crate::Session::storage_deadline), default
+  30 days of inactivity) — see the
+  [external store guide](crate::_docs::guide::external_store).
 
 ### Bounding in this crate
 
@@ -82,7 +85,9 @@ duration after login, regardless of activity or AS policy. The deadline is
 frozen into each session at login
 ([`SessionState::expire_at`](crate::SessionState)); cookie `Max-Age`,
 external-store record TTLs, and liveness-entry TTLs all derive from that one
-stored value, so the configured lifetime lives in exactly one place.
+stored value (the latter two additionally capped by the activity horizon —
+see [`Session::storage_deadline`](crate::Session::storage_deadline)), so the
+configured lifetime lives in exactly one place.
 
 Freezing makes changing the cap one-directional for existing sessions. The
 engine enforces the tighter of the frozen and configured deadlines, so

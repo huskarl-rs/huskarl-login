@@ -176,8 +176,10 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// with the `Set-Cookie` values for the callback response.
     ///
     /// `default_lifetime` is the assumed access-token lifetime when the token
-    /// response omits `expires_in`. `headers` carries request cookies so cookie
-    /// stores can clear stale session chunks.
+    /// response omits `expires_in`. `headers` carries request cookies so the
+    /// driver can clean up what the new login supersedes: cookie stores clear
+    /// stale session chunks, store-backed stores delete the record a
+    /// still-valid pointer cookie references.
     fn create(
         &self,
         completed: CompletedLogin,

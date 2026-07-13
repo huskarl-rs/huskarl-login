@@ -8,10 +8,19 @@ session. A [`StoreBackedSessionStore`](crate::StoreBackedSessionStore) with a
 compares against [`idle_timeout`](crate::LivenessConfig), and tears the session
 down on an [`Expired`](crate::LivenessVerdict) verdict.
 
+Every deployment has an idle bound —
+[`idle_timeout`](crate::LivenessConfig::idle_timeout) defaults to 30 days
+([`DEFAULT_IDLE_TIMEOUT`](crate::DEFAULT_IDLE_TIMEOUT)); there is no unbounded
+mode. The default is deliberately long: it changes nothing for deployments
+with real idle requirements, while guaranteeing that storage for sessions
+nobody uses anymore is eventually reclaimed (see the
+[TTL contract](crate::_docs::guide::external_store)).
+
 Cookie sessions, and store-backed sessions without a liveness store, report
-[`Untracked`](crate::LivenessVerdict) — idle timeout simply isn't enforced for
-them, and only the absolute [`SessionLifetime`](crate::SessionLifetime)
-bound applies.
+[`Untracked`](crate::LivenessVerdict) — there is no `last_active` to judge, so
+per-request enforcement doesn't happen for them. Store-backed sessions still
+get the coarse form: records whose activity horizon has passed are reaped by
+the storage TTL.
 
 ## Fail open
 
@@ -41,11 +50,21 @@ are:
 - **best-effort and monotonic** — a failed write just delays the next advance;
   it never fails the request.
 
-The absolute expiry handed to the store
-([`expire_at`](crate::LivenessStore::touch)) is the session's effective
-deadline — the tighter of the one frozen at login
-([`SessionState::expire_at`](crate::SessionState)) and the live
-[`SessionLifetime::Bounded`](crate::SessionLifetime) cap (absent when the
-lifetime is delegated to the authorization server) — not a sliding idle TTL.
-The liveness entry thus expires exactly when the session can no longer be
-valid, which is what keeps fail-open correct.
+## Entry TTLs and fail-open
+
+The deadline handed to the store ([`touch`](crate::LivenessStore::touch)) is
+the record's storage deadline — the sooner of the session's effective absolute
+deadline and the activity horizon `max(now, token_expiry) + idle_timeout` —
+never a sliding idle TTL. The ordering matters: a missing entry reads as
+active, so an entry that expired **before** its record would resurrect an idle
+session; an entry that outlives its record is harmless, because the record is
+what serves requests. Anchoring the horizon to `token_expiry` rather than
+`now` keeps the entry alive across the whole gap to the next possible
+record write (a token refresh), which is what preserves that ordering.
+
+One softness is accepted: a token refresh extends the record's deadline, but
+the entry keeps the deadline from its last touch until the next one. A session
+whose final activity triggered a refresh can therefore fail open — read as
+active — for up to one access-token lifetime past its idle timeout. That
+window is small against realistic idle timeouts and consistent with fail-open
+during a liveness outage.

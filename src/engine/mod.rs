@@ -747,10 +747,10 @@ where
         // and store-backed sessions without a liveness store, and fails open so
         // an outage never expires a session. The engine acts only on `Expired`.
         let record_activity = self.config.activity_policy.counts_as_activity(headers);
-        // Absolute deadline handed to the liveness store so its entry expires
-        // exactly when the session can no longer be valid (never on a sliding
-        // idle TTL, which would break fail-open). `None` under a delegated
-        // session lifetime — the AS's bound is not observable here.
+        // Effective absolute deadline (frozen `expire_at` tightened by the
+        // live config cap; `None` under a delegated lifetime). The store
+        // combines it with the activity horizon into the liveness entry's
+        // TTL — see `check_liveness` in store_session.rs.
         let expire_at = self.session_deadline(&session);
         if self
             .session_store
