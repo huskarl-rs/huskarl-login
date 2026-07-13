@@ -27,7 +27,7 @@ where
 
         let start = self
             .grant
-            .start(StartInput::scopes(self.config.scopes.clone()))
+            .start(StartInput::scope(self.config.scope.clone()))
             .await?;
         let state = start.pending_state.state.clone();
 

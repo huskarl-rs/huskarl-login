@@ -117,7 +117,7 @@ mod tests {
     fn make_config_with_base(base_url: &str) -> LoginConfig {
         LoginConfig::builder()
             .callback_path("/callback")
-            .scopes(vec![])
+            .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url(base_url.parse().unwrap())
             .build()
@@ -127,7 +127,7 @@ mod tests {
     fn make_config_with_strip(base_url: &str, strip: &str) -> LoginConfig {
         LoginConfig::builder()
             .callback_path(format!("{strip}/callback"))
-            .scopes(vec![])
+            .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .base_url(base_url.parse().unwrap())
             .strip_prefix(strip)

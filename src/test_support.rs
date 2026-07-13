@@ -7,6 +7,7 @@
 use http::{HeaderMap, HeaderName, HeaderValue};
 use huskarl::core::{
     Error,
+    jwk::OctBytes,
     platform::MaybeSendBoxFuture,
     secrets::{Secret, SecretBytes, SecretOutput},
 };
@@ -30,9 +31,11 @@ impl Secret for TestSecret {
 /// A 256-bit AES-GCM cipher over all-zero key bytes, reporting **no** key
 /// identity (the cipher's `key_id()` is `None`, so no kid sidecar is emitted).
 pub(crate) async fn test_cipher() -> AesGcmKey {
-    AesGcmKey::from_secret(TestSecret(SecretBytes::new(vec![0u8; 32])), |_| None)
-        .await
-        .unwrap()
+    AesGcmKey::from_secret(
+        TestSecret(SecretBytes::new(vec![0u8; 32])).mapped(OctBytes::new("A256GCM")),
+    )
+    .await
+    .unwrap()
 }
 
 /// Like [`test_cipher`] but reports a fixed key identity `kid`, exercising the
@@ -46,10 +49,9 @@ pub(crate) async fn test_cipher_with_kid(kid: &str) -> AesGcmKey {
 /// `(kid, byte)` reconstructs the "same" key twice (e.g. once for a decryptor
 /// set and once as the encryptor) — the shape multi-key rotation tests need.
 pub(crate) async fn aes_key_with_kid(kid: &str, byte: u8) -> AesGcmKey {
-    let kid_owned = kid.to_owned();
-    AesGcmKey::from_secret(TestSecret(SecretBytes::new(vec![byte; 32])), move |_| {
-        Some(kid_owned.clone())
-    })
+    AesGcmKey::from_secret(
+        TestSecret(SecretBytes::new(vec![byte; 32])).mapped(OctBytes::new("A256GCM").with_kid(kid)),
+    )
     .await
     .unwrap()
 }

@@ -481,7 +481,7 @@ impl SessionDriver for ErrorSessionStore {
 fn default_config() -> LoginConfig {
     LoginConfig::builder()
         .callback_path("/callback")
-        .scopes(vec![])
+        .scope(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
         .build()
@@ -491,7 +491,7 @@ fn default_config() -> LoginConfig {
 fn config_with_logout() -> LoginConfig {
     LoginConfig::builder()
         .callback_path("/callback")
-        .scopes(vec![])
+        .scope(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
         .logout(LogoutConfig::builder().path("/logout").build().unwrap())
@@ -527,7 +527,7 @@ async fn engine_stamps_store_secure_from_https_base_url() {
 async fn engine_stamps_store_insecure_from_http_base_url() {
     let http_config = LoginConfig::builder()
         .callback_path("/callback")
-        .scopes(vec![])
+        .scope(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("http://localhost:6188".parse().unwrap())
         .build()
@@ -542,7 +542,7 @@ async fn engine_stamps_store_with_bounded_session_lifetime() {
     // store-side deadlines) can be clamped to the session cap.
     let config = LoginConfig::builder()
         .callback_path("/callback")
-        .scopes(vec![])
+        .scope(vec![])
         .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(8)))
         .base_url("https://app.example.com".parse().unwrap())
         .build()
@@ -637,17 +637,24 @@ async fn seal_login_cookie(state: &str, original_url: &str) -> String {
     seal_login_cookie_at(state, original_url, SystemTime::now()).await
 }
 
+/// Builds a [`PendingState`] for tests. It is `#[non_exhaustive]` upstream, so
+/// it can't be struct-literal'd from this crate — round-trip through serde.
+fn test_pending_state(state: &str) -> PendingState {
+    serde_json::from_value(serde_json::json!({
+        "redirect_uri": "https://app.example.com/callback",
+        "pkce_verifier": null,
+        "state": state,
+        "nonce": "test_nonce",
+        "dpop_jkt": null,
+    }))
+    .unwrap()
+}
+
 async fn seal_login_cookie_at(state: &str, original_url: &str, created_at: SystemTime) -> String {
     let sealer = AeadV1Cipher::new(test_cipher().await);
     let cookie = super::LoginStateCookie {
         original_url: original_url.to_owned(),
-        pending_state: PendingState {
-            redirect_uri: "https://app.example.com/callback".to_owned(),
-            pkce_verifier: None,
-            state: state.to_owned(),
-            nonce: "test_nonce".to_owned(),
-            dpop_jkt: None,
-        },
+        pending_state: test_pending_state(state),
         created_at,
     };
     let payload = crate::cookie::encode_payload(&cookie).unwrap();
@@ -920,7 +927,7 @@ async fn active_verdict_yields_active() {
 async fn login_state_cookie_uses_configured_ttl() {
     let config = LoginConfig::builder()
         .callback_path("/callback")
-        .scopes(vec![])
+        .scope(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
         .login_state_ttl(Duration::from_mins(30))
@@ -1011,13 +1018,7 @@ async fn callback_pre_created_at_format_treated_as_expired() {
         pending_state: &'a PendingState,
     }
     let state = "oldformat";
-    let pending_state = PendingState {
-        redirect_uri: "https://app.example.com/callback".to_owned(),
-        pkce_verifier: None,
-        state: state.to_owned(),
-        nonce: "test_nonce".to_owned(),
-        dpop_jkt: None,
-    };
+    let pending_state = test_pending_state(state);
     let payload = crate::cookie::encode_payload(&OldLoginStateCookie {
         original_url: "https://app.example.com/a",
         pending_state: &pending_state,
@@ -1046,7 +1047,7 @@ async fn max_lifetime_expired_clears_session() {
     );
     let config = LoginConfig::builder()
         .callback_path("/callback")
-        .scopes(vec![])
+        .scope(vec![])
         .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(1)))
         .base_url("https://app.example.com".parse().unwrap())
         .build()
@@ -1073,7 +1074,7 @@ async fn frozen_expire_at_is_enforced_over_a_raised_lifetime() {
     session.state.expire_at = Some(created_at + Duration::from_hours(1));
     let config = LoginConfig::builder()
         .callback_path("/callback")
-        .scopes(vec![])
+        .scope(vec![])
         .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(24)))
         .base_url("https://app.example.com".parse().unwrap())
         .build()
@@ -1097,7 +1098,7 @@ async fn lowered_lifetime_applies_to_sessions_with_a_longer_frozen_deadline() {
     session.state.expire_at = Some(created_at + Duration::from_hours(48));
     let config = LoginConfig::builder()
         .callback_path("/callback")
-        .scopes(vec![])
+        .scope(vec![])
         .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(1)))
         .base_url("https://app.example.com".parse().unwrap())
         .build()
@@ -1181,7 +1182,7 @@ async fn activity_policy_first_party_counts_same_origin_fetch() {
 async fn activity_policy_navigations_only_excludes_same_origin_fetch() {
     let config = LoginConfig::builder()
         .callback_path("/callback")
-        .scopes(vec![])
+        .scope(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
         .activity_policy(ActivityPolicy::NavigationsOnly)
@@ -1830,7 +1831,7 @@ async fn logout_with_session_deletes_session() {
 async fn logout_redirects_to_configured_post_logout_uri() {
     let config = LoginConfig::builder()
         .callback_path("/callback")
-        .scopes(vec![])
+        .scope(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
         .logout(
@@ -1863,7 +1864,7 @@ async fn logout_end_session_url_includes_client_id_without_id_token() {
     // post_logout_redirect_uri (OIDC RP-Initiated Logout 1.0 §2).
     let config = LoginConfig::builder()
         .callback_path("/callback")
-        .scopes(vec![])
+        .scope(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
         .logout(
@@ -1901,7 +1902,7 @@ async fn post_logout_redirect_uri_is_sent_exactly_not_normalized() {
     // wire (parsing through http::Uri would add one), or the OP drops it.
     let config = LoginConfig::builder()
         .callback_path("/callback")
-        .scopes(vec![])
+        .scope(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .base_url("https://app.example.com".parse().unwrap())
         .logout(

@@ -59,10 +59,10 @@ impl SessionState {
             .expires_in
             .map_or(default_lifetime, Duration::from_secs);
         let token_expiry = now + lifetime;
-        let (sub, sid) = match completed.id_token_claims() {
-            Some(claims) => (claims.sub.clone(), claims.sid.clone()),
-            None => (None, None),
-        };
+        let sub = completed.subject().map(str::to_string);
+        let sid = completed
+            .id_token_claims()
+            .and_then(|claims| claims.sid.clone());
 
         Self {
             token_expiry,

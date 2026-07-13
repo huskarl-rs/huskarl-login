@@ -1,5 +1,5 @@
 [tools]
-cargo-docs-rs = "latest"
+"cargo:cargo-docs-rs" = "latest"
 
 [tasks.docs]
 description = "Build docs the docs.rs way (renders the gated `_docs` module)"
