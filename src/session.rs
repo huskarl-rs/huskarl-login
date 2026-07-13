@@ -165,8 +165,14 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// naming and the `Secure` attribute; `max_lifetime` (the
     /// [`SessionLifetime::Bounded`](crate::SessionLifetime) cap, `None` when
     /// delegated) clamps the cookie `Max-Age`, so no session cookie outlives
-    /// the session cap.
-    fn apply_session_policy(&mut self, secure: bool, max_lifetime: Option<std::time::Duration>);
+    /// the session cap; `metrics_name` becomes the `name` label on every
+    /// counter the driver emits (`None` omits it).
+    fn apply_session_policy(
+        &mut self,
+        secure: bool,
+        max_lifetime: Option<std::time::Duration>,
+        metrics_name: Option<&str>,
+    );
 
     /// The AEAD cipher this driver seals session data with (AAD-domain-separated
     /// from the login-state seal, so the key may be shared).

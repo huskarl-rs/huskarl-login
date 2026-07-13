@@ -66,13 +66,9 @@ pub use enrich::{NoEnrichment, SessionEnricher};
 pub use error_page::{DefaultErrorPage, ErrorPage, ErrorPageResponse};
 pub use huskarl::core::EndpointUrl;
 pub use liveness::{DEFAULT_IDLE_TIMEOUT, LivenessConfig, LivenessStore, LivenessVerdict};
-pub use metrics::{
-    DecryptResult, LoginCompleteResult, LoginEngineMetrics, LoginStartResult, RefreshResult,
-    SessionCookieMetrics, normalize_as_error,
-};
 pub use session::{SessionDriver, SessionError, SessionErrorKind};
 pub use session_state::{Session, SessionState};
 pub use store_session::{
-    ExternalSessionStore, PersistedSession, PersistedSessionState, SaveOutcome, SessionNotFound,
-    StoreBackedSessionStore, StoreBackedSessionStoreBuilder, VersionConflict,
+    ExternalSessionStore, LoadOutcome, PersistedSession, PersistedSessionState, SaveOutcome,
+    SessionNotFound, StoreBackedSessionStore, StoreBackedSessionStoreBuilder, VersionConflict,
 };

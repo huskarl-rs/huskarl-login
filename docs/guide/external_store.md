@@ -9,7 +9,7 @@ from a login is the enricher's job, not the store's.
 ## The session type
 
 Your session type embeds a [`PersistedSessionState`](crate::PersistedSessionState)
-(the framework-managed key, token state, and version) and exposes it via
+(the framework-managed key and token state) and exposes it via
 [`PersistedSession`](crate::PersistedSession). It must be `Clone` —
 [`PendingPersist::commit`](crate::engine::PendingPersist::commit) explains why.
 Implement `From<PersistedSessionState>` if you want the plain `build()`
@@ -17,15 +17,23 @@ finisher.
 
 ## Versioning contract
 
-Each record carries a [`version`](crate::PersistedSessionState):
+Each record is stored alongside a version — the
+[`Version`](crate::ExternalSessionStore::Version) associated type — that the
+store owns entirely. It never appears in the session type; it travels through
+the trait methods instead:
 
-- [`save`](crate::ExternalSessionStore::save) is last-writer-wins and advances
-  the version unconditionally.
+- [`load`](crate::ExternalSessionStore::load) returns the stored version with
+  the session, and the framework hands it back verbatim as `expected`.
+- [`save`](crate::ExternalSessionStore::save) is last-writer-wins; every write
+  must change the stored version, so an in-flight compare-and-swap cannot
+  succeed against overwritten state.
 - [`compare_and_swap`](crate::ExternalSessionStore::compare_and_swap) writes
-  only if the stored version still equals `expected`, advancing it on success
-  and returning [`SaveOutcome::Conflict`](crate::SaveOutcome) otherwise. Version
-  is compared by **equality only** — a column-based `version + 1` and a
-  body-persisted version both work as long as a matched swap ends one higher.
+  only if the stored version still equals `expected`, changing it on success
+  and returning [`SaveOutcome::Conflict`](crate::SaveOutcome) otherwise.
+
+Version is compared by **equality only**, so any per-write-unique value works:
+an integer column you `+ 1` on write, a database row version (e.g. Postgres
+`xmin`), an ETag, a fresh UUID per write.
 
 ## TTL contract
 
@@ -78,7 +86,6 @@ serve — and refresh — an idle-expired session.
 - **Liveness entries** reap the same way: the deadline handed to
   [`touch`](crate::LivenessStore::touch) never falls before the record's, so
   applying it as the entry's TTL is likewise safe.
->>>>>>> conflict 1 of 2 ends
 
 A complete in-memory implementation:
 
@@ -120,6 +127,7 @@ struct InMemoryStore {
 
 impl ExternalSessionStore for InMemoryStore {
     type SessionType = MySession;
+    type Version = i32;
     type Error = Infallible;
 
     // A real backend applies `session.storage_deadline(now, idle_timeout)`
@@ -131,13 +139,8 @@ impl ExternalSessionStore for InMemoryStore {
         Ok(())
     }
 
-    async fn load(&self, session_key: Uuid) -> Result<Option<MySession>, Infallible> {
-        Ok(self.rows.lock().unwrap().get(&session_key).map(|(s, version)| {
-            // Stamp the stored version onto the loaded session.
-            let mut s = s.clone();
-            s.persisted_mut().version = *version;
-            s
-        }))
+    async fn load(&self, session_key: Uuid) -> Result<Option<(MySession, i32)>, Infallible> {
+        Ok(self.rows.lock().unwrap().get(&session_key).cloned())
     }
 
     async fn save(&self, session: &MySession) -> Result<(), Infallible> {
