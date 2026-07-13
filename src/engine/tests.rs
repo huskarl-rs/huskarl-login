@@ -194,13 +194,14 @@ fn variant_name(loaded: &LoadedSession<MockSession>) -> &'static str {
     }
 }
 
-/// Unwraps [`LoadedSession::Active`] into the session and its cookies.
+/// Unwraps [`LoadedSession::Active`] into the session and its cookies
+/// (consumed out of the [`SetCookies`] guard).
 fn expect_active(loaded: LoadedSession<MockSession>) -> (MockSession, Vec<HeaderValue>) {
     match loaded {
         LoadedSession::Active {
             session,
             set_cookies,
-        } => (session, set_cookies),
+        } => (session, set_cookies.into_headers()),
         other => unreachable!("expected Active, got {}", variant_name(&other)),
     }
 }
@@ -219,10 +220,11 @@ fn expect_pending(
     }
 }
 
-/// Unwraps [`LoadedSession::Cleared`] into the teardown reason and clears.
+/// Unwraps [`LoadedSession::Cleared`] into the teardown reason and clears
+/// (consumed out of the [`SetCookies`] guard).
 fn expect_cleared(loaded: LoadedSession<MockSession>) -> (TeardownReason, Vec<HeaderValue>) {
     match loaded {
-        LoadedSession::Cleared { reason, clears } => (reason, clears),
+        LoadedSession::Cleared { reason, clears } => (reason, clears.into_headers()),
         other => unreachable!("expected Cleared, got {}", variant_name(&other)),
     }
 }
@@ -1238,7 +1240,7 @@ async fn persist_session_retries_the_deferred_refresh_save() {
         .unwrap();
     assert!(e.session_store.save_called());
     assert_eq!(
-        set_cookies,
+        set_cookies.into_headers(),
         vec![HeaderValue::from_static(MOCK_SAVE_COOKIE)]
     );
     // The re-applied refresh keeps the session's tokens fresh.
@@ -1345,10 +1347,12 @@ async fn persist_save_calls_store_save() {
     let e = engine(MockSessionStore::with_session(valid_session())).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let (mut session, _) = expect_active(loaded);
-    e.persist_session(&mut session, &token_response_fixture(), &api_headers())
+    let set_cookies = e
+        .persist_session(&mut session, &token_response_fixture(), &api_headers())
         .await
         .unwrap();
     assert!(e.session_store.save_called());
+    assert!(!set_cookies.into_headers().is_empty());
 }
 
 /// A minimal refresh-style token response for driving `persist_session`.
@@ -2267,6 +2271,91 @@ async fn metrics_refresh_ok_on_successful_refresh() {
         .cipher(test_cipher().await)
         .metrics(Arc::clone(&m) as Arc<dyn LoginEngineMetrics>)
         .build();
-    let _ = e.load_session(&HeaderMap::new()).await.unwrap();
+    // Consume via expect_active: a successful refresh returns owed cookies,
+    // and dropping them unconsumed would (correctly) trip the SetCookies guard.
+    let _ = expect_active(e.load_session(&HeaderMap::new()).await.unwrap());
     assert_eq!(m.calls(), vec![MetricCall::Refresh { result: "ok" }]);
+}
+
+// ── SetCookies drop guard ─────────────────────────────────────────────────
+
+#[test]
+fn set_cookies_drop_guard_fires_when_cookies_are_discarded() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::SetCookies;
+
+    let probe = Arc::new(AtomicUsize::new(0));
+
+    // The bug the guard exists for: matching `Active { session, .. }` takes
+    // the session and drops the re-sealed cookies on the floor. Rust cannot
+    // flag the `..` pattern at compile time, so the guard detects the drop
+    // at runtime.
+    // The `..` residue of a partially-moved local drops when the local's
+    // scope ends, hence the inner block.
+    let session = {
+        let loaded = LoadedSession::Active {
+            session: valid_session(),
+            set_cookies: SetCookies::new(vec![HeaderValue::from_static("a=b")])
+                .with_drop_probe(Arc::clone(&probe)),
+        };
+        match loaded {
+            LoadedSession::Active { session, .. } => session,
+            _ => unreachable!(),
+        }
+    };
+    assert_eq!(
+        probe.load(Ordering::Relaxed),
+        1,
+        "discarded cookies must be detected"
+    );
+    drop(session);
+}
+
+#[test]
+fn set_cookies_drop_guard_stays_silent_for_consumed_and_empty_guards() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::SetCookies;
+
+    let probe = Arc::new(AtomicUsize::new(0));
+
+    // Consuming into headers defuses the guard.
+    let consumed =
+        SetCookies::new(vec![HeaderValue::from_static("a=b")]).with_drop_probe(Arc::clone(&probe));
+    assert_eq!(consumed.len(), 1);
+    assert_eq!(
+        consumed.into_headers(),
+        vec![HeaderValue::from_static("a=b")]
+    );
+
+    // So does consuming by iteration (the `extend(set_cookies)` shape).
+    let iterated =
+        SetCookies::new(vec![HeaderValue::from_static("c=d")]).with_drop_probe(Arc::clone(&probe));
+    let mut sink: Vec<HeaderValue> = vec![];
+    sink.extend(iterated);
+    assert_eq!(sink.len(), 1);
+
+    // The steady state — nothing owed — drops silently.
+    let empty = SetCookies::default().with_drop_probe(Arc::clone(&probe));
+    assert!(empty.is_empty());
+    drop(empty);
+
+    // A non-empty guard dropped by panic unwinding stays silent too: the
+    // cookies are collateral of the panic, not a separate bug to report.
+    let unwind_probe = Arc::clone(&probe);
+    let result = std::panic::catch_unwind(move || {
+        let _guarded =
+            SetCookies::new(vec![HeaderValue::from_static("e=f")]).with_drop_probe(unwind_probe);
+        panic!("handler panic");
+    });
+    assert!(result.is_err());
+
+    assert_eq!(probe.load(Ordering::Relaxed), 0);
 }

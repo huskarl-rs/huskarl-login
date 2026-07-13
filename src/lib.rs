@@ -61,7 +61,7 @@ pub use cookie::{CookieName, InvalidCookieName};
 pub use cookie_session::{
     CookiePayload, CookieSession, CookieSessionStore, CookieSessionStoreBuilder,
 };
-pub use engine::{DefaultPersistFailurePolicy, PersistFailurePolicy, TeardownReason};
+pub use engine::{DefaultPersistFailurePolicy, PersistFailurePolicy, SetCookies, TeardownReason};
 pub use enrich::{NoEnrichment, SessionEnricher};
 pub use error_page::{DefaultErrorPage, ErrorPage, ErrorPageResponse};
 pub use huskarl::core::EndpointUrl;
