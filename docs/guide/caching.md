@@ -20,7 +20,7 @@ response, whose caching the engine does not control:
   [`Active`](crate::engine::LoadedSession::Active) result after an eager token
   refresh,
 - the cookies returned by
-  [`persist_session`](crate::engine::LoginEngine::persist_session) /
+  [`PendingPersist::commit`](crate::engine::PendingPersist::commit) /
   [`save_session`](crate::engine::LoginEngine::save_session), and
 - the cookie clears on a
   [`Cleared`](crate::engine::LoadedSession::Cleared) result.

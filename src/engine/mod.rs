@@ -56,7 +56,10 @@ pub enum LoginResponse {
         status: StatusCode,
         /// The `Location` to redirect to.
         location: HeaderValue,
-        /// `Set-Cookie` values to emit alongside the redirect.
+        /// `Set-Cookie` values to emit alongside the redirect: after the
+        /// callback they mint the initial session cookie, after logout they
+        /// clear it — every one must reach the response. Prefer
+        /// [`into_parts`](LoginResponse::into_parts), which cannot lose them.
         set_cookies: Vec<HeaderValue>,
     },
     /// A response rendered with an explicit status, header set, and body.
@@ -189,6 +192,17 @@ impl SetCookies {
         std::mem::take(&mut self.headers)
     }
 
+    /// Consumes the guard without logging, dropping the cookies.
+    ///
+    /// Only correct when the response is already gone — e.g. a persistence
+    /// fallback that runs after the response was written, where non-delivery
+    /// is a fact rather than a bug. Everywhere else, append the cookies to
+    /// the response; to also report what could not be delivered, use
+    /// [`into_headers`](Self::into_headers) and inspect the result instead.
+    pub fn discard(mut self) {
+        self.headers.clear();
+    }
+
     /// Attaches the test drop-probe — see [`Self::drop_probe`].
     #[cfg(test)]
     pub(crate) fn with_drop_probe(
@@ -279,16 +293,15 @@ pub enum LoadedSession<S> {
     /// same unavailable server, and an anonymous fallback page could leak
     /// that state into caches keyed on the user.
     RefreshUnavailable,
-    /// Authenticated, with a save owed after the inner handler responds — pass
-    /// `session` and `token_response` to [`LoginEngine::persist_session`].
+    /// Authenticated, with a save owed after the inner handler responds.
     /// Arises only when the eager persist of a refreshed session failed.
     ActivePending {
-        /// The loaded session, with the refresh applied in memory.
-        session: S,
-        /// The refresh response, so [`LoginEngine::persist_session`] can
-        /// re-commit it against fresh store state. Boxed to keep the rare
-        /// variant from inflating every [`LoadedSession`] returned.
-        token_response: Box<TokenResponse>,
+        /// The refreshed session together with the save owed for it. Serve
+        /// [`PendingPersist::session`] (or a shared
+        /// [`PendingPersist::session_arc`] handle) during the request, then
+        /// call [`PendingPersist::commit`] once the inner handler has
+        /// responded.
+        pending: PendingPersist<S>,
     },
 }
 
@@ -297,7 +310,8 @@ impl<S> LoadedSession<S> {
     pub fn session(&self) -> Option<&S> {
         match self {
             Self::Missing | Self::Cleared { .. } | Self::RefreshUnavailable => None,
-            Self::Active { session, .. } | Self::ActivePending { session, .. } => Some(session),
+            Self::Active { session, .. } => Some(session),
+            Self::ActivePending { pending } => Some(pending.session()),
         }
     }
 }
@@ -321,6 +335,156 @@ impl<S> std::fmt::Debug for LoadedSession<S> {
                 .finish_non_exhaustive(),
             Self::ActivePending { .. } => f.debug_struct("ActivePending").finish_non_exhaustive(),
         }
+    }
+}
+
+/// The save owed by a [`LoadedSession::ActivePending`]: the refreshed session
+/// and the refresh response that must be re-committed, bound together so an
+/// adapter cannot pair a session with the wrong refresh. Hold it across the
+/// inner handler, then [`commit`](Self::commit) it in the response phase.
+///
+/// Serve the session during the request via [`session`](Self::session), or
+/// take a shared [`session_arc`](Self::session_arc) handle (e.g. for a
+/// request extension) — `commit` does not need the handle back.
+///
+/// Dropping an uncommitted `PendingPersist` forfeits the retry of the failed
+/// eager persist, so, like [`SetCookies`], the drop is detected at runtime
+/// and logged as an error; for what a forfeited retry costs, see the
+/// [refresh explanation](crate::_docs::explanation::refresh). The one
+/// legitimate abandonment (the session was deleted instead) is spelled
+/// [`abandon`](Self::abandon).
+#[must_use = "an owed session persist must be committed after the response"]
+pub struct PendingPersist<S> {
+    /// The loaded session, with the refresh applied in memory. Shared so
+    /// adapters can serve it while this value waits out the inner handler.
+    session: Arc<S>,
+    /// The refresh response to re-commit against fresh store state. Boxed to
+    /// keep the rare variant from inflating every [`LoadedSession`] returned,
+    /// and `Some` until [`commit`](Self::commit) or [`abandon`](Self::abandon)
+    /// consumes it — `Drop` reports a still-armed guard.
+    token_response: Option<Box<TokenResponse>>,
+    /// Test-only observer incremented when the guard fires — see
+    /// [`SetCookies::drop_probe`].
+    #[cfg(test)]
+    drop_probe: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl<S> PendingPersist<S> {
+    /// Pairs a refreshed session with the refresh response whose persist is
+    /// owed. [`LoginEngine::load_session`] constructs these; the constructor
+    /// is public so adapter tests can fabricate the deferred-persist path
+    /// without arranging a failing store.
+    pub fn new(session: S, token_response: TokenResponse) -> Self {
+        Self {
+            session: Arc::new(session),
+            token_response: Some(Box::new(token_response)),
+            #[cfg(test)]
+            drop_probe: None,
+        }
+    }
+
+    /// The refreshed session (the owed refresh is already applied in memory).
+    #[must_use]
+    pub fn session(&self) -> &S {
+        &self.session
+    }
+
+    /// A shared handle to the session, for serving it while this value waits
+    /// out the inner handler. The handle never has to be returned: one still
+    /// alive at [`commit`](Self::commit) time keeps its pre-commit view and
+    /// the commit proceeds on a clone.
+    #[must_use]
+    pub fn session_arc(&self) -> Arc<S> {
+        Arc::clone(&self.session)
+    }
+
+    /// Commits the owed refresh after the inner service responded, returning
+    /// [`SetCookies`] to append. The refresh is re-committed through the same
+    /// merge-safe path as the eager persist, so a concurrent
+    /// [`StoreBackedSessionStore::update`] landing in between is preserved.
+    /// `request_headers` are the original request cookies (used by
+    /// cookie-backed stores to clear stale slots); see
+    /// [`LoginEngine::load_session`] on response caching.
+    ///
+    /// [`StoreBackedSessionStore::update`]: crate::StoreBackedSessionStore::update
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] if the session store fails to write.
+    pub async fn commit<SD>(
+        mut self,
+        engine: &LoginEngine<SD>,
+        request_headers: &HeaderMap,
+    ) -> Result<SetCookies, SessionError>
+    where
+        SD: SessionDriver<SessionType = S>,
+        S: Clone,
+    {
+        // Taking the response disarms the drop guard; it is present here by
+        // construction — only `commit` and `abandon` remove it, and both
+        // consume `self`.
+        let Some(token_response) = self.token_response.take() else {
+            return Ok(SetCookies::default());
+        };
+        // Post-response the serving handles are normally gone, so this mutates
+        // in place; a handle a handler stashed away keeps its pre-commit view
+        // and the commit works on a clone instead.
+        let session = Arc::make_mut(&mut self.session);
+        engine
+            .session_store
+            .apply_refresh_and_save(
+                session,
+                &token_response,
+                engine.config.default_token_lifetime,
+                request_headers,
+            )
+            .await
+            .map(SetCookies::new)
+    }
+
+    /// Defuses the drop guard without committing — only correct when the owed
+    /// save became moot because the session was deleted instead.
+    pub fn abandon(mut self) {
+        self.token_response = None;
+    }
+
+    /// Attaches the test drop-probe — see [`Self::drop_probe`].
+    #[cfg(test)]
+    pub(crate) fn with_drop_probe(
+        mut self,
+        probe: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.drop_probe = Some(probe);
+        self
+    }
+}
+
+// Manual `Debug` for the same reason as [`LoadedSession`]: never print the
+// session payload or the token response.
+impl<S> std::fmt::Debug for PendingPersist<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingPersist").finish_non_exhaustive()
+    }
+}
+
+impl<S> Drop for PendingPersist<S> {
+    fn drop(&mut self) {
+        // During unwinding the owed persist is collateral of the panic — an
+        // error here would misdirect whoever is diagnosing that panic.
+        if self.token_response.is_none() || std::thread::panicking() {
+            return;
+        }
+        #[cfg(test)]
+        if let Some(probe) = &self.drop_probe {
+            probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        log::error!(
+            "owed session persist dropped without commit; the retry of the failed \
+             eager refresh persist is forfeited — with refresh-token rotation this \
+             strands the rotated token and the session dies on its next request. \
+             Commit the `PendingPersist` after the response (or `abandon` it if \
+             the session was deleted instead)"
+        );
     }
 }
 
@@ -534,8 +698,8 @@ where
     ///
     /// Any response carrying session `Set-Cookie` values — `Active`'s
     /// `set_cookies`, [`LoadedSession::Cleared`]'s clears, or those from
-    /// [`persist_session`](Self::persist_session) — MUST be made non-cacheable
-    /// by the adapter, or a shared cache could replay a session cookie.
+    /// [`PendingPersist::commit`] — MUST be made non-cacheable by the
+    /// adapter, or a shared cache could replay a session cookie.
     ///
     /// # Errors
     ///
@@ -717,8 +881,7 @@ where
                             error_chain(&e)
                         );
                         LoadedSession::ActivePending {
-                            session,
-                            token_response: Box::new(token_response),
+                            pending: PendingPersist::new(session, token_response),
                         }
                     }
                 }
@@ -832,41 +995,8 @@ where
         }
     }
 
-    /// Commits the refresh owed by a [`LoadedSession::ActivePending`] after the
-    /// inner service responded, returning [`SetCookies`] to append. Pass
-    /// the variant's `session` and `token_response` back in; the refresh is
-    /// re-committed through the same merge-safe path as the eager persist, so
-    /// a concurrent [`StoreBackedSessionStore::update`] landing in between is
-    /// preserved. On success `session` is the committed (merged) session.
-    /// `request_headers` are the original request cookies (used by
-    /// cookie-backed stores to clear stale slots); see
-    /// [`load_session`](Self::load_session) on caching.
-    ///
-    /// [`StoreBackedSessionStore::update`]: crate::StoreBackedSessionStore::update
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SessionError`] if the session store fails to write.
-    pub async fn persist_session(
-        &self,
-        session: &mut SD::SessionType,
-        token_response: &TokenResponse,
-        request_headers: &HeaderMap,
-    ) -> Result<SetCookies, SessionError> {
-        self.session_store
-            .apply_refresh_and_save(
-                session,
-                token_response,
-                self.config.default_token_lifetime,
-                request_headers,
-            )
-            .await
-            .map(SetCookies::new)
-    }
-
     /// Deletes a session, returning [`SetCookies`] that clear the session
-    /// cookies. See [`persist_session`](Self::persist_session) for
-    /// `request_headers`.
+    /// cookies. See [`PendingPersist::commit`] for `request_headers`.
     ///
     /// # Errors
     ///
@@ -883,9 +1013,9 @@ where
     }
 
     /// Explicitly and unconditionally saves a session (e.g. after the
-    /// application mutated it), returning [`SetCookies`]; unlike the
-    /// deferred [`persist_session`](Self::persist_session). See
-    /// [`persist_session`](Self::persist_session) for `request_headers`.
+    /// application mutated it), returning [`SetCookies`]; unlike the deferred
+    /// [`PendingPersist::commit`]. See [`PendingPersist::commit`] for
+    /// `request_headers`.
     ///
     /// This is a whole-session, last-writer-wins write: it overwrites changes
     /// committed concurrently by other requests. For store-backed sessions

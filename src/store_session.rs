@@ -1273,7 +1273,7 @@ mod tests {
     async fn refresh_save_failure_applies_refresh_in_memory() {
         // On a persist failure the trait contract is "refresh applied in
         // memory, save owed" — the engine serves the request from `snapshot`
-        // and retries via persist_session.
+        // and retries via `PendingPersist::commit`.
         let session = test_session();
         let ext = VersioningStore {
             always_conflict: true,

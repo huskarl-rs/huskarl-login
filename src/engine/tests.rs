@@ -31,7 +31,7 @@ use rstest::rstest;
 use snafu::Snafu;
 
 use super::{
-    LoadedSession, LoginEngine, TeardownReason, error_chain, is_cors_preflight,
+    LoadedSession, LoginEngine, PendingPersist, TeardownReason, error_chain, is_cors_preflight,
     is_cross_site_request, is_navigation_request,
 };
 use crate::{
@@ -146,6 +146,7 @@ async fn par_failing_grant() -> AuthorizationCodeGrant {
 
 // ── MockSession ───────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct MockSession {
     state: crate::SessionState,
 }
@@ -206,16 +207,10 @@ fn expect_active(loaded: LoadedSession<MockSession>) -> (MockSession, Vec<Header
     }
 }
 
-/// Unwraps [`LoadedSession::ActivePending`] into the session and the refresh
-/// response owed to [`LoginEngine::persist_session`].
-fn expect_pending(
-    loaded: LoadedSession<MockSession>,
-) -> (MockSession, Box<huskarl::grant::core::TokenResponse>) {
+/// Unwraps [`LoadedSession::ActivePending`] into the owed persist.
+fn expect_pending(loaded: LoadedSession<MockSession>) -> PendingPersist<MockSession> {
     match loaded {
-        LoadedSession::ActivePending {
-            session,
-            token_response,
-        } => (session, token_response),
+        LoadedSession::ActivePending { pending } => pending,
         other => unreachable!("expected ActivePending, got {}", variant_name(&other)),
     }
 }
@@ -1213,15 +1208,18 @@ async fn refresh_success_with_failing_save_defers_persistence() {
         .cipher(test_cipher().await)
         .build();
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (session, _token_response) = expect_pending(loaded);
+    let pending = expect_pending(loaded);
     // The refresh itself was applied — only persistence is outstanding.
-    assert!(session.token_expiry() > SystemTime::now() + Duration::from_mins(30));
+    assert!(pending.session().token_expiry() > SystemTime::now() + Duration::from_mins(30));
+    // Not committed in this test — defuse the drop guard.
+    pending.abandon();
 }
 
 #[tokio::test]
-async fn persist_session_retries_the_deferred_refresh_save() {
-    // ActivePending carries the refresh response so the post-response persist
-    // can re-commit it (through the merge-safe path) once the store recovers.
+async fn commit_retries_the_deferred_refresh_save() {
+    // The `PendingPersist` carries the refresh response so the post-response
+    // commit can re-apply it (through the merge-safe path) once the store
+    // recovers.
     let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
     let mut e = LoginEngine::builder()
         .config(default_config())
@@ -1230,20 +1228,19 @@ async fn persist_session_retries_the_deferred_refresh_save() {
         .cipher(test_cipher().await)
         .build();
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (mut session, token_response) = expect_pending(loaded);
+    let pending = expect_pending(loaded);
+    // A serving handle taken during the request survives the commit.
+    let session = pending.session_arc();
 
     // The store recovers; the owed persist now succeeds.
     e.session_store.fail_save = false;
-    let set_cookies = e
-        .persist_session(&mut session, &token_response, &HeaderMap::new())
-        .await
-        .unwrap();
+    let set_cookies = pending.commit(&e, &HeaderMap::new()).await.unwrap();
     assert!(e.session_store.save_called());
     assert_eq!(
         set_cookies.into_headers(),
         vec![HeaderValue::from_static(MOCK_SAVE_COOKIE)]
     );
-    // The re-applied refresh keeps the session's tokens fresh.
+    // The applied refresh keeps the session's tokens fresh.
     assert!(session.token_expiry() > SystemTime::now() + Duration::from_mins(30));
 }
 
@@ -1340,22 +1337,79 @@ async fn load_session_store_error_bubbles_up() {
     assert!(err.is_retryable());
 }
 
-// ── persist_session ───────────────────────────────────────────────────────
+// ── PendingPersist::commit ────────────────────────────────────────────────
 
 #[tokio::test]
-async fn persist_save_calls_store_save() {
+async fn commit_calls_store_save() {
     let e = engine(MockSessionStore::with_session(valid_session())).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let (mut session, _) = expect_active(loaded);
-    let set_cookies = e
-        .persist_session(&mut session, &token_response_fixture(), &api_headers())
-        .await
-        .unwrap();
+    let (session, _) = expect_active(loaded);
+    // The public constructor: what adapter tests use to fabricate the
+    // deferred-persist path without arranging a failing store.
+    let pending = PendingPersist::new(session, token_response_fixture());
+    let set_cookies = pending.commit(&e, &api_headers()).await.unwrap();
     assert!(e.session_store.save_called());
     assert!(!set_cookies.into_headers().is_empty());
 }
 
-/// A minimal refresh-style token response for driving `persist_session`.
+#[test]
+fn pending_persist_drop_guard_detects_a_dropped_persist() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let probe = Arc::new(AtomicUsize::new(0));
+    let dropped = PendingPersist::new(valid_session(), token_response_fixture())
+        .with_drop_probe(Arc::clone(&probe));
+    drop(dropped);
+    assert_eq!(
+        probe.load(Ordering::Relaxed),
+        1,
+        "a dropped owed persist must be detected"
+    );
+}
+
+#[tokio::test]
+async fn pending_persist_drop_guard_stays_silent_for_defused_guards() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let probe = Arc::new(AtomicUsize::new(0));
+
+    // `commit` defuses the guard (consuming the returned cookies keeps the
+    // `SetCookies` guard quiet too — this test is about the persist guard).
+    let e = engine(MockSessionStore::with_session(valid_session())).await;
+    let committed = PendingPersist::new(valid_session(), token_response_fixture())
+        .with_drop_probe(Arc::clone(&probe));
+    let _cookies = committed
+        .commit(&e, &api_headers())
+        .await
+        .unwrap()
+        .into_headers();
+
+    // So does `abandon`, the explicit non-commit verb.
+    let abandoned = PendingPersist::new(valid_session(), token_response_fixture())
+        .with_drop_probe(Arc::clone(&probe));
+    abandoned.abandon();
+
+    // An armed guard dropped by panic unwinding stays silent too: the owed
+    // persist is collateral of the panic, not a separate bug to report.
+    let unwind_probe = Arc::clone(&probe);
+    let result = std::panic::catch_unwind(move || {
+        let _armed = PendingPersist::new(valid_session(), token_response_fixture())
+            .with_drop_probe(unwind_probe);
+        panic!("handler panic");
+    });
+    assert!(result.is_err());
+
+    assert_eq!(probe.load(Ordering::Relaxed), 0);
+}
+
+/// A minimal refresh-style token response for driving
+/// [`PendingPersist::commit`].
 fn token_response_fixture() -> huskarl::grant::core::TokenResponse {
     use huskarl::core::secrets::SecretString;
     huskarl::grant::core::RawTokenResponse::builder()
@@ -2341,6 +2395,12 @@ fn set_cookies_drop_guard_stays_silent_for_consumed_and_empty_guards() {
     let mut sink: Vec<HeaderValue> = vec![];
     sink.extend(iterated);
     assert_eq!(sink.len(), 1);
+
+    // So does the explicit non-delivery verb, for the path where the
+    // response is already gone.
+    let undeliverable =
+        SetCookies::new(vec![HeaderValue::from_static("e=f")]).with_drop_probe(Arc::clone(&probe));
+    undeliverable.discard();
 
     // The steady state — nothing owed — drops silently.
     let empty = SetCookies::default().with_drop_probe(Arc::clone(&probe));
