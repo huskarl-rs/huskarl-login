@@ -2,7 +2,8 @@
 
 use bytes::Bytes;
 use http::StatusCode;
-use huskarl::core::platform::MaybeSendSync;
+
+use crate::core::platform::MaybeSendSync;
 
 /// The rendered content of an error page.
 pub struct ErrorPageResponse {

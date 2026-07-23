@@ -1,6 +1,6 @@
 # Building the session: enrichment
 
-After a successful login the framework hands you a *seed* and the
+After a successful login the framework hands you a _seed_ and the
 [`CompletedLogin`](crate::CompletedLogin); you turn them into your session type.
 How you do that depends on whether construction needs network I/O. The three
 recipes below go from least to most involved. All use
@@ -24,7 +24,7 @@ call. Pass a synchronous closure — no `SessionEnricher` impl, no
 `Box::pin(async move { … })`:
 
 ```rust
-use huskarl::core::crypto::cipher::AeadCipher;
+use huskarl_login::core::crypto::cipher::AeadCipher;
 use huskarl_login::{CookieSessionStore, Session, SessionState};
 # struct MySession {
 #     state: SessionState,
@@ -59,7 +59,7 @@ Returning `Err` from the closure fails session creation (the callback responds
 The same no-I/O mapping written as a type, when you want to name and reuse it:
 
 ```rust
-use huskarl::core::platform::MaybeSendBoxFuture;
+use huskarl_login::core::platform::MaybeSendBoxFuture;
 use huskarl_login::{CompletedLogin, SessionEnricher, SessionError, SessionState};
 # struct MySession {
 #     state: SessionState,
@@ -95,10 +95,8 @@ clients and awaits them. Attach it with `build_with_enricher`:
 ```rust
 use std::sync::Arc;
 
-use huskarl::{
-    core::{http::HttpClient, platform::MaybeSendBoxFuture},
-    userinfo::UserInfoClient,
-};
+use huskarl_login::client::userinfo::UserInfoClient;
+use huskarl_login::core::{http::HttpClient, platform::MaybeSendBoxFuture};
 use huskarl_login::{
     CompletedLogin, CookieSessionStore, SessionEnricher, SessionError, SessionErrorKind,
     SessionState,
@@ -142,7 +140,7 @@ impl SessionEnricher<SessionState, MySession> for UserInfoEnricher {
 }
 
 # fn attach(
-#     cipher: impl huskarl::core::crypto::cipher::AeadCipher + 'static,
+#     cipher: impl huskarl_login::core::crypto::cipher::AeadCipher + 'static,
 #     http_client: Arc<dyn HttpClient>,
 #     userinfo: UserInfoClient,
 # ) -> CookieSessionStore<MySession> {
@@ -158,7 +156,7 @@ let store = CookieSessionStore::<MySession>::builder()
 # }
 ```
 
-An error from a `UserInfo` call is a [`huskarl::core::Error`] and converts with
+An error from a `UserInfo` call is a [`crate::core::Error`] and converts with
 `?` directly; a local mapping failure is a
 [`SessionError::new`](crate::SessionError::new) with a
 [`Store`](crate::SessionErrorKind) kind. An enricher that treats its extra data
@@ -171,7 +169,7 @@ changes.
 
 ## Customizing the `Session` trait
 
-Beyond *building* the session, a custom session type can override two
+Beyond _building_ the session, a custom session type can override two
 [`Session`](crate::Session) methods to change runtime behavior. Both default to
 the [`SessionState`](crate::SessionState) baseline.
 
@@ -184,7 +182,7 @@ logout and you want clean logout UX — no OP confirmation page — store the
 so the engine can send it as `id_token_hint`:
 
 ```rust
-# use huskarl::token::IdToken;
+# use huskarl_login::client::token::IdToken;
 # use huskarl_login::{Session, SessionState};
 # struct MySession {
 #     state: SessionState,
@@ -207,7 +205,8 @@ If any of your custom fields derive from a token response, override
 alongside the [`SessionState`](crate::SessionState):
 
 ```rust
-# use huskarl::{core::platform::Duration, grant::core::TokenResponse};
+# use huskarl_login::core::platform::Duration;
+# use huskarl_login::client::grant::core::TokenResponse;
 # use huskarl_login::{Session, SessionState};
 # struct MySession { state: SessionState }
 # impl Session for MySession {

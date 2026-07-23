@@ -1,12 +1,11 @@
 //! `handle_callback` — exchange the authorization code for tokens and create
 //! the session.
 
+use crate::client::grant::authorization_code::CompleteInput;
+use crate::core::crypto::cipher::AeadUnsealer as _;
+use crate::core::platform::SystemTime;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
-use huskarl::{
-    core::{crypto::cipher::AeadUnsealer as _, platform::SystemTime},
-    grant::authorization_code::CompleteInput,
-};
 use serde::Deserialize;
 
 use super::{LoginEngine, LoginResponse, LoginStateCookie, error_chain};

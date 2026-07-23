@@ -7,10 +7,11 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use bytes::Bytes;
-use http::{HeaderMap, HeaderValue, Method, StatusCode};
-use huskarl::{
+use crate::{
+    client::{
+        grant::authorization_code::{AuthorizationCodeGrant, PendingState},
+        token::RefreshToken,
+    },
     core::{
         Error, ErrorKind,
         client_auth::NoAuth,
@@ -24,9 +25,10 @@ use huskarl::{
         http::{HttpClient, HttpResponse, Idempotency},
         platform::MaybeSendBoxFuture,
     },
-    grant::authorization_code::{AuthorizationCodeGrant, PendingState},
-    token::RefreshToken,
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::Bytes;
+use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use rstest::rstest;
 use snafu::Snafu;
 
@@ -1258,7 +1260,7 @@ async fn token_expired_no_refresh_token_clears_session() {
 
 #[tokio::test]
 async fn token_expired_refresh_fails_clears_session() {
-    use huskarl::core::secrets::SecretString;
+    use crate::core::secrets::SecretString;
     let session = session_with(
         SystemTime::now() - Duration::from_mins(1),
         Some(RefreshToken::new(SecretString::new("test_refresh"), None)),
@@ -1279,7 +1281,7 @@ async fn token_expired_refresh_fails_clears_session() {
 /// refresh token — i.e. one that enters the refresh path on load whenever
 /// `token_expiry` is within the refresh margin.
 fn refreshable_session(token_expiry: SystemTime) -> MockSession {
-    use huskarl::core::secrets::SecretString;
+    use crate::core::secrets::SecretString;
     session_with(
         token_expiry,
         Some(RefreshToken::new(SecretString::new("test_refresh"), None)),
@@ -1561,9 +1563,9 @@ async fn pending_persist_drop_guard_stays_silent_for_defused_guards() {
 
 /// A minimal refresh-style token response for driving
 /// [`PendingPersist::commit`].
-fn token_response_fixture() -> huskarl::grant::core::TokenResponse {
-    use huskarl::core::secrets::SecretString;
-    huskarl::grant::core::RawTokenResponse::builder()
+fn token_response_fixture() -> crate::client::grant::core::TokenResponse {
+    use crate::core::secrets::SecretString;
+    crate::client::grant::core::RawTokenResponse::builder()
         .access_token(SecretString::new("refreshed-access-token"))
         .token_type("Bearer")
         .build()
@@ -2380,7 +2382,7 @@ fn metrics_refresh_no_refresh_token_when_none_available() {
 #[test]
 fn metrics_refresh_failed_when_grant_refresh_fails() {
     let ((), counters) = with_metrics(async {
-        use huskarl::core::secrets::SecretString;
+        use crate::core::secrets::SecretString;
         let session = session_with(
             SystemTime::now() - Duration::from_mins(1),
             Some(RefreshToken::new(SecretString::new("test_refresh"), None)),

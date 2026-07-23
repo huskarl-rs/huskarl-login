@@ -87,7 +87,7 @@ inner handler's latency.
 When the AS rotates refresh tokens, the expected deployment shape is:
 
 - a **shared refresh-token cache** across replicas (implement
-  `huskarl::cache::TokenCache` / `RefreshTokenStore` over shared storage) so
+  `huskarl_login::client::cache::TokenCache` / `RefreshTokenStore` over shared storage) so
   concurrent refreshes converge on the rotated token instead of racing, and
 - an AS configured with a **rotation grace period**, so reuse of the
   just-rotated token inside the race window is honored rather than treated as

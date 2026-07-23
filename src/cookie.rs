@@ -7,15 +7,15 @@ use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::{HeaderValue, header};
-use huskarl::core::crypto::{
-    KeyMatchStrength,
-    cipher::{AeadCipher, AeadEncryptor as _, AeadUnsealer, AeadV1Cipher, CipherMatch},
-};
 use serde::{Serialize, de::DeserializeOwned};
 use snafu::Snafu;
 
 use crate::{
     config::RoutePath,
+    core::crypto::{
+        KeyMatchStrength,
+        cipher::{AeadCipher, AeadEncryptor as _, AeadUnsealer, AeadV1Cipher, CipherMatch},
+    },
     metrics::DecryptResult,
     session::{SessionError, SessionErrorKind},
 };

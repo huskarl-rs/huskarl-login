@@ -25,7 +25,7 @@ session is then stored by a [`CookieSessionStore`](https://docs.rs/huskarl-login
 browser cookies) or a [`StoreBackedSessionStore`](https://docs.rs/huskarl-login/latest/huskarl_login/store_session/struct.StoreBackedSessionStore.html) (persisted via an
 [`ExternalSessionStore`](https://docs.rs/huskarl-login/latest/huskarl_login/store_session/trait.ExternalSessionStore.html) behind a pointer cookie).
 
-Trait bounds use `huskarl::core::platform`’s `MaybeSend` / `MaybeSendSync`
+Trait bounds use `huskarl_login::core::platform`’s `MaybeSend` / `MaybeSendSync`
 markers, so the crate also compiles for `wasm32` and WASI targets.
 
 # Guides and explanation

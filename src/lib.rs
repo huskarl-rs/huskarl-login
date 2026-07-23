@@ -14,14 +14,14 @@
 //! cookie and URL helpers, and session store traits.
 //!
 //! The OAuth flow is driven by a
-//! [`huskarl::grant::authorization_code::AuthorizationCodeGrant`] passed to the
+//! [`client::grant::authorization_code::AuthorizationCodeGrant`] passed to the
 //! [`engine::LoginEngine`]. A [`SessionEnricher`] builds the application's
 //! session type from a framework-prepared seed and the [`CompletedLogin`]; the
 //! session is then stored by a [`CookieSessionStore`] (sealed into AEAD
 //! browser cookies) or a [`StoreBackedSessionStore`] (persisted via an
 //! [`ExternalSessionStore`] behind a pointer cookie).
 //!
-//! Trait bounds use `huskarl::core::platform`'s `MaybeSend` / `MaybeSendSync`
+//! Trait bounds use `huskarl_login::core::platform`'s `MaybeSend` / `MaybeSendSync`
 //! markers, so the crate also compiles for `wasm32` and WASI targets.
 //!
 //! # Guides and explanation
@@ -34,10 +34,14 @@
 #[cfg(any(doc, docsrs))]
 pub mod _docs;
 
+pub use huskarl as client;
+pub use huskarl::core;
+
 pub mod cookie;
 pub mod engine;
 pub mod liveness;
 pub mod metrics;
+pub mod prelude;
 pub mod session;
 pub mod url;
 
@@ -52,6 +56,8 @@ mod store_session;
 #[cfg(test)]
 mod test_support;
 
+pub use core::EndpointUrl;
+
 pub use completed_login::CompletedLogin;
 pub use config::{
     ActivityPolicy, ConfigError, InvalidRoutePath, LoginConfig, LogoutConfig, RoutePath,
@@ -64,7 +70,6 @@ pub use cookie_session::{
 pub use engine::{DefaultPersistFailurePolicy, PersistFailurePolicy, TeardownReason};
 pub use enrich::{NoEnrichment, SessionEnricher};
 pub use error_page::{DefaultErrorPage, ErrorPage, ErrorPageResponse};
-pub use huskarl::core::EndpointUrl;
 pub use liveness::{DEFAULT_IDLE_TIMEOUT, LivenessConfig, LivenessStore, LivenessVerdict};
 pub use session::{SessionDriver, SessionError, SessionErrorKind};
 pub use session_state::{Session, SessionState};

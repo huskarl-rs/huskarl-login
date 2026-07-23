@@ -2,14 +2,14 @@
 
 use std::{fmt, sync::Arc};
 
-use http::HeaderValue;
-use huskarl::{
+use crate::{
+    client::grant::core::TokenResponse,
     core::{
         crypto::cipher::AeadCipher,
         platform::{MaybeSend, MaybeSendSync, SystemTime},
     },
-    grant::core::TokenResponse,
 };
+use http::HeaderValue;
 
 use crate::{completed_login::CompletedLogin, liveness::LivenessVerdict, session_state::Session};
 
@@ -90,9 +90,9 @@ impl From<SessionErrorKind> for SessionError {
     }
 }
 
-impl From<huskarl::core::Error> for SessionError {
+impl From<crate::core::Error> for SessionError {
     /// Carry a huskarl error as a session error, preserving its retryability.
-    fn from(err: huskarl::core::Error) -> Self {
+    fn from(err: crate::core::Error) -> Self {
         let kind = if err.is_retryable() {
             SessionErrorKind::Unavailable
         } else {

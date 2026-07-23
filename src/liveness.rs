@@ -5,10 +5,13 @@
 //! enforcement fails open: a missing entry or read error is treated as active,
 //! never expired.
 
-use huskarl::core::platform::{Duration, MaybeSendBoxFuture, MaybeSendSync, SystemTime};
 use uuid::Uuid;
 
-use crate::{config::ConfigError, session::SessionError};
+use crate::{
+    config::ConfigError,
+    core::platform::{Duration, MaybeSendBoxFuture, MaybeSendSync, SystemTime},
+    session::SessionError,
+};
 
 /// Default minimum interval between liveness writes: one hour.
 const DEFAULT_TOUCH_MIN_INTERVAL: Duration = Duration::from_secs(3600);

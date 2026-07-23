@@ -87,7 +87,7 @@ where
         };
         let id_token_hint = loaded_session
             .and_then(|s| s.id_token())
-            .map(huskarl::token::IdToken::token);
+            .map(crate::client::token::IdToken::token);
         // Always send client_id: the built-in sessions don't store the
         // id_token, so without it the OP can't identify the RP and will drop
         // post_logout_redirect_uri (OIDC RP-Initiated Logout 1.0 §2).

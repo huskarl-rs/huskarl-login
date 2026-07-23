@@ -6,10 +6,6 @@ use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
-use huskarl::core::{
-    crypto::cipher::{AeadCipher, AeadSealer as _, CipherMatch},
-    platform::MaybeSendSync,
-};
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 
@@ -19,6 +15,10 @@ use crate::{
     cookie::{
         CookieName, CookieSealer, DEFAULT_COOKIE_MAX_AGE, decode_payload, encode_payload,
         get_kid_cookie, kid_cookie_name, unseal_with_kid_fallback,
+    },
+    core::{
+        crypto::cipher::{AeadCipher, AeadSealer as _, CipherMatch},
+        platform::MaybeSendSync,
     },
     enrich::{NoEnrichment, SessionEnricher},
     metrics::DecryptResult,
@@ -487,13 +487,13 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use http::HeaderMap;
-    use huskarl::core::{crypto::cipher::AeadV1Cipher, platform::MaybeSendBoxFuture};
     use huskarl_crypto_native::aead::AesGcmKey;
 
     use super::*;
     use crate::{
         config::InvalidRoutePath,
         cookie::{InvalidCookieName, encode_kid},
+        core::{crypto::cipher::AeadV1Cipher, platform::MaybeSendBoxFuture},
         session_state::SessionState,
         test_support::{aes_key_with_kid, test_cipher, test_cipher_with_kid},
     };
@@ -771,7 +771,7 @@ mod tests {
 
     // ── kid sidecar as hint, not filter ───────────────────────────────────
 
-    use huskarl::core::crypto::cipher::{AeadDecryptor, MultiKeyCipher, MultiKeyDecryptor};
+    use crate::core::crypto::cipher::{AeadDecryptor, MultiKeyCipher, MultiKeyDecryptor};
 
     /// A rotation-shaped cipher: seals under "v2", unseals under {"v1", "v2"}.
     /// Its decryptor treats an exact-kid match as definitive, so a wrong
@@ -1125,7 +1125,7 @@ mod tests {
         // The accessor a convenience layer uses to default the login-state
         // cipher: it must hand back the store's actual configured cipher
         // (matched here by reported key id), not a re-wrapped or empty one.
-        use huskarl::core::crypto::cipher::AeadEncryptor as _;
+        use crate::core::crypto::cipher::AeadEncryptor as _;
         let store = CookieSessionStore::<CookieSession>::builder()
             .cipher(test_cipher_with_kid("v5").await)
             .cookie_name("huskarl_session".parse().unwrap())
@@ -1137,15 +1137,15 @@ mod tests {
 
     /// A completed login carrying an `email` profile claim.
     fn completed_with_email(email: &str) -> CompletedLogin {
-        let token_response = huskarl::grant::core::RawTokenResponse::builder()
+        let token_response = crate::client::grant::core::RawTokenResponse::builder()
             // A fixture token value, not a key — `SecretString::new` is the
             // value wrapper, distinct from the `Secret` key-source layer.
-            .access_token(huskarl::core::secrets::SecretString::new("access-token"))
+            .access_token(crate::core::secrets::SecretString::new("access-token"))
             .token_type("Bearer")
             .build()
             .into_token_response(None, SystemTime::now())
             .unwrap();
-        let mut claims = huskarl::token::id_token::IdTokenClaims::default();
+        let mut claims = crate::client::token::id_token::IdTokenClaims::default();
         claims.profile.email = Some(email.to_owned());
         CompletedLogin::builder()
             .token_response(token_response)

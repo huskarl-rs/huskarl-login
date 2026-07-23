@@ -4,22 +4,22 @@
 
 use std::sync::{Arc, LazyLock};
 
-use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
-use huskarl::{
-    core::{
-        Error,
-        crypto::cipher::{AeadCipher, AeadV1Cipher},
-        platform::{Duration, MaybeSendSync, SystemTime, sleep},
-        serde_utils::time::unix_secs,
-    },
-    grant::{
+use crate::core::{
+    Error,
+    crypto::cipher::{AeadCipher, AeadV1Cipher},
+    platform::{Duration, MaybeSendSync, SystemTime, sleep},
+    serde_utils::time::unix_secs,
+};
+use crate::{
+    client::grant::{
         authorization_code::{AuthorizationCodeGrant, PendingState},
         core::{OAuth2ExchangeGrant as _, TokenResponse},
         refresh::RefreshGrantParameters,
     },
-    token::RefreshToken,
+    client::token::RefreshToken,
 };
+use bytes::Bytes;
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 

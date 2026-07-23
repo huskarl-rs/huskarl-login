@@ -8,9 +8,11 @@
 //! [`StoreBackedSessionStore`](crate::StoreBackedSessionStore). The default
 //! [`NoEnrichment`] converts the seed via [`From`].
 
-use huskarl::core::platform::{MaybeSend, MaybeSendBoxFuture, MaybeSendSync};
-
-use crate::{completed_login::CompletedLogin, session::SessionError};
+use crate::{
+    completed_login::CompletedLogin,
+    core::platform::{MaybeSend, MaybeSendBoxFuture, MaybeSendSync},
+    session::SessionError,
+};
 
 /// Asynchronously builds the session type from framework-prepared seed data
 /// and the completed login.

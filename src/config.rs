@@ -6,11 +6,11 @@
 use std::time::Duration;
 
 use http::HeaderMap;
-use huskarl::core::EndpointUrl;
 use snafu::Snafu;
 
 use crate::{
     cookie::CookieName,
+    core::EndpointUrl,
     engine::{is_cross_site_request, is_navigation_request},
 };
 
@@ -368,7 +368,7 @@ impl LogoutConfig {
 /// Configuration for the login middleware; constructed via
 /// [`builder`](Self::builder). Authorization server endpoints, client
 /// credentials, and redirect URI are configured on the
-/// [`AuthorizationCodeGrant`](huskarl::grant::authorization_code::AuthorizationCodeGrant)
+/// [`AuthorizationCodeGrant`](crate::client::grant::authorization_code::AuthorizationCodeGrant)
 /// directly.
 #[derive(Debug)]
 #[non_exhaustive]

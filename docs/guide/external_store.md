@@ -3,7 +3,7 @@
 [`StoreBackedSessionStore`](crate::StoreBackedSessionStore) delegates the actual
 session data to an [`ExternalSessionStore`](crate::ExternalSessionStore) you
 implement over your backend (Redis, SQL, DynamoDB, …). The trait is pure
-storage — insert, load, save, compare-and-swap, delete. Session *construction*
+storage — insert, load, save, compare-and-swap, delete. Session _construction_
 from a login is the enricher's job, not the store's.
 
 ## The session type
@@ -74,7 +74,7 @@ Records it cannot reach — the pointer cookie was cleared, or its cookie key
 was rotated out without a grace period — are the backend's to reap, and
 `storage_deadline` is the detector: a record past its deadline is one your
 lifetime cap or activity bound says must not be served again, so deleting it
-is always safe. Deleting it is also what *enforces* the bound: liveness fails
+is always safe. Deleting it is also what _enforces_ the bound: liveness fails
 open, so once the liveness entry is gone, a record that is still stored would
 serve — and refresh — an idle-expired session.
 
@@ -94,7 +94,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Mutex;
 
-use huskarl::core::crypto::cipher::AeadCipher;
+use huskarl_login::core::crypto::cipher::AeadCipher;
 use huskarl_login::{
     ExternalSessionStore, PersistedSession, PersistedSessionState, SaveOutcome, Session,
     SessionState, StoreBackedSessionStore,

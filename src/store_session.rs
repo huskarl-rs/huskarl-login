@@ -6,15 +6,15 @@
 
 use std::{borrow::Cow, sync::Arc, time::Duration};
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use http::HeaderValue;
-use huskarl::{
+use crate::{
+    client::grant::core::TokenResponse,
     core::{
         crypto::cipher::{AeadCipher, AeadSealer as _, CipherMatch},
         platform::{MaybeSend, MaybeSendSync, SystemTime},
     },
-    grant::core::TokenResponse,
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use http::HeaderValue;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 use uuid::Uuid;
@@ -707,11 +707,10 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
 mod tests {
     use std::convert::Infallible;
 
-    use huskarl::core::{crypto::cipher::AeadV1Cipher, platform::MaybeSendBoxFuture};
-
     use super::*;
     use crate::{
         cookie::encode_kid,
+        core::{crypto::cipher::AeadV1Cipher, platform::MaybeSendBoxFuture},
         session_state::{Session, SessionState},
         test_support::{aes_key_with_kid, test_cipher, test_cipher_with_kid},
     };
@@ -1493,8 +1492,8 @@ mod tests {
     /// A refresh-style token response with no `expires_in`, so the new expiry
     /// comes from the `default_lifetime` handed to `apply_refresh`.
     fn refresh_token_response() -> TokenResponse {
-        huskarl::grant::core::RawTokenResponse::builder()
-            .access_token(huskarl::core::secrets::SecretString::new(
+        crate::client::grant::core::RawTokenResponse::builder()
+            .access_token(crate::core::secrets::SecretString::new(
                 "refreshed-access-token",
             ))
             .token_type("Bearer")
@@ -1662,7 +1661,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_pointer_cookie_falls_back_when_kid_names_wrong_configured_key() {
-        use huskarl::core::crypto::cipher::{AeadDecryptor, MultiKeyCipher, MultiKeyDecryptor};
+        use crate::core::crypto::cipher::{AeadDecryptor, MultiKeyCipher, MultiKeyDecryptor};
 
         // Rotation-shaped cipher: seals under "v2", unseals under {"v1","v2"}.
         let decryptor = MultiKeyDecryptor::new(vec![
@@ -1771,15 +1770,15 @@ mod tests {
 
     /// A completed login carrying an `email` profile claim.
     fn completed_with_email(email: &str) -> crate::CompletedLogin {
-        let token_response = huskarl::grant::core::RawTokenResponse::builder()
+        let token_response = crate::client::grant::core::RawTokenResponse::builder()
             // A fixture token value, not a key — `SecretString::new` is the
             // value wrapper, distinct from the `Secret` key-source layer.
-            .access_token(huskarl::core::secrets::SecretString::new("access-token"))
+            .access_token(crate::core::secrets::SecretString::new("access-token"))
             .token_type("Bearer")
             .build()
             .into_token_response(None, std::time::SystemTime::now())
             .unwrap();
-        let mut claims = huskarl::token::id_token::IdTokenClaims::default();
+        let mut claims = crate::client::token::id_token::IdTokenClaims::default();
         claims.profile.email = Some(email.to_owned());
         crate::CompletedLogin::builder()
             .token_response(token_response)
@@ -1864,7 +1863,7 @@ mod tests {
         // The accessor a convenience layer uses to default the login-state
         // cipher: it must hand back the store's actual configured cipher
         // (matched here by reported key id), not a re-wrapped or empty one.
-        use huskarl::core::crypto::cipher::AeadEncryptor as _;
+        use crate::core::crypto::cipher::AeadEncryptor as _;
         let session = test_session();
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session))

@@ -9,7 +9,7 @@ users out. The background is in the
 
 Concurrent requests across replicas can enter the refresh window for the same
 session at once. Give them a shared place to converge by implementing
-`huskarl::cache::TokenCache` / `RefreshTokenStore` over shared storage (the same
+`huskarl_login::client::cache::TokenCache` / `RefreshTokenStore` over shared storage (the same
 Redis/database you already run). Concurrent refreshes then coordinate through it
 instead of each independently spending the refresh token and racing.
 

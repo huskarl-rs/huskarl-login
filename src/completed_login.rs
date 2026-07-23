@@ -1,6 +1,6 @@
 //! [`CompletedLogin`]: the result of a successful login completion.
 
-use huskarl::{grant::core::TokenResponse, token::id_token::IdTokenClaims};
+use crate::client::{grant::core::TokenResponse, token::id_token::IdTokenClaims};
 
 /// The token response and validated identity claims from a completed login
 /// (claims present only for OIDC flows).

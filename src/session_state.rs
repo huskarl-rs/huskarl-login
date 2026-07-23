@@ -2,13 +2,13 @@
 //! token/timing fields, [`Session`] exposes them to the middleware. State is
 //! immutable. Liveness is tracked separately (see [`crate::liveness`]).
 
-use huskarl::{
+use crate::{
+    client::grant::core::TokenResponse,
+    client::token::{IdToken, RefreshToken},
     core::{
         platform::{Duration, SystemTime},
         serde_utils::time::{option_unix_secs, unix_secs},
     },
-    grant::core::TokenResponse,
-    token::{IdToken, RefreshToken},
 };
 use serde::{Deserialize, Serialize};
 

@@ -2,10 +2,8 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::{HeaderValue, Uri};
-use huskarl::{
-    core::{crypto::cipher::AeadSealer as _, platform::SystemTime},
-    grant::authorization_code::StartInput,
-};
+use crate::client::grant::authorization_code::StartInput;
+use crate::core::{crypto::cipher::AeadSealer as _, platform::SystemTime};
 
 use super::{EngineError, LoginEngine, LoginResponse, LoginStateCookie};
 use crate::{
@@ -51,7 +49,7 @@ where
         &self,
         state: &str,
         original_url: String,
-        pending_state: huskarl::grant::authorization_code::PendingState,
+        pending_state: crate::client::grant::authorization_code::PendingState,
     ) -> Result<HeaderValue, EngineError> {
         let payload = encode_payload(&LoginStateCookie {
             original_url,

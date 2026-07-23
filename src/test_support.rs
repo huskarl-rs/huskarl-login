@@ -5,13 +5,14 @@
 //! and reachable as `crate::test_support::*`.
 
 use http::{HeaderMap, HeaderName, HeaderValue};
-use huskarl::core::{
+use huskarl_crypto_native::aead::AesGcmKey;
+
+use crate::core::{
     Error,
     jwk::OctBytes,
     platform::MaybeSendBoxFuture,
     secrets::{Secret, SecretBytes, SecretOutput},
 };
-use huskarl_crypto_native::aead::AesGcmKey;
 
 /// A [`Secret`] yielding fixed bytes and no key identity.
 #[derive(Clone)]
