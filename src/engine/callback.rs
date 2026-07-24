@@ -243,10 +243,7 @@ where
     /// Builds the `Set-Cookie` value that clears a login-state cookie by name.
     /// `None` if the name produces an invalid header value.
     pub(super) fn clear_login_state_cookie(&self, cookie_name: &str) -> Option<HeaderValue> {
-        let attrs = cookie_attrs(
-            self.secure,
-            self.config.browser_callback_path.as_str(),
-        );
+        let attrs = cookie_attrs(self.secure, self.config.browser_callback_path.as_str());
         HeaderValue::from_str(&format!("{cookie_name}=; {attrs}; Max-Age=0")).ok()
     }
 

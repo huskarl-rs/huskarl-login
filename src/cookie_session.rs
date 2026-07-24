@@ -16,11 +16,7 @@ use crate::{
         CookieName, CookieSealer, DEFAULT_COOKIE_MAX_AGE, decode_payload, encode_payload,
         get_kid_cookie, kid_cookie_name, unseal_with_kid_fallback,
     },
-    core::{
-        crypto::seal::AeadSealerUnsealer,
-        platform::MaybeSendSync,
-        prelude::*,
-    },
+    core::{crypto::seal::AeadSealerUnsealer, platform::MaybeSendSync, prelude::*},
     enrich::{NoEnrichment, SessionEnricher},
     metrics::DecryptResult,
     session::{SessionDriver, SessionError, SessionErrorKind},
@@ -208,25 +204,21 @@ impl<C: CookiePayload> CookieSessionStore<C> {
         let kid = get_kid_cookie(headers, &self.sealer.cookie_name);
 
         let Ok(bundle) = URL_SAFE_NO_PAD.decode(&raw_encoded) else {
-            self.sealer
-                .record_decrypt(&DecryptResult::BadEncoding);
+            self.sealer.record_decrypt(&DecryptResult::BadEncoding);
             return None;
         };
         let aad = self.sealer.aad("session");
         let Some(plaintext) =
             unseal_with_kid_fallback(&self.sealer.cipher, kid.as_deref(), &bundle, &aad).await
         else {
-            self.sealer
-                .record_decrypt(&DecryptResult::DecryptFailed);
+            self.sealer.record_decrypt(&DecryptResult::DecryptFailed);
             return None;
         };
         if let Ok(session) = decode_payload(&plaintext) {
-            self.sealer
-                .record_decrypt(&DecryptResult::Ok);
+            self.sealer.record_decrypt(&DecryptResult::Ok);
             Some(session)
         } else {
-            self.sealer
-                .record_decrypt(&DecryptResult::PayloadInvalid);
+            self.sealer.record_decrypt(&DecryptResult::PayloadInvalid);
             None
         }
     }
@@ -894,16 +886,26 @@ mod tests {
 
         // Same key, different cookie name → the AAD differs, so it must not unseal.
         assert!(
-            unseal_with_kid_fallback(&sealer_b.cipher, None, &output.bundle, &sealer_b.aad("session"))
-                .await
-                .is_none(),
+            unseal_with_kid_fallback(
+                &sealer_b.cipher,
+                None,
+                &output.bundle,
+                &sealer_b.aad("session")
+            )
+            .await
+            .is_none(),
             "a session sealed for app_a must not unseal under app_b's cookie name"
         );
         // Sanity: it unseals under its own cookie name.
         assert!(
-            unseal_with_kid_fallback(&sealer_a.cipher, None, &output.bundle, &sealer_a.aad("session"))
-                .await
-                .is_some(),
+            unseal_with_kid_fallback(
+                &sealer_a.cipher,
+                None,
+                &output.bundle,
+                &sealer_a.aad("session")
+            )
+            .await
+            .is_some(),
         );
     }
 
@@ -1635,5 +1637,4 @@ mod tests {
             1
         );
     }
-
 }

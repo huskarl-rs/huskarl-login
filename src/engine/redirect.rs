@@ -1,9 +1,9 @@
 //! `redirect_to_as` — start the OAuth flow by redirecting to the AS.
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use http::{HeaderValue, Uri};
 use crate::client::grant::authorization_code::StartInput;
 use crate::core::{platform::SystemTime, prelude::*};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use http::{HeaderValue, Uri};
 
 use super::{EngineError, LoginEngine, LoginResponse, LoginStateCookie};
 use crate::{
@@ -20,9 +20,12 @@ where
         &self,
         request_uri: &Uri,
     ) -> Result<LoginResponse, EngineError> {
-        let orig_url =
-            original_url(&self.base_url, self.config.strip_prefix.as_ref(), request_uri)
-                .unwrap_or_else(|| base_url_as_string(&self.base_url));
+        let orig_url = original_url(
+            &self.base_url,
+            self.config.strip_prefix.as_ref(),
+            request_uri,
+        )
+        .unwrap_or_else(|| base_url_as_string(&self.base_url));
 
         let start = self
             .grant
@@ -70,10 +73,7 @@ where
             self.config.login_cookie_prefix.as_str(),
         );
         let cookie_value = URL_SAFE_NO_PAD.encode(&sealed.bundle);
-        let attrs = cookie_attrs(
-            self.secure,
-            self.config.browser_callback_path.as_str(),
-        );
+        let attrs = cookie_attrs(self.secure, self.config.browser_callback_path.as_str());
         let max_age = self.config.login_state_ttl.as_secs();
         HeaderValue::from_str(&format!(
             "{cookie_name}={cookie_value}; {attrs}; Max-Age={max_age}"

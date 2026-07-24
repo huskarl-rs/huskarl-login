@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Default minimum interval between liveness writes: one hour.
-const DEFAULT_TOUCH_MIN_INTERVAL: Duration = Duration::from_secs(3600);
+const DEFAULT_TOUCH_MIN_INTERVAL: Duration = Duration::from_hours(1);
 
 /// Default [`idle_timeout`](LivenessConfig::idle_timeout): 30 days.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_hours(30 * 24);

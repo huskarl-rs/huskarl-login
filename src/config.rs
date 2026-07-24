@@ -568,8 +568,11 @@ impl LoginConfig {
         // joined result is re-validated before it is emitted as a cookie `Path`,
         // closing the one route by which a `;`/control char could reach a
         // `Set-Cookie` header. Independent of the origin, so it's known here.
-        let browser_callback_path =
-            compute_browser_callback_path(&callback_path, strip_prefix.as_ref(), base_path.as_ref());
+        let browser_callback_path = compute_browser_callback_path(
+            &callback_path,
+            strip_prefix.as_ref(),
+            base_path.as_ref(),
+        );
         let browser_callback_path =
             RoutePath::new(browser_callback_path).map_err(|e| ConfigError::InvalidBasePath {
                 path: base_path

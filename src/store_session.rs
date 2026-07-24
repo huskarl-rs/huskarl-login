@@ -274,7 +274,6 @@ impl<E: ExternalSessionStore, S: store_builder::IsComplete> StoreBackedSessionSt
 }
 
 impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
-
     /// Attach server-side liveness (idle-timeout) tracking, backed by the given
     /// [`LivenessStore`] and configured by `config`. Returns `self`. See
     /// [`crate::liveness`] for the fail-open / monotonic contract.
@@ -396,26 +395,22 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         let kid = get_kid_cookie(headers, &self.sealer.cookie_name);
 
         let Ok(bundle) = URL_SAFE_NO_PAD.decode(encoded) else {
-            self.sealer
-                .record_decrypt(&DecryptResult::BadEncoding);
+            self.sealer.record_decrypt(&DecryptResult::BadEncoding);
             return None;
         };
         let aad = self.sealer.aad("session_ptr");
         let Some(plaintext) =
             unseal_with_kid_fallback(&self.sealer.cipher, kid.as_deref(), &bundle, &aad).await
         else {
-            self.sealer
-                .record_decrypt(&DecryptResult::DecryptFailed);
+            self.sealer.record_decrypt(&DecryptResult::DecryptFailed);
             return None;
         };
         // Must be exactly 16 bytes (UUID); anything else is a corrupted cookie.
         if let Ok(bytes) = <[u8; 16]>::try_from(plaintext) {
-            self.sealer
-                .record_decrypt(&DecryptResult::Ok);
+            self.sealer.record_decrypt(&DecryptResult::Ok);
             Some(Uuid::from_bytes(bytes))
         } else {
-            self.sealer
-                .record_decrypt(&DecryptResult::PayloadInvalid);
+            self.sealer.record_decrypt(&DecryptResult::PayloadInvalid);
             None
         }
     }

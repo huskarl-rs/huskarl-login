@@ -26,7 +26,8 @@
 //!
 //! # Guides and explanation
 //!
-//! The API items here are the reference docs. For task-oriented how-to guides
+//! New here? Start with [getting started](_docs::guide::getting_started) for a
+//! minimal end-to-end wiring. For the other task-oriented how-to guides
 //! (implementing a framework adapter, enrichment, implementing an external
 //! store, refresh-token rotation) and design explanation (the session model,
 //! liveness, cookie security), see the [`_docs`] module.

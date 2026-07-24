@@ -30,6 +30,9 @@ pub mod explanation {
 
 /// Task-oriented recipes for wiring the crate into an application.
 pub mod guide {
+    #[doc = include_str!("../docs/guide/getting_started.md")]
+    pub mod getting_started {}
+
     #[doc = include_str!("../docs/guide/adapter.md")]
     pub mod adapter {}
 

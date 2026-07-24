@@ -246,7 +246,11 @@ mod tests {
     fn original_url_strip_prefix_removes_prefix() {
         let uri: http::Uri = "/internal/page".parse().unwrap();
         assert_eq!(
-            original_url(&base("https://app.example.com"), Some(&strip("/internal")), &uri),
+            original_url(
+                &base("https://app.example.com"),
+                Some(&strip("/internal")),
+                &uri
+            ),
             Some("https://app.example.com/page".into())
         );
     }
@@ -255,7 +259,11 @@ mod tests {
     fn original_url_strip_prefix_preserves_query() {
         let uri: http::Uri = "/internal/page?foo=bar".parse().unwrap();
         assert_eq!(
-            original_url(&base("https://app.example.com"), Some(&strip("/internal")), &uri),
+            original_url(
+                &base("https://app.example.com"),
+                Some(&strip("/internal")),
+                &uri
+            ),
             Some("https://app.example.com/page?foo=bar".into())
         );
     }
@@ -264,7 +272,11 @@ mod tests {
     fn original_url_strip_prefix_mismatch_returns_none() {
         let uri: http::Uri = "/other/page".parse().unwrap();
         assert_eq!(
-            original_url(&base("https://app.example.com"), Some(&strip("/internal")), &uri),
+            original_url(
+                &base("https://app.example.com"),
+                Some(&strip("/internal")),
+                &uri
+            ),
             None
         );
     }
@@ -273,7 +285,11 @@ mod tests {
     fn original_url_strip_prefix_with_base_path() {
         let uri: http::Uri = "/internal/page".parse().unwrap();
         assert_eq!(
-            original_url(&base("https://app.example.com/base"), Some(&strip("/internal")), &uri),
+            original_url(
+                &base("https://app.example.com/base"),
+                Some(&strip("/internal")),
+                &uri
+            ),
             Some("https://app.example.com/base/page".into())
         );
     }

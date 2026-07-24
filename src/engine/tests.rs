@@ -507,7 +507,8 @@ async fn engine_with_config(
         .grant(test_grant(FailingHttp::new(false).0).await)
         .session_store(store)
         .sealer(test_sealer().await)
-        .build().unwrap()
+        .build()
+        .unwrap()
 }
 
 #[tokio::test]
@@ -586,7 +587,8 @@ async fn engine_defaults_login_state_cipher_to_store_cipher() {
         .config(default_config())
         .grant(test_grant(FailingHttp::new(false).0).await)
         .session_store(store)
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     let uri = "/dashboard".parse().unwrap();
     let r = e.redirect_to_login(&nav_headers(), &uri).await;
@@ -1302,7 +1304,8 @@ async fn engine_with_failing_refresh(
         .grant(test_grant(http).await)
         .session_store(MockSessionStore::with_session(session))
         .sealer(test_sealer().await)
-        .build().unwrap();
+        .build()
+        .unwrap();
     (e, calls)
 }
 
@@ -1334,7 +1337,8 @@ async fn refresh_success_persists_eagerly() {
         .grant(test_grant(TokenHttp).await)
         .session_store(MockSessionStore::with_session(session))
         .sealer(test_sealer().await)
-        .build().unwrap();
+        .build()
+        .unwrap();
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     // The refreshed session was saved inside load_session — `Active`, with
     // nothing left for the post-response persist phase.
@@ -1360,7 +1364,8 @@ async fn refresh_success_with_failing_save_defers_persistence() {
         .grant(test_grant(TokenHttp).await)
         .session_store(MockSessionStore::with_session_failing_save(session))
         .sealer(test_sealer().await)
-        .build().unwrap();
+        .build()
+        .unwrap();
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let pending = expect_pending(loaded);
     // The refresh itself was applied — only persistence is outstanding.
@@ -1380,7 +1385,8 @@ async fn commit_retries_the_deferred_refresh_save() {
         .grant(test_grant(TokenHttp).await)
         .session_store(MockSessionStore::with_session_failing_save(session))
         .sealer(test_sealer().await)
-        .build().unwrap();
+        .build()
+        .unwrap();
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let pending = expect_pending(loaded);
     // A serving handle taken during the request survives the commit.
@@ -1466,7 +1472,8 @@ async fn refresh_unavailable_session_recovers_when_the_as_does() {
         .grant(test_grant(TokenHttp).await)
         .session_store(MockSessionStore::with_session(session))
         .sealer(test_sealer().await)
-        .build().unwrap();
+        .build()
+        .unwrap();
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let (recovered, _) = expect_active(loaded);
     assert!(recovered.token_expiry() > SystemTime::now() + Duration::from_mins(30));
@@ -1479,7 +1486,8 @@ async fn load_session_store_error_bubbles_up() {
         .grant(test_grant(FailingHttp::new(false).0).await)
         .session_store(ErrorSessionStore)
         .sealer(test_sealer().await)
-        .build().unwrap();
+        .build()
+        .unwrap();
     let err = e
         .load_session(&HeaderMap::new())
         .await
@@ -1721,7 +1729,8 @@ async fn callback_success_redirects_to_original_url() {
         .grant(test_grant(TokenHttp).await)
         .session_store(MockSessionStore::empty())
         .sealer(test_sealer().await)
-        .build().unwrap();
+        .build()
+        .unwrap();
     let state = "valid_state";
     let sealed = seal_login_cookie(state, "https://app.example.com/page").await;
     let h = headers_with_login_cookie(state, &sealed);
@@ -1759,7 +1768,8 @@ async fn callback_success_sweeps_all_pending_login_state_cookies() {
         .grant(test_grant(TokenHttp).await)
         .session_store(MockSessionStore::empty())
         .sealer(test_sealer().await)
-        .build().unwrap();
+        .build()
+        .unwrap();
     let state = "valid_state";
     let sealed = seal_login_cookie(state, "https://app.example.com/page").await;
     let name = |s: &str| {
@@ -2120,7 +2130,8 @@ fn metrics_name_labels_engine_counters() {
             .session_store(MockSessionStore::empty())
             .sealer(test_sealer().await)
             .metrics_name("tenant-a")
-            .build().unwrap();
+            .build()
+            .unwrap();
         let _ = e
             .redirect_to_login(&nav_headers(), &"/protected".parse().unwrap())
             .await;
@@ -2157,7 +2168,8 @@ fn metrics_login_start_error_when_grant_start_fails() {
             .grant(par_failing_grant().await)
             .session_store(MockSessionStore::empty())
             .sealer(test_sealer().await)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let _ = e
             .redirect_to_login(&nav_headers(), &"/protected".parse().unwrap())
             .await;
@@ -2303,7 +2315,8 @@ fn metrics_callback_ok_on_successful_login() {
             .grant(test_grant(TokenHttp).await)
             .session_store(MockSessionStore::empty())
             .sealer(test_sealer().await)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let state = "valid_state";
         let sealed = seal_login_cookie(state, "https://app.example.com/").await;
         let h = headers_with_login_cookie(state, &sealed);
@@ -2440,7 +2453,8 @@ fn metrics_refresh_failed_retained_on_transient_failure_with_valid_token() {
                 LivenessVerdict::Active,
             ))
             .sealer(test_sealer().await)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let _ = e.load_session(&HeaderMap::new()).await.unwrap();
     });
     // The transient-retention path retains the session as-is — the refresh
@@ -2469,7 +2483,8 @@ fn metrics_refresh_failed_unavailable_on_transient_failure_with_expired_token() 
             .grant(test_grant(FailingHttp::new(true).0).await)
             .session_store(MockSessionStore::with_session(session))
             .sealer(test_sealer().await)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let _ = e.load_session(&HeaderMap::new()).await.unwrap();
     });
     assert_eq!(
@@ -2492,7 +2507,8 @@ fn metrics_refresh_ok_on_successful_refresh() {
             .grant(test_grant(TokenHttp).await)
             .session_store(MockSessionStore::with_session(session))
             .sealer(test_sealer().await)
-            .build().unwrap();
+            .build()
+            .unwrap();
         // Consume via expect_active: a successful refresh returns owed cookies,
         // and dropping them unconsumed would (correctly) trip the SetCookies guard.
         let _ = expect_active(e.load_session(&HeaderMap::new()).await.unwrap());
