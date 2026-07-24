@@ -80,7 +80,7 @@ where
     ) -> String {
         let post_logout = match &logout.post_logout_redirect_uri {
             Some(uri) => uri.clone(),
-            None => default_post_logout_redirect(&self.config),
+            None => default_post_logout_redirect(&self.base_url),
         };
         let Some(endpoint) = &logout.end_session_endpoint else {
             return post_logout;

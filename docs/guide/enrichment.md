@@ -24,7 +24,7 @@ call. Pass a synchronous closure — no `SessionEnricher` impl, no
 `Box::pin(async move { … })`:
 
 ```rust
-use huskarl_login::core::crypto::cipher::AeadCipher;
+use huskarl_login::core::crypto::{cipher::AeadCipher, seal::AeadV1Sealer};
 use huskarl_login::{CookieSessionStore, Session, SessionState};
 # struct MySession {
 #     state: SessionState,
@@ -36,7 +36,7 @@ use huskarl_login::{CookieSessionStore, Session, SessionState};
 # }
 # fn attach(cipher: impl AeadCipher + 'static) -> CookieSessionStore<MySession> {
 let store = CookieSessionStore::<MySession>::builder()
-    .cipher(cipher)
+    .sealer(AeadV1Sealer::new(cipher))
     .cookie_name("session".parse().unwrap())
     .cookie_path("/".parse().unwrap())
     .build_with_claims(|state, completed| {
@@ -96,6 +96,7 @@ clients and awaits them. Attach it with `build_with_enricher`:
 use std::sync::Arc;
 
 use huskarl_login::client::userinfo::UserInfoClient;
+use huskarl_login::core::crypto::seal::AeadV1Sealer;
 use huskarl_login::core::{http::HttpClient, platform::MaybeSendBoxFuture};
 use huskarl_login::{
     CompletedLogin, CookieSessionStore, SessionEnricher, SessionError, SessionErrorKind,
@@ -145,7 +146,7 @@ impl SessionEnricher<SessionState, MySession> for UserInfoEnricher {
 #     userinfo: UserInfoClient,
 # ) -> CookieSessionStore<MySession> {
 let store = CookieSessionStore::<MySession>::builder()
-    .cipher(cipher)
+    .sealer(AeadV1Sealer::new(cipher))
     .cookie_name("session".parse().unwrap())
     .cookie_path("/".parse().unwrap())
     .build_with_enricher(UserInfoEnricher {

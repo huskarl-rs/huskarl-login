@@ -1,9 +1,9 @@
 //! `handle_callback` — exchange the authorization code for tokens and create
 //! the session.
 
-use crate::client::grant::authorization_code::CompleteInput;
-use crate::core::crypto::cipher::AeadUnsealer as _;
+use crate::client::grant::authorization_code::{CompleteInput, CompleteOutput};
 use crate::core::platform::SystemTime;
+use crate::core::prelude::*;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use serde::Deserialize;
@@ -38,7 +38,7 @@ where
         // Locate and validate the login-state cookie.
         let cookie_name = login_state_cookie_name(
             &state,
-            self.config.secure,
+            self.secure,
             self.config.browser_callback_path.as_str(),
             self.config.login_cookie_prefix.as_str(),
         );
@@ -73,17 +73,17 @@ where
             .build();
         let completed_login = match self
             .grant
-            .complete_oidc(&login_state.pending_state, complete_input)
+            .complete(&login_state.pending_state, complete_input)
             .await
         {
-            Ok((token_response, validated_id_token)) => CompletedLogin::builder()
+            Ok(CompleteOutput {
+                token_response,
+                id_token,
+                ..
+            }) => CompletedLogin::builder()
                 .token_response(token_response)
-                .maybe_subject(
-                    validated_id_token
-                        .as_ref()
-                        .and_then(|jwt| jwt.subject.clone()),
-                )
-                .maybe_id_token_claims(validated_id_token.map(|jwt| jwt.claims))
+                .maybe_subject(id_token.as_ref().and_then(|jwt| jwt.sub.clone()))
+                .maybe_id_token_claims(id_token.map(|jwt| jwt.claims))
                 .build(),
             Err(e) => {
                 log::error!("token exchange failed: {}", error_chain(&e));
@@ -144,7 +144,7 @@ where
     fn redirect_to_base_url(&self) -> LoginResponse {
         LoginResponse::Redirect {
             status: StatusCode::FOUND,
-            location: HeaderValue::from_str(&base_url_as_string(&self.config))
+            location: HeaderValue::from_str(&base_url_as_string(&self.base_url))
                 .unwrap_or_else(|_| HeaderValue::from_static("/")),
             set_cookies: vec![],
         }
@@ -175,7 +175,7 @@ where
         session_cookies: Vec<HeaderValue>,
     ) -> LoginResponse {
         let location = HeaderValue::from_str(original_url)
-            .or_else(|_| HeaderValue::from_str(&base_url_as_string(&self.config)))
+            .or_else(|_| HeaderValue::from_str(&base_url_as_string(&self.base_url)))
             .unwrap_or_else(|_| HeaderValue::from_static("/"));
         // Sweep every login-state cookie on the request, not just the flow
         // that completed: the session now exists, so pending flows in other
@@ -184,7 +184,7 @@ where
         // hit the session cookie itself). The sweep only touches names whose
         // suffix is a valid state value — names this crate could have minted.
         let prefix = login_state_cookie_name_prefix(
-            self.config.secure,
+            self.secure,
             self.config.browser_callback_path.as_str(),
             self.config.login_cookie_prefix.as_str(),
         );
@@ -217,7 +217,7 @@ where
             .map_err(|_| (StatusCode::BAD_REQUEST, "malformed state cookie"))?;
         let plaintext = self
             .cipher
-            .unseal(None, &bundle, &super::login_state_aad(state))
+            .unseal(&bundle, &super::login_state_aad(state), None)
             .await
             .map_err(|_| (StatusCode::BAD_REQUEST, "state cookie decryption failed"))?;
         let login_state = decode_payload::<LoginStateCookie>(&plaintext)
@@ -244,7 +244,7 @@ where
     /// `None` if the name produces an invalid header value.
     pub(super) fn clear_login_state_cookie(&self, cookie_name: &str) -> Option<HeaderValue> {
         let attrs = cookie_attrs(
-            self.config.secure,
+            self.secure,
             self.config.browser_callback_path.as_str(),
         );
         HeaderValue::from_str(&format!("{cookie_name}=; {attrs}; Max-Age=0")).ok()

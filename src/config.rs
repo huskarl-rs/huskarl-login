@@ -95,12 +95,12 @@ pub enum ConfigError {
         /// Why the path was rejected.
         reason: &'static str,
     },
-    /// The `base_url` is invalid.
-    #[snafu(display("invalid base_url {url:?}: {reason}"))]
-    InvalidBaseUrl {
-        /// The offending URL.
-        url: String,
-        /// Why the URL was rejected.
+    /// The `base_path` is invalid.
+    #[snafu(display("invalid base_path {path:?}: {reason}"))]
+    InvalidBasePath {
+        /// The offending path.
+        path: String,
+        /// Why the path was rejected.
         reason: &'static str,
     },
     /// The `strip_prefix` is invalid.
@@ -141,6 +141,16 @@ pub enum ConfigError {
         /// The name of the offending field.
         field: &'static str,
         /// Why the value was rejected.
+        reason: &'static str,
+    },
+    /// The grant's `redirect_uri` is not a usable absolute URL, so the engine
+    /// cannot reconstruct the client-facing base URL from it. Checked when
+    /// building a [`LoginEngine`](crate::engine::LoginEngine).
+    #[snafu(display("invalid redirect_uri {url:?}: {reason}"))]
+    InvalidRedirectUri {
+        /// The offending URL.
+        url: String,
+        /// Why the URL was rejected.
         reason: &'static str,
     },
 }
@@ -299,12 +309,12 @@ fn validate_durations(
     Ok(())
 }
 
-/// Computes the browser-facing callback path: `base_url` path joined to
-/// `callback_path` with `strip_prefix` removed.
+/// Computes the browser-facing callback path: the `base_path` prefix joined to
+/// `callback_path` with `strip_prefix` removed. Independent of the origin.
 fn compute_browser_callback_path(
     callback_path: &RoutePath,
     strip_prefix: Option<&RoutePath>,
-    base_url: &http::Uri,
+    base_path: Option<&RoutePath>,
 ) -> String {
     let callback_path = callback_path.as_str();
     let stripped_callback = match strip_prefix {
@@ -313,7 +323,17 @@ fn compute_browser_callback_path(
             .unwrap_or(callback_path),
         None => callback_path,
     };
-    join_base_path(base_url, stripped_callback)
+    match base_path {
+        Some(base) => {
+            let base = base.as_str().trim_end_matches('/');
+            if stripped_callback.starts_with('/') {
+                format!("{base}{stripped_callback}")
+            } else {
+                format!("{base}/{stripped_callback}")
+            }
+        }
+        None => stripped_callback.to_owned(),
+    }
 }
 
 /// Logout endpoint configuration. Grouped under [`LoginConfig::logout`].
@@ -326,10 +346,11 @@ pub struct LogoutConfig {
     /// (OIDC RP-Initiated Logout 1.0).
     pub end_session_endpoint: Option<EndpointUrl>,
     /// Absolute URI to redirect to after the local session is cleared; defaults
-    /// to `base_url`. Held as the exact string supplied, as the OP matches it
-    /// byte-for-byte (OIDC RP-Initiated Logout 1.0 §3): it (and the `base_url`
-    /// default, if relied on) must be registered at the authorization server,
-    /// or the OP silently drops the redirect and strands the user on its logout
+    /// to the reconstructed base URL (the grant's `redirect_uri` origin joined
+    /// with `base_path`). Held as the exact string supplied, as the OP matches
+    /// it byte-for-byte (OIDC RP-Initiated Logout 1.0 §3): it (and the base-URL
+    /// default, if relied on) must be registered at the authorization server, or
+    /// the OP silently drops the redirect and strands the user on its logout
     /// page.
     pub post_logout_redirect_uri: Option<String>,
 }
@@ -349,7 +370,7 @@ impl LogoutConfig {
         /// Authorization server's end-session endpoint for RP-initiated logout.
         end_session_endpoint: Option<EndpointUrl>,
         /// Absolute URL to redirect to after logout, preserved exactly as
-        /// supplied. Defaults to `base_url`.
+        /// supplied. Defaults to the reconstructed base URL.
         #[builder(into)]
         post_logout_redirect_uri: Option<String>,
     ) -> Result<Self, ConfigError> {
@@ -377,10 +398,6 @@ pub struct LoginConfig {
     pub callback_path: RoutePath,
     /// OAuth 2.0 scopes to request (e.g. `bon::vec!["openid"]`).
     pub scope: Vec<String>,
-    /// Whether to set the `Secure` flag and `__Host-`/`__Secure-` cookie name
-    /// prefixes. Derived from [`base_url`](Self::base_url): `true` when its
-    /// scheme is `https`.
-    pub secure: bool,
     /// Which party bounds the session's absolute lifetime — see
     /// [`SessionLifetime`]. Idle timeout is configured separately, on the
     /// liveness store.
@@ -396,9 +413,12 @@ pub struct LoginConfig {
     /// Lifetime (and `Max-Age`) of the per-flow login-state cookie; the user
     /// has this long to complete authentication. Defaults to 10 minutes.
     pub login_state_ttl: Duration,
-    /// Canonical client-facing base URL (e.g. `"https://app.example.com"`),
-    /// used to reconstruct the post-login redirect URL behind a front proxy.
-    pub base_url: EndpointUrl,
+    /// Public path prefix the app is mounted under behind a front proxy (e.g.
+    /// `"/app"`), prepended when reconstructing the client-facing URL. The
+    /// scheme and host come from the grant's `redirect_uri` at engine build, so
+    /// only the path prefix is configured here. `None` means mounted at the
+    /// origin root.
+    pub base_path: Option<RoutePath>,
     /// Path prefix added by a front proxy, stripped from the request path
     /// before constructing the original URL (e.g. `"/internal"`).
     pub strip_prefix: Option<RoutePath>,
@@ -409,19 +429,24 @@ pub struct LoginConfig {
     /// `{security_prefix}{login_cookie_prefix}_{state}`. Defaults to
     /// `"huskarl_login"`.
     pub login_cookie_prefix: CookieName,
-    /// Browser-facing callback path, derived from `base_url`, `strip_prefix`,
+    /// Browser-facing callback path, derived from `base_path`, `strip_prefix`,
     /// and `callback_path`; used as the `Path` scope on login-state cookies.
     pub browser_callback_path: RoutePath,
 }
 
 #[bon::bon]
 impl LoginConfig {
-    /// Builds a [`LoginConfig`], validating paths and the `base_url`.
+    /// Builds a [`LoginConfig`], validating paths.
+    ///
+    /// The client-facing origin (scheme + host) is **not** configured here: it
+    /// is reconstructed from the grant's `redirect_uri` when the
+    /// [`LoginEngine`](crate::engine::LoginEngine) is built. Only the callback
+    /// path and, behind a front proxy, the public `base_path` prefix live here.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError`] if any path is malformed, the durations are
-    /// invalid, or the cookie `Path` derived from `base_url` and
+    /// invalid, or the cookie `Path` derived from `base_path` and
     /// `callback_path` is not cookie-safe.
     #[builder]
     pub fn new(
@@ -449,8 +474,11 @@ impl LoginConfig {
         /// Lifetime of the per-flow login-state cookie. Defaults to 10 minutes.
         #[builder(default = Duration::from_mins(10))]
         login_state_ttl: Duration,
-        /// Canonical client-facing base URL (e.g. `"https://app.example.com"`).
-        base_url: EndpointUrl,
+        /// Public path prefix the app is mounted under behind a front proxy
+        /// (e.g. `"/app"`); the scheme and host come from the grant's
+        /// `redirect_uri` at engine build. Omit when mounted at the origin root.
+        #[builder(into)]
+        base_path: Option<String>,
         /// Front-proxy path prefix to strip before reconstructing the URL.
         #[builder(into)]
         strip_prefix: Option<String>,
@@ -467,6 +495,14 @@ impl LoginConfig {
         let callback_path = RoutePath::validated(callback_path, |path, reason| {
             ConfigError::InvalidCallbackPath { path, reason }
         })?;
+        let base_path = base_path
+            .map(|prefix| {
+                RoutePath::validated(prefix, |path, reason| ConfigError::InvalidBasePath {
+                    path,
+                    reason,
+                })
+            })
+            .transpose()?;
         let strip_prefix = strip_prefix
             .map(|prefix| {
                 RoutePath::validated(prefix, |prefix, reason| ConfigError::InvalidStripPrefix {
@@ -527,32 +563,30 @@ impl LoginConfig {
             login_state_ttl,
         )?;
 
-        // Derived from `base_url`'s path joined to `callback_path`. The
-        // callback is already a `RoutePath`, but `base_url`'s path is not — so
-        // validate the joined result before it is emitted as a cookie `Path`,
+        // The `base_path` prefix joined to `callback_path` (minus any
+        // `strip_prefix`). Both are already validated `RoutePath`s, but the
+        // joined result is re-validated before it is emitted as a cookie `Path`,
         // closing the one route by which a `;`/control char could reach a
-        // `Set-Cookie` header.
+        // `Set-Cookie` header. Independent of the origin, so it's known here.
         let browser_callback_path =
-            compute_browser_callback_path(&callback_path, strip_prefix.as_ref(), base_url.as_uri());
+            compute_browser_callback_path(&callback_path, strip_prefix.as_ref(), base_path.as_ref());
         let browser_callback_path =
-            RoutePath::new(browser_callback_path).map_err(|e| ConfigError::InvalidBaseUrl {
-                url: base_url.as_uri().to_string(),
+            RoutePath::new(browser_callback_path).map_err(|e| ConfigError::InvalidBasePath {
+                path: base_path
+                    .as_ref()
+                    .map_or_else(String::new, |p| p.as_str().to_owned()),
                 reason: e.reason,
             })?;
-        // Single source of truth for cookie security: the browser-facing scheme.
-        // `base_url` is validated above to have a scheme, so this is decisive.
-        let secure = base_url.as_uri().scheme_str() == Some("https");
 
         Ok(Self {
             callback_path,
             scope,
-            secure,
             session_lifetime,
             activity_policy,
             token_refresh_margin,
             default_token_lifetime,
             login_state_ttl,
-            base_url,
+            base_path,
             strip_prefix,
             logout,
             login_cookie_prefix,
@@ -573,26 +607,13 @@ mod tests {
             .callback_path("/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com".parse().unwrap())
             .build()
             .unwrap()
     }
 
     #[test]
-    fn login_config_secure_derived_true_for_https_base_url() {
-        assert!(default_policy_config().secure);
-    }
-
-    #[test]
-    fn login_config_secure_derived_false_for_http_base_url() {
-        let config = LoginConfig::builder()
-            .callback_path("/callback")
-            .scope(vec![])
-            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("http://localhost:6188".parse().unwrap())
-            .build()
-            .unwrap();
-        assert!(!config.secure);
+    fn browser_callback_path_is_callback_path_without_base_path() {
+        assert_eq!(default_policy_config().browser_callback_path, "/callback");
     }
 
     #[test]
@@ -614,7 +635,6 @@ mod tests {
             .callback_path("/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com".parse().unwrap())
             .default_token_lifetime(Duration::ZERO)
             .build()
             .unwrap_err();
@@ -633,7 +653,6 @@ mod tests {
             .callback_path("/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com".parse().unwrap())
             .login_state_ttl(Duration::ZERO)
             .build()
             .unwrap_err();
@@ -652,7 +671,6 @@ mod tests {
             .callback_path("/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::Bounded(Duration::ZERO))
-            .base_url("https://app.example.com".parse().unwrap())
             .build()
             .unwrap_err();
         assert!(matches!(
@@ -672,7 +690,6 @@ mod tests {
             .callback_path("/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com".parse().unwrap())
             .default_token_lifetime(Duration::from_secs(60))
             .token_refresh_margin(Duration::from_secs(60))
             .build()
@@ -797,7 +814,6 @@ mod tests {
             .callback_path("/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(1)))
-            .base_url("https://app.example.com".parse().unwrap())
             .token_refresh_margin(Duration::from_mins(1))
             .default_token_lifetime(Duration::from_hours(2))
             .login_state_ttl(Duration::from_mins(30))
@@ -818,7 +834,6 @@ mod tests {
             .callback_path("callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com".parse().unwrap())
             .build()
             .unwrap_err();
         assert!(matches!(err, ConfigError::InvalidCallbackPath { .. }));
@@ -831,7 +846,6 @@ mod tests {
                 .callback_path(path)
                 .scope(vec![])
                 .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-                .base_url("https://app.example.com".parse().unwrap())
                 .build()
                 .unwrap_err();
             assert!(matches!(err, ConfigError::InvalidCallbackPath { .. }));
@@ -850,7 +864,6 @@ mod tests {
                 .callback_path(path)
                 .scope(vec![])
                 .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-                .base_url("https://app.example.com".parse().unwrap())
                 .build()
                 .unwrap_err();
             assert!(
@@ -866,7 +879,6 @@ mod tests {
             .callback_path("/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com".parse().unwrap())
             .strip_prefix("internal")
             .build()
             .unwrap_err();
@@ -880,7 +892,6 @@ mod tests {
                 .callback_path("/callback")
                 .scope(vec![])
                 .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-                .base_url("https://app.example.com".parse().unwrap())
                 .strip_prefix(prefix)
                 .build()
                 .unwrap_err();
@@ -899,7 +910,6 @@ mod tests {
             .callback_path("/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com".parse().unwrap())
             .logout(LogoutConfig::builder().path("/logout").build().unwrap())
             .build()
             .unwrap();
@@ -940,7 +950,6 @@ mod tests {
             .callback_path("/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com".parse().unwrap())
             .logout(
                 LogoutConfig::builder()
                     .path("/logout")
@@ -962,7 +971,6 @@ mod tests {
             .callback_path("/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com".parse().unwrap())
             .logout(
                 LogoutConfig::builder()
                     .path("/logout")
@@ -986,7 +994,6 @@ mod tests {
                 .callback_path("/callback")
                 .scope(vec![])
                 .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-                .base_url("https://app.example.com".parse().unwrap())
                 .login_cookie_prefix(prefix)
                 .build()
                 .unwrap_err();
@@ -1003,7 +1010,6 @@ mod tests {
             .callback_path("/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com".parse().unwrap())
             .login_cookie_prefix("my-app_2")
             .build()
             .unwrap();
@@ -1018,7 +1024,6 @@ mod tests {
             .callback_path("/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com".parse().unwrap())
             .build()
             .unwrap();
         assert_eq!(config.browser_callback_path, "/callback");
@@ -1028,9 +1033,9 @@ mod tests {
     fn browser_callback_path_with_base_path() {
         let config = LoginConfig::builder()
             .callback_path("/callback")
+            .base_path("/base")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com/base".parse().unwrap())
             .build()
             .unwrap();
         assert_eq!(config.browser_callback_path, "/base/callback");
@@ -1042,7 +1047,6 @@ mod tests {
             .callback_path("/internal/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com".parse().unwrap())
             .strip_prefix("/internal")
             .build()
             .unwrap();
@@ -1053,9 +1057,9 @@ mod tests {
     fn browser_callback_path_with_base_path_and_strip_prefix() {
         let config = LoginConfig::builder()
             .callback_path("/internal/callback")
+            .base_path("/base")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com/base".parse().unwrap())
             .strip_prefix("/internal")
             .build()
             .unwrap();
@@ -1086,18 +1090,18 @@ mod tests {
     }
 
     #[test]
-    fn base_url_path_with_semicolon_rejected_as_unsafe_cookie_scope() {
-        // The derived browser_callback_path becomes a cookie `Path`; a `;` in
-        // base_url's path would inject a stray cookie attribute, so the build
-        // must reject it rather than emit an unsafe Set-Cookie.
+    fn base_path_with_semicolon_rejected_as_unsafe_cookie_scope() {
+        // `base_path` becomes part of the browser_callback_path cookie `Path`; a
+        // `;` would inject a stray cookie attribute, so the build must reject it
+        // rather than emit an unsafe Set-Cookie.
         let err = LoginConfig::builder()
             .callback_path("/callback")
+            .base_path("/a;b")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com/a;b".parse().unwrap())
             .build()
             .unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidBaseUrl { .. }));
+        assert!(matches!(err, ConfigError::InvalidBasePath { .. }));
     }
 
     // -- ConfigError Display tests --
@@ -1115,12 +1119,12 @@ mod tests {
     }
 
     #[test]
-    fn config_error_display_base_url() {
-        let err = ConfigError::InvalidBaseUrl {
-            url: "x".into(),
+    fn config_error_display_base_path() {
+        let err = ConfigError::InvalidBasePath {
+            path: "x".into(),
             reason: "reason",
         };
-        assert!(err.to_string().contains("base_url"));
+        assert!(err.to_string().contains("base_path"));
     }
 
     #[test]
@@ -1168,7 +1172,6 @@ mod tests {
             .callback_path("/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com".parse().unwrap())
             .strip_prefix("/other")
             .build()
             .unwrap_err();
@@ -1181,7 +1184,6 @@ mod tests {
             .callback_path("/internal/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com".parse().unwrap())
             .strip_prefix("/internal")
             .logout(LogoutConfig::builder().path("/logout").build().unwrap())
             .build()
@@ -1195,7 +1197,6 @@ mod tests {
             .callback_path("/internal/callback")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url("https://app.example.com".parse().unwrap())
             .strip_prefix("/internal")
             .logout(
                 LogoutConfig::builder()

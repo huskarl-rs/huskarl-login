@@ -94,7 +94,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Mutex;
 
-use huskarl_login::core::crypto::cipher::AeadCipher;
+use huskarl_login::core::crypto::{cipher::AeadCipher, seal::AeadV1Sealer};
 use huskarl_login::{
     ExternalSessionStore, PersistedSession, PersistedSessionState, SaveOutcome, Session,
     SessionState, StoreBackedSessionStore,
@@ -178,7 +178,7 @@ impl ExternalSessionStore for InMemoryStore {
 fn attach(cipher: impl AeadCipher + 'static) -> StoreBackedSessionStore<InMemoryStore> {
     StoreBackedSessionStore::builder()
         .external(InMemoryStore::default())
-        .cipher(cipher)
+        .sealer(AeadV1Sealer::new(cipher))
         .cookie_name("session".parse().unwrap())
         .cookie_path("/".parse().unwrap())
         .build()

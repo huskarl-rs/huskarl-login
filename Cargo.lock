@@ -145,8 +145,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
 dependencies = [
  "cfg-if",
+ "cipher",
  "cpufeatures",
  "rand_core 0.10.1",
+ "zeroize",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb"
+dependencies = [
+ "aead",
+ "chacha20",
+ "cipher",
+ "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -669,9 +684,7 @@ dependencies = [
 
 [[package]]
 name = "huskarl"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fe06f1c7a85b0be030b6082df47507ceead31a5036657ad21cd6a6d6aa5e2fe"
+version = "0.10.1"
 dependencies = [
  "arc-swap",
  "base64",
@@ -695,9 +708,7 @@ dependencies = [
 
 [[package]]
 name = "huskarl-core"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77dd1dfd1086da79dd5c19972545337aef3c6e2af4676b998055833abccf735a"
+version = "0.9.1"
 dependencies = [
  "arc-swap",
  "base64",
@@ -724,11 +735,11 @@ dependencies = [
 
 [[package]]
 name = "huskarl-crypto-native"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f507455f7673737004ed0ea5fe62a4d9e0c863b55f1256a827728f9da36d80bc"
+version = "0.10.1"
 dependencies = [
+ "aead",
  "aes-gcm",
+ "chacha20poly1305",
  "ed25519-dalek",
  "hmac",
  "huskarl-core",
@@ -775,8 +786,6 @@ dependencies = [
 [[package]]
 name = "huskarl-macros"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d91df0947d8d52c4def038b8af46e3d2036a4a5cfe144b0c44e095d9672579ef"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -1125,6 +1134,16 @@ checksum = "451913da69c775a56034ea8d9003d27ee8948e12443eae7c038ba100a4f21cb7"
 dependencies = [
  "der",
  "spki",
+]
+
+[[package]]
+name = "poly1305"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e2d0073b297041425c7c3df6eb4792d598a15323fe63346852b092eca02904c"
+dependencies = [
+ "cpufeatures",
+ "universal-hash",
 ]
 
 [[package]]

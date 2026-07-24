@@ -16,11 +16,8 @@ use crate::{
         Error, ErrorKind,
         client_auth::NoAuth,
         crypto::{
-            KeyMatchStrength,
-            cipher::{
-                AeadCipher, AeadDecryptor, AeadEncryptor, AeadOutput, AeadSealer as _,
-                AeadUnsealer as _, AeadV1Cipher, CipherMatch, DecryptError,
-            },
+            cipher::DecryptError,
+            seal::{AeadSealer, AeadSealerUnsealer, AeadUnsealer, AeadV1Sealer, SealOutput},
         },
         http::{HttpClient, HttpResponse, Idempotency},
         platform::MaybeSendBoxFuture,
@@ -40,7 +37,7 @@ use crate::{
     ActivityPolicy, CompletedLogin, LivenessVerdict, LoginConfig, LogoutConfig, Session,
     SessionDriver, SessionError, SessionErrorKind, SessionLifetime, SessionState,
     session::sealed::Sealed,
-    test_support::{header_map as headers, test_cipher},
+    test_support::{header_map as headers, test_cipher, test_sealer},
 };
 
 // ── HTTP doubles ──────────────────────────────────────────────────────────
@@ -227,46 +224,34 @@ fn expect_cleared(loaded: LoadedSession<MockSession>) -> (TeardownReason, Vec<He
 
 // ── MockSessionStore ──────────────────────────────────────────────────────
 
-/// A do-nothing AEAD cipher so [`MockSessionStore`] can satisfy
-/// [`SessionDriver::session_aead_cipher`] without async key construction in its
+/// A do-nothing sealer so [`MockSessionStore`] can satisfy
+/// [`SessionDriver::session_sealer`] without async key construction in its
 /// sync constructors. The engine under test is always built with an explicit
-/// `.cipher(...)`, so this is never actually invoked to seal or unseal.
+/// `.sealer(...)`, so this is never actually invoked to seal or unseal.
 #[derive(Debug)]
-struct NoopCipher;
+struct NoopSealer;
 
-impl AeadEncryptor for NoopCipher {
-    fn enc_algorithm(&self) -> std::borrow::Cow<'_, str> {
-        std::borrow::Cow::Borrowed("noop")
-    }
-    fn key_id(&self) -> Option<std::borrow::Cow<'_, str>> {
-        None
-    }
-    fn encrypt<'a>(
+impl AeadSealer for NoopSealer {
+    fn seal<'a>(
         &'a self,
         _plaintext: &'a [u8],
         _aad: &'a [u8],
-    ) -> MaybeSendBoxFuture<'a, Result<AeadOutput, Error>> {
+    ) -> MaybeSendBoxFuture<'a, Result<SealOutput, Error>> {
         Box::pin(async {
-            Ok(AeadOutput {
-                nonce: Vec::new(),
-                ciphertext: Vec::new(),
-                tag: Vec::new(),
+            Ok(SealOutput {
+                bundle: Vec::new(),
+                kid: None,
             })
         })
     }
 }
 
-impl AeadDecryptor for NoopCipher {
-    fn cipher_match(&self, _m: &CipherMatch<'_>) -> Option<KeyMatchStrength> {
-        None
-    }
-    fn decrypt<'a>(
+impl AeadUnsealer for NoopSealer {
+    fn unseal<'a>(
         &'a self,
-        _cipher_match: Option<&'a CipherMatch<'a>>,
-        _nonce: &'a [u8],
-        _ciphertext: &'a [u8],
-        _tag: &'a [u8],
+        _bundle: &'a [u8],
         _aad: &'a [u8],
+        _kid: Option<&'a str>,
     ) -> MaybeSendBoxFuture<'a, Result<Vec<u8>, DecryptError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
@@ -290,10 +275,10 @@ struct MockSessionStore {
     /// [`SessionDriver::apply_session_policy`], so a test can assert the
     /// deployment policy (secure flag, lifetime bound) reaches the store.
     applied_policy: Mutex<Option<(bool, Option<Duration>)>>,
-    /// The cipher returned from [`SessionDriver::session_aead_cipher`]. `None`
-    /// falls back to [`NoopCipher`]; a test that exercises the engine's
-    /// default-login-state-cipher path sets a real key here.
-    store_cipher: Option<Arc<dyn AeadCipher>>,
+    /// The sealer returned from [`SessionDriver::session_sealer`]. `None`
+    /// falls back to [`NoopSealer`]; a test that exercises the engine's
+    /// default-login-state-sealer path sets a real sealer here.
+    store_cipher: Option<Arc<dyn AeadSealerUnsealer>>,
 }
 
 /// The `Set-Cookie` value [`MockSessionStore::save`] returns, so tests can
@@ -339,10 +324,10 @@ impl MockSessionStore {
             store_cipher: None,
         }
     }
-    /// Sets the cipher [`SessionDriver::session_aead_cipher`] returns, so a test
-    /// can exercise the engine defaulting the login-state cipher to the store's.
-    fn with_cipher(mut self, cipher: Arc<dyn AeadCipher>) -> Self {
-        self.store_cipher = Some(cipher);
+    /// Sets the sealer [`SessionDriver::session_sealer`] returns, so a test can
+    /// exercise the engine defaulting the login-state sealer to the store's.
+    fn with_cipher(mut self, sealer: Arc<dyn AeadSealerUnsealer>) -> Self {
+        self.store_cipher = Some(sealer);
         self
     }
     fn last_record_activity(&self) -> Option<bool> {
@@ -377,10 +362,10 @@ impl SessionDriver for MockSessionStore {
         *self.applied_policy.lock().unwrap() = Some((secure, max_lifetime));
     }
 
-    fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
+    fn session_sealer(&self) -> Arc<dyn AeadSealerUnsealer> {
         self.store_cipher
             .clone()
-            .unwrap_or_else(|| Arc::new(NoopCipher))
+            .unwrap_or_else(|| Arc::new(NoopSealer))
     }
 
     async fn create(
@@ -461,7 +446,7 @@ impl SessionDriver for ErrorSessionStore {
     ) {
     }
 
-    fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
+    fn session_sealer(&self) -> Arc<dyn AeadSealerUnsealer> {
         unimplemented!()
     }
 
@@ -495,7 +480,6 @@ fn default_config() -> LoginConfig {
         .callback_path("/callback")
         .scope(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-        .base_url("https://app.example.com".parse().unwrap())
         .build()
         .unwrap()
 }
@@ -505,7 +489,6 @@ fn config_with_logout() -> LoginConfig {
         .callback_path("/callback")
         .scope(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-        .base_url("https://app.example.com".parse().unwrap())
         .logout(LogoutConfig::builder().path("/logout").build().unwrap())
         .build()
         .unwrap()
@@ -523,8 +506,21 @@ async fn engine_with_config(
         .config(config)
         .grant(test_grant(FailingHttp::new(false).0).await)
         .session_store(store)
-        .cipher(test_cipher().await)
-        .build()
+        .sealer(test_sealer().await)
+        .build().unwrap()
+}
+
+#[tokio::test]
+async fn engine_reconstructs_base_url_from_grant_redirect_uri() {
+    // The origin is not configured on LoginConfig; the engine takes it from the
+    // grant's redirect_uri (https://app.example.com). Reconstructing the
+    // post-login redirect proves it used that origin.
+    let e = engine(MockSessionStore::empty()).await;
+    let uri: http::Uri = "/dashboard".parse().unwrap();
+    assert_eq!(
+        crate::url::original_url(&e.base_url, e.config.strip_prefix.as_ref(), &uri).as_deref(),
+        Some("https://app.example.com/dashboard"),
+    );
 }
 
 #[tokio::test]
@@ -536,15 +532,26 @@ async fn engine_stamps_store_secure_from_https_base_url() {
 }
 
 #[tokio::test]
-async fn engine_stamps_store_insecure_from_http_base_url() {
-    let http_config = LoginConfig::builder()
-        .callback_path("/callback")
-        .scope(vec![])
-        .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-        .base_url("http://localhost:6188".parse().unwrap())
+async fn engine_stamps_store_insecure_from_http_redirect_uri() {
+    // `secure` comes from the grant's redirect_uri scheme; an http redirect_uri
+    // must stamp the store insecure.
+    let http_grant = AuthorizationCodeGrant::builder()
+        .client_id("client")
+        .http_client(FailingHttp::new(false).0)
+        .client_auth(NoAuth)
+        .token_endpoint("https://auth.example.com/token".parse().unwrap())
+        .authorization_endpoint("https://auth.example.com/authorize".parse().unwrap())
+        .redirect_uri("http://app.example.com/callback")
+        .build()
+        .await
+        .unwrap();
+    let e = LoginEngine::builder()
+        .config(default_config())
+        .grant(http_grant)
+        .session_store(MockSessionStore::empty())
+        .sealer(test_sealer().await)
         .build()
         .unwrap();
-    let e = engine_with_config(MockSessionStore::empty(), http_config).await;
     assert_eq!(e.session_store.applied_policy(), Some((false, None)));
 }
 
@@ -556,7 +563,6 @@ async fn engine_stamps_store_with_bounded_session_lifetime() {
         .callback_path("/callback")
         .scope(vec![])
         .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(8)))
-        .base_url("https://app.example.com".parse().unwrap())
         .build()
         .unwrap();
     let e = engine_with_config(MockSessionStore::empty(), config).await;
@@ -568,19 +574,19 @@ async fn engine_stamps_store_with_bounded_session_lifetime() {
 
 #[tokio::test]
 async fn engine_defaults_login_state_cipher_to_store_cipher() {
-    // Omitting `.cipher()` must default the login-state seal to the store's own
+    // Omitting `.sealer()` must default the login-state seal to the store's own
     // AEAD cipher — the two seals are AAD-domain-separated, so sharing one key
     // is safe. Moving this defaulting into the builder means every adapter gets
     // it (and its safety argument) for free instead of reimplementing it. Build
     // the engine WITHOUT a cipher over a store whose `session_aead_cipher()` is
     // the shared test key, then confirm the login-state cookie it seals unseals
     // under that same key.
-    let store = MockSessionStore::empty().with_cipher(Arc::new(test_cipher().await));
+    let store = MockSessionStore::empty().with_cipher(Arc::new(test_sealer().await));
     let e = LoginEngine::builder()
         .config(default_config())
         .grant(test_grant(FailingHttp::new(false).0).await)
         .session_store(store)
-        .build();
+        .build().unwrap();
 
     let uri = "/dashboard".parse().unwrap();
     let r = e.redirect_to_login(&nav_headers(), &uri).await;
@@ -620,9 +626,9 @@ async fn engine_defaults_login_state_cipher_to_store_cipher() {
     // success proves the engine sealed with the store's cipher (the default),
     // not some unrelated key.
     let bundle = URL_SAFE_NO_PAD.decode(&cookie_value).unwrap();
-    let sealer = AeadV1Cipher::new(test_cipher().await);
+    let sealer = AeadV1Sealer::new(test_cipher().await);
     let plaintext = sealer
-        .unseal(None, &bundle, &super::login_state_aad(state))
+        .unseal(&bundle, &super::login_state_aad(state), None)
         .await
         .expect("login-state cookie unseals under the store cipher");
     let decoded = crate::cookie::decode_payload::<super::LoginStateCookie>(&plaintext).unwrap();
@@ -663,18 +669,18 @@ fn test_pending_state(state: &str) -> PendingState {
 }
 
 async fn seal_login_cookie_at(state: &str, original_url: &str, created_at: SystemTime) -> String {
-    let sealer = AeadV1Cipher::new(test_cipher().await);
+    let sealer = AeadV1Sealer::new(test_cipher().await);
     let cookie = super::LoginStateCookie {
         original_url: original_url.to_owned(),
         pending_state: test_pending_state(state),
         created_at,
     };
     let payload = crate::cookie::encode_payload(&cookie).unwrap();
-    let bundle = sealer
+    let output = sealer
         .seal(&payload, &super::login_state_aad(state))
         .await
         .unwrap();
-    URL_SAFE_NO_PAD.encode(&bundle)
+    URL_SAFE_NO_PAD.encode(&output.bundle)
 }
 
 fn headers_with_login_cookie(state: &str, value: &str) -> HeaderMap {
@@ -973,7 +979,6 @@ async fn login_state_cookie_uses_configured_ttl() {
         .callback_path("/callback")
         .scope(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-        .base_url("https://app.example.com".parse().unwrap())
         .login_state_ttl(Duration::from_mins(30))
         .build()
         .unwrap();
@@ -1068,9 +1073,9 @@ async fn callback_pre_created_at_format_treated_as_expired() {
         pending_state: &pending_state,
     })
     .unwrap();
-    let sealer = AeadV1Cipher::new(test_cipher().await);
-    let bundle = sealer.seal(&payload, state.as_bytes()).await.unwrap();
-    let value = URL_SAFE_NO_PAD.encode(&bundle);
+    let sealer = AeadV1Sealer::new(test_cipher().await);
+    let output = sealer.seal(&payload, state.as_bytes()).await.unwrap();
+    let value = URL_SAFE_NO_PAD.encode(&output.bundle);
 
     let e = engine(MockSessionStore::empty()).await;
     let h = headers_with_login_cookie(state, &value);
@@ -1093,7 +1098,6 @@ async fn max_lifetime_expired_clears_session() {
         .callback_path("/callback")
         .scope(vec![])
         .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(1)))
-        .base_url("https://app.example.com".parse().unwrap())
         .build()
         .unwrap();
     let e = engine_with_config(MockSessionStore::with_session(session), config).await;
@@ -1120,7 +1124,6 @@ async fn frozen_expire_at_is_enforced_over_a_raised_lifetime() {
         .callback_path("/callback")
         .scope(vec![])
         .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(24)))
-        .base_url("https://app.example.com".parse().unwrap())
         .build()
         .unwrap();
     let e = engine_with_config(MockSessionStore::with_session(session), config).await;
@@ -1144,7 +1147,6 @@ async fn lowered_lifetime_applies_to_sessions_with_a_longer_frozen_deadline() {
         .callback_path("/callback")
         .scope(vec![])
         .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(1)))
-        .base_url("https://app.example.com".parse().unwrap())
         .build()
         .unwrap();
     let e = engine_with_config(MockSessionStore::with_session(session), config).await;
@@ -1228,7 +1230,6 @@ async fn activity_policy_navigations_only_excludes_same_origin_fetch() {
         .callback_path("/callback")
         .scope(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-        .base_url("https://app.example.com".parse().unwrap())
         .activity_policy(ActivityPolicy::NavigationsOnly)
         .build()
         .unwrap();
@@ -1300,8 +1301,8 @@ async fn engine_with_failing_refresh(
         .config(default_config())
         .grant(test_grant(http).await)
         .session_store(MockSessionStore::with_session(session))
-        .cipher(test_cipher().await)
-        .build();
+        .sealer(test_sealer().await)
+        .build().unwrap();
     (e, calls)
 }
 
@@ -1332,8 +1333,8 @@ async fn refresh_success_persists_eagerly() {
         .config(default_config())
         .grant(test_grant(TokenHttp).await)
         .session_store(MockSessionStore::with_session(session))
-        .cipher(test_cipher().await)
-        .build();
+        .sealer(test_sealer().await)
+        .build().unwrap();
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     // The refreshed session was saved inside load_session — `Active`, with
     // nothing left for the post-response persist phase.
@@ -1358,8 +1359,8 @@ async fn refresh_success_with_failing_save_defers_persistence() {
         .config(default_config())
         .grant(test_grant(TokenHttp).await)
         .session_store(MockSessionStore::with_session_failing_save(session))
-        .cipher(test_cipher().await)
-        .build();
+        .sealer(test_sealer().await)
+        .build().unwrap();
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let pending = expect_pending(loaded);
     // The refresh itself was applied — only persistence is outstanding.
@@ -1378,8 +1379,8 @@ async fn commit_retries_the_deferred_refresh_save() {
         .config(default_config())
         .grant(test_grant(TokenHttp).await)
         .session_store(MockSessionStore::with_session_failing_save(session))
-        .cipher(test_cipher().await)
-        .build();
+        .sealer(test_sealer().await)
+        .build().unwrap();
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let pending = expect_pending(loaded);
     // A serving handle taken during the request survives the commit.
@@ -1464,8 +1465,8 @@ async fn refresh_unavailable_session_recovers_when_the_as_does() {
         .config(default_config())
         .grant(test_grant(TokenHttp).await)
         .session_store(MockSessionStore::with_session(session))
-        .cipher(test_cipher().await)
-        .build();
+        .sealer(test_sealer().await)
+        .build().unwrap();
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let (recovered, _) = expect_active(loaded);
     assert!(recovered.token_expiry() > SystemTime::now() + Duration::from_mins(30));
@@ -1477,8 +1478,8 @@ async fn load_session_store_error_bubbles_up() {
         .config(default_config())
         .grant(test_grant(FailingHttp::new(false).0).await)
         .session_store(ErrorSessionStore)
-        .cipher(test_cipher().await)
-        .build();
+        .sealer(test_sealer().await)
+        .build().unwrap();
     let err = e
         .load_session(&HeaderMap::new())
         .await
@@ -1719,8 +1720,8 @@ async fn callback_success_redirects_to_original_url() {
         .config(default_config())
         .grant(test_grant(TokenHttp).await)
         .session_store(MockSessionStore::empty())
-        .cipher(test_cipher().await)
-        .build();
+        .sealer(test_sealer().await)
+        .build().unwrap();
     let state = "valid_state";
     let sealed = seal_login_cookie(state, "https://app.example.com/page").await;
     let h = headers_with_login_cookie(state, &sealed);
@@ -1757,8 +1758,8 @@ async fn callback_success_sweeps_all_pending_login_state_cookies() {
         .config(default_config())
         .grant(test_grant(TokenHttp).await)
         .session_store(MockSessionStore::empty())
-        .cipher(test_cipher().await)
-        .build();
+        .sealer(test_sealer().await)
+        .build().unwrap();
     let state = "valid_state";
     let sealed = seal_login_cookie(state, "https://app.example.com/page").await;
     let name = |s: &str| {
@@ -1877,7 +1878,6 @@ async fn logout_redirects_to_configured_post_logout_uri() {
         .callback_path("/callback")
         .scope(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-        .base_url("https://app.example.com".parse().unwrap())
         .logout(
             LogoutConfig::builder()
                 .path("/logout")
@@ -1910,7 +1910,6 @@ async fn logout_end_session_url_includes_client_id_without_id_token() {
         .callback_path("/callback")
         .scope(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-        .base_url("https://app.example.com".parse().unwrap())
         .logout(
             LogoutConfig::builder()
                 .path("/logout")
@@ -1948,7 +1947,6 @@ async fn post_logout_redirect_uri_is_sent_exactly_not_normalized() {
         .callback_path("/callback")
         .scope(vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-        .base_url("https://app.example.com".parse().unwrap())
         .logout(
             LogoutConfig::builder()
                 .path("/logout")
@@ -2120,9 +2118,9 @@ fn metrics_name_labels_engine_counters() {
             .config(default_config())
             .grant(test_grant(FailingHttp::new(false).0).await)
             .session_store(MockSessionStore::empty())
-            .cipher(test_cipher().await)
+            .sealer(test_sealer().await)
             .metrics_name("tenant-a")
-            .build();
+            .build().unwrap();
         let _ = e
             .redirect_to_login(&nav_headers(), &"/protected".parse().unwrap())
             .await;
@@ -2158,8 +2156,8 @@ fn metrics_login_start_error_when_grant_start_fails() {
             .config(default_config())
             .grant(par_failing_grant().await)
             .session_store(MockSessionStore::empty())
-            .cipher(test_cipher().await)
-            .build();
+            .sealer(test_sealer().await)
+            .build().unwrap();
         let _ = e
             .redirect_to_login(&nav_headers(), &"/protected".parse().unwrap())
             .await;
@@ -2304,8 +2302,8 @@ fn metrics_callback_ok_on_successful_login() {
             .config(default_config())
             .grant(test_grant(TokenHttp).await)
             .session_store(MockSessionStore::empty())
-            .cipher(test_cipher().await)
-            .build();
+            .sealer(test_sealer().await)
+            .build().unwrap();
         let state = "valid_state";
         let sealed = seal_login_cookie(state, "https://app.example.com/").await;
         let h = headers_with_login_cookie(state, &sealed);
@@ -2441,8 +2439,8 @@ fn metrics_refresh_failed_retained_on_transient_failure_with_valid_token() {
                 session,
                 LivenessVerdict::Active,
             ))
-            .cipher(test_cipher().await)
-            .build();
+            .sealer(test_sealer().await)
+            .build().unwrap();
         let _ = e.load_session(&HeaderMap::new()).await.unwrap();
     });
     // The transient-retention path retains the session as-is — the refresh
@@ -2470,8 +2468,8 @@ fn metrics_refresh_failed_unavailable_on_transient_failure_with_expired_token() 
             .config(default_config())
             .grant(test_grant(FailingHttp::new(true).0).await)
             .session_store(MockSessionStore::with_session(session))
-            .cipher(test_cipher().await)
-            .build();
+            .sealer(test_sealer().await)
+            .build().unwrap();
         let _ = e.load_session(&HeaderMap::new()).await.unwrap();
     });
     assert_eq!(
@@ -2493,8 +2491,8 @@ fn metrics_refresh_ok_on_successful_refresh() {
             .config(default_config())
             .grant(test_grant(TokenHttp).await)
             .session_store(MockSessionStore::with_session(session))
-            .cipher(test_cipher().await)
-            .build();
+            .sealer(test_sealer().await)
+            .build().unwrap();
         // Consume via expect_active: a successful refresh returns owed cookies,
         // and dropping them unconsumed would (correctly) trip the SetCookies guard.
         let _ = expect_active(e.load_session(&HeaderMap::new()).await.unwrap());

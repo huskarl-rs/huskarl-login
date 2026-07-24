@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 
 use crate::core::{
     Error,
-    crypto::cipher::{AeadCipher, AeadV1Cipher},
+    crypto::seal::AeadSealerUnsealer,
     platform::{Duration, MaybeSendSync, SystemTime, sleep},
     serde_utils::time::unix_secs,
 };
@@ -24,7 +24,7 @@ use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DefaultErrorPage, ErrorPage, LivenessVerdict, LoginConfig, Session, SessionDriver,
+    ConfigError, DefaultErrorPage, ErrorPage, LivenessVerdict, LoginConfig, Session, SessionDriver,
     SessionError, SessionErrorKind,
     cookie::SessionCipher,
     metrics::{LoginCompleteResult, LoginStartResult, RefreshResult},
@@ -606,6 +606,12 @@ pub struct LoginEngine<SD> {
     grant: AuthorizationCodeGrant,
     /// The session store.
     pub session_store: SD,
+    /// Client-facing base URL, reconstructed at build from the grant's
+    /// `redirect_uri` origin joined with [`LoginConfig::base_path`].
+    base_url: http::Uri,
+    /// Whether the deployment is HTTPS, from the `redirect_uri` scheme; drives
+    /// `Secure`/`__Host-` on the cookies this engine sets.
+    secure: bool,
     cipher: SessionCipher,
     error_page: Box<dyn ErrorPage>,
     /// Instance `name` label for emitted counters; `None` omits it.
@@ -623,18 +629,25 @@ where
     ///
     /// `grant` drives the OAuth flow per its own configuration.
     ///
-    /// `cipher` seals the short-lived login-state cookie. Optional: defaults
-    /// to the store's own cipher ([`SessionDriver::session_aead_cipher`]);
-    /// the seals are AAD-domain-separated, so sharing one key is safe — see
+    /// `sealer` seals the short-lived login-state cookie. Optional: defaults
+    /// to the store's own sealer ([`SessionDriver::session_sealer`]); the seals
+    /// are AAD-domain-separated, so sharing one key is safe — see
     /// [cookie security](crate::_docs::explanation::cookie_security). Pass it
-    /// only to use a distinct login-state key.
+    /// only to use a distinct login-state sealer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidRedirectUri`] if the grant's `redirect_uri`
+    /// is not a usable absolute URL, so the client-facing base URL cannot be
+    /// reconstructed from it. (The grant validates its `redirect_uri`, so this
+    /// is defensive.)
     #[builder]
     pub fn new(
         config: LoginConfig,
         grant: AuthorizationCodeGrant,
         session_store: SD,
-        #[builder(with = |cipher: impl AeadCipher + 'static| Arc::new(cipher) as Arc<dyn AeadCipher>)]
-        cipher: Option<Arc<dyn AeadCipher>>,
+        #[builder(with = |sealer: impl AeadSealerUnsealer + 'static| Arc::new(sealer) as Arc<dyn AeadSealerUnsealer>)]
+        sealer: Option<Arc<dyn AeadSealerUnsealer>>,
         /// Custom error page renderer. Defaults to [`DefaultErrorPage`].
         #[builder(default = Box::new(DefaultErrorPage) as Box<dyn ErrorPage>)]
         error_page: Box<dyn ErrorPage>,
@@ -643,28 +656,63 @@ where
         /// process runs several. `None` (the default) omits the label.
         #[builder(into)]
         metrics_name: Option<String>,
-    ) -> Self {
+    ) -> Result<Self, ConfigError> {
+        // The client-facing origin is the single source of truth: the grant's
+        // `redirect_uri`. Reconstruct the base URL from its origin joined with
+        // the config's `base_path`, and derive `secure` from its scheme. Because
+        // the origin comes from the same value the AS returns the browser to,
+        // the session cookie's host is correct by construction — there is no
+        // second origin to disagree with. (The grant validates `redirect_uri`,
+        // so the error paths are defensive.)
+        let redirect =
+            grant
+                .redirect_uri
+                .parse::<Uri>()
+                .map_err(|_| ConfigError::InvalidRedirectUri {
+                    url: grant.redirect_uri.clone(),
+                    reason: "must be a valid absolute URL",
+                })?;
+        let (Some(scheme), Some(authority)) = (
+            redirect.scheme_str(),
+            redirect.authority().map(http::uri::Authority::as_str),
+        ) else {
+            return Err(ConfigError::InvalidRedirectUri {
+                url: grant.redirect_uri.clone(),
+                reason: "must be an absolute URL with scheme and authority",
+            });
+        };
+        let base_path = config.base_path.as_ref().map_or("", |p| p.as_str());
+        let base_url = format!("{scheme}://{authority}{base_path}")
+            .parse::<Uri>()
+            .map_err(|_| ConfigError::InvalidRedirectUri {
+                url: grant.redirect_uri.clone(),
+                reason: "origin is not a valid base URL",
+            })?;
+        let secure = scheme == "https";
+
         // Single source of truth for cookie security and session lifetime:
-        // stamp the store with the values derived from `base_url` and the
+        // stamp the store with the reconstructed `secure` and the
         // `session_lifetime` bound, so session cookies share one
         // `secure`/`__Host-` policy and no cookie outlives the session cap.
         let mut session_store = session_store;
         session_store.apply_session_policy(
-            config.secure,
+            secure,
             config.session_lifetime.bound(),
             metrics_name.as_deref(),
         );
         // Default here rather than in each adapter, so every adapter gets the
         // shared-key setup (and its safety argument) without reimplementing it.
-        let cipher = cipher.unwrap_or_else(|| session_store.session_aead_cipher());
-        Self {
+        let sealer = sealer.unwrap_or_else(|| session_store.session_sealer());
+        Ok(Self {
             config,
             grant,
             session_store,
-            cipher: AeadV1Cipher::new(cipher),
+            base_url,
+            secure,
+            cipher: sealer,
             error_page,
             metrics_name,
-        }
+        })
     }
 }
 

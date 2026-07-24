@@ -6,10 +6,10 @@ the session key for [`StoreBackedSessionStore`](crate::StoreBackedSessionStore).
 
 ## `Secure` and the name prefixes
 
-Cookie security is derived from a single source of truth — the configured
-`base_url` scheme — and stamped onto the store by the engine, so session
-cookies and the login-state cookie always share one policy. An `https` base URL
-yields `Secure` cookies, prefixed `__Host-` for host-wide cookies
+Cookie security is derived from a single source of truth — the grant's
+`redirect_uri` scheme — and stamped onto the store by the engine, so session
+cookies and the login-state cookie always share one policy. An `https`
+redirect URI yields `Secure` cookies, prefixed `__Host-` for host-wide cookies
 (`Path=/`; the browser then guarantees the cookie is host-locked, path-`/`,
 and `Secure`) or `__Secure-` for cookies scoped to a narrower path; an `http`
 base URL (local development) drops both. The stores therefore take no `secure`

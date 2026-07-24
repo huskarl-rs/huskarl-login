@@ -3,7 +3,7 @@
 //! with the right security prefix (`__Host-`/`__Secure-`/none), and CBOR
 //! encoding for the payloads sealed into the session and login-state cookies.
 
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::{HeaderValue, header};
@@ -12,16 +12,16 @@ use snafu::Snafu;
 
 use crate::{
     config::RoutePath,
-    core::crypto::{
-        KeyMatchStrength,
-        cipher::{AeadCipher, AeadEncryptor as _, AeadUnsealer, AeadV1Cipher, CipherMatch},
-    },
+    core::crypto::seal::{AeadSealerUnsealer, AeadUnsealer},
     metrics::DecryptResult,
     session::{SessionError, SessionErrorKind},
 };
 
-/// The v1 bundle cipher (over a type-erased AEAD cipher) used to seal cookies.
-pub(crate) type SessionCipher = AeadV1Cipher<Arc<dyn AeadCipher>>;
+/// The type-erased sealer used to seal/unseal cookie values. Any
+/// [`AeadSealerUnsealer`] — an [`AeadV1Sealer`](crate::core::crypto::seal::AeadV1Sealer)
+/// over a local key, or an externally-managed sealer such as a KMS/Vault
+/// transit endpoint.
+pub(crate) type SessionCipher = Arc<dyn AeadSealerUnsealer>;
 
 /// Default `Max-Age` for session cookies (400 days, the browser ceiling).
 pub(crate) const DEFAULT_COOKIE_MAX_AGE: Duration = Duration::from_hours(9600);
@@ -240,11 +240,10 @@ pub fn cookie_attrs(secure: bool, path: &str) -> String {
 /// Shared cookie-sealing machinery behind both built-in session stores: AEAD
 /// seal, security-prefixed naming, kid sidecar, and encrypt/decrypt metrics.
 pub(crate) struct CookieSealer {
-    /// The v1-bundle cipher used to seal/unseal cookie values.
+    /// The sealer used to seal/unseal cookie values. Also handed back by
+    /// [`SessionDriver::session_sealer`](crate::SessionDriver::session_sealer)
+    /// as the default login-state sealer.
     pub(crate) cipher: SessionCipher,
-    /// The raw cipher behind [`cipher`](Self::cipher), handed back unwrapped by
-    /// [`SessionDriver::session_aead_cipher`](crate::SessionDriver::session_aead_cipher).
-    pub(crate) aead: Arc<dyn AeadCipher>,
     /// The configured cookie name, before any security prefix is applied.
     raw_cookie_name: CookieName,
     /// The security-prefixed cookie name actually emitted on the wire.
@@ -259,11 +258,10 @@ pub(crate) struct CookieSealer {
 }
 
 impl CookieSealer {
-    /// Wraps `cipher` in the v1 bundle format and derives a secure-by-default
-    /// cookie name; `secure` is re-stamped later via
-    /// [`apply_secure`](Self::apply_secure).
+    /// Stores `sealer` and derives a secure-by-default cookie name; `secure` is
+    /// re-stamped later via [`apply_secure`](Self::apply_secure).
     pub(crate) fn new(
-        cipher: Arc<dyn AeadCipher>,
+        sealer: Arc<dyn AeadSealerUnsealer>,
         cookie_name: CookieName,
         cookie_path: RoutePath,
         max_age: Duration,
@@ -273,8 +271,7 @@ impl CookieSealer {
         let cookie_name =
             session_cookie_name(raw_cookie_name.as_str(), secure, cookie_path.as_str());
         Self {
-            aead: cipher.clone(),
-            cipher: AeadV1Cipher::new(cipher),
+            cipher: sealer,
             raw_cookie_name,
             cookie_name,
             secure,
@@ -282,11 +279,6 @@ impl CookieSealer {
             max_age,
             metrics_name: None,
         }
-    }
-
-    /// The active key's identity, if it has one.
-    pub(crate) fn key_id(&self) -> Option<Cow<'_, str>> {
-        self.cipher.key_id()
     }
 
     /// AEAD associated data `"{purpose}:{cookie_name}"` for the given `purpose`
@@ -354,18 +346,16 @@ impl CookieSealer {
         );
     }
 
-    /// Records a decrypt outcome, bounding the client-supplied kid label via
-    /// [`normalize_kid_label`].
-    pub(crate) fn record_decrypt(&self, kid: Option<&str>, result: &DecryptResult) {
-        let label = normalize_kid_label(&*self.aead, &self.cookie_name, kid);
+    /// Records a decrypt outcome. Carries no per-kid label: the sidecar kid is
+    /// an untrusted client value and the sealer exposes no way to bound it to a
+    /// configured key (a KMS/Vault sealer has no local key set to match
+    /// against), so labelling it would be unbounded-cardinality. Per-key
+    /// visibility comes from the encrypt counter's sealer-reported kid.
+    pub(crate) fn record_decrypt(&self, result: &DecryptResult) {
         crate::metrics::emit_counter(
             "huskarl.session_cookie.decrypt",
             vec![
                 metrics::Label::new("cookie", self.cookie_name.clone()),
-                metrics::Label::new(
-                    "kid",
-                    label.map_or_else(|| "none".to_owned(), str::to_owned),
-                ),
                 metrics::Label::new("outcome", result.as_str()),
             ],
             self.metrics_name.as_deref(),
@@ -378,21 +368,21 @@ impl CookieSealer {
 /// (tampering or absence just degrades to trial-decrypt).
 pub(crate) const KID_COOKIE_SUFFIX: &str = ".kid";
 
-/// Unseals `bundle`, treating the kid sidecar's `cipher_match` as a hint, not
-/// a filter: if unsealing under the hint fails, retry once across all keys.
-/// A stale or tampered hint must not lock out an otherwise-authentic session.
+/// Unseals `bundle`, treating the sidecar `kid` as a hint, not a filter: if
+/// unsealing under the hint fails, retry once across all keys. A stale or
+/// tampered hint must not lock out an otherwise-authentic session.
 pub(crate) async fn unseal_with_kid_fallback(
     unsealer: &impl AeadUnsealer,
-    cipher_match: Option<&CipherMatch<'_>>,
+    kid: Option<&str>,
     bundle: &[u8],
     aad: &[u8],
 ) -> Option<Vec<u8>> {
-    if let Some(m) = cipher_match
-        && let Ok(plaintext) = unsealer.unseal(Some(m), bundle, aad).await
+    if let Some(k) = kid
+        && let Ok(plaintext) = unsealer.unseal(bundle, aad, Some(k)).await
     {
         return Some(plaintext);
     }
-    unsealer.unseal(None, bundle, aad).await.ok()
+    unsealer.unseal(bundle, aad, None).await.ok()
 }
 
 /// Returns the sidecar cookie name for the given session cookie base name.
@@ -415,24 +405,6 @@ pub(crate) fn get_kid_cookie(headers: &http::HeaderMap, base_name: &str) -> Opti
 #[must_use]
 pub(crate) fn encode_kid(identity: &str) -> String {
     URL_SAFE_NO_PAD.encode(identity.as_bytes())
-}
-
-/// Normalizes a client-supplied sidecar kid into a bounded metrics label:
-/// kept only on an exact [`KeyMatchStrength::ByKeyId`] match, else `"unknown"`
-/// to cap label cardinality. Unmatched kids are logged at debug.
-pub(crate) fn normalize_kid_label<'a>(
-    cipher: &dyn AeadCipher,
-    cookie_name: &str,
-    kid: Option<&'a str>,
-) -> Option<&'a str> {
-    let k = kid?;
-    let m = CipherMatch::builder().kid(k).build();
-    if matches!(cipher.cipher_match(&m), Some(KeyMatchStrength::ByKeyId)) {
-        Some(k)
-    } else {
-        log::debug!("session cookie {cookie_name}: sidecar kid {k:?} matches no configured key");
-        Some("unknown")
-    }
 }
 
 /// Returns the first value of cookie `name` from the request headers, trimmed.

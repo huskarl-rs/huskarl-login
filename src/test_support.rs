@@ -9,6 +9,7 @@ use huskarl_crypto_native::aead::AesGcmKey;
 
 use crate::core::{
     Error,
+    crypto::seal::AeadV1Sealer,
     jwk::OctBytes,
     platform::MaybeSendBoxFuture,
     secrets::{Secret, SecretBytes, SecretOutput},
@@ -55,6 +56,17 @@ pub(crate) async fn aes_key_with_kid(kid: &str, byte: u8) -> AesGcmKey {
     )
     .await
     .unwrap()
+}
+
+/// [`test_cipher`] wrapped in the v1 sealer the cookie stores use — the value
+/// the `.sealer(…)` builders now take.
+pub(crate) async fn test_sealer() -> AeadV1Sealer<AesGcmKey> {
+    AeadV1Sealer::new(test_cipher().await)
+}
+
+/// [`test_cipher_with_kid`] wrapped in the v1 sealer, for the kid-sidecar path.
+pub(crate) async fn test_sealer_with_kid(kid: &str) -> AeadV1Sealer<AesGcmKey> {
+    AeadV1Sealer::new(test_cipher_with_kid(kid).await)
 }
 
 /// Build a [`HeaderMap`] from `(name, value)` pairs, panicking on invalid

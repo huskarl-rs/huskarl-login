@@ -5,7 +5,7 @@ use std::{fmt, sync::Arc};
 use crate::{
     client::grant::core::TokenResponse,
     core::{
-        crypto::cipher::AeadCipher,
+        crypto::seal::AeadSealerUnsealer,
         platform::{MaybeSend, MaybeSendSync, SystemTime},
     },
 };
@@ -174,9 +174,9 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
         metrics_name: Option<&str>,
     );
 
-    /// The AEAD cipher this driver seals session data with (AAD-domain-separated
-    /// from the login-state seal, so the key may be shared).
-    fn session_aead_cipher(&self) -> Arc<dyn AeadCipher>;
+    /// The sealer this driver seals session data with (AAD-domain-separated
+    /// from the login-state seal, so the underlying key may be shared).
+    fn session_sealer(&self) -> Arc<dyn AeadSealerUnsealer>;
 
     /// Create and persist a new session from a completed login, returning it
     /// with the `Set-Cookie` values for the callback response.

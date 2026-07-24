@@ -4,13 +4,14 @@
 //! and delegates session data to an [`ExternalSessionStore`] (Redis, a database,
 //! etc.).
 
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use crate::{
     client::grant::core::TokenResponse,
     core::{
-        crypto::cipher::{AeadCipher, AeadSealer as _, CipherMatch},
+        crypto::seal::AeadSealerUnsealer,
         platform::{MaybeSend, MaybeSendSync, SystemTime},
+        prelude::*,
     },
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -211,8 +212,8 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             dyn SessionEnricher<PersistedSessionState, E::SessionType>,
         >,
         external: E,
-        #[builder(with = |cipher: impl AeadCipher + 'static| Arc::new(cipher) as Arc<dyn AeadCipher>)]
-        cipher: Arc<dyn AeadCipher>,
+        #[builder(with = |sealer: impl AeadSealerUnsealer + 'static| Arc::new(sealer) as Arc<dyn AeadSealerUnsealer>)]
+        sealer: Arc<dyn AeadSealerUnsealer>,
         /// Base name for the session cookie.
         cookie_name: CookieName,
         /// Cookie `Path` scope.
@@ -226,7 +227,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         Self {
             external,
             enricher,
-            sealer: CookieSealer::new(cipher, cookie_name, cookie_path, max_age),
+            sealer: CookieSealer::new(sealer, cookie_name, cookie_path, max_age),
             liveness: None,
             max_lifetime: None,
         }
@@ -273,10 +274,6 @@ impl<E: ExternalSessionStore, S: store_builder::IsComplete> StoreBackedSessionSt
 }
 
 impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
-    /// Returns the active cipher's key ID, if the key has an identity.
-    pub fn key_id(&self) -> Option<Cow<'_, str>> {
-        self.sealer.key_id()
-    }
 
     /// Attach server-side liveness (idle-timeout) tracking, backed by the given
     /// [`LivenessStore`] and configured by `config`. Returns `self`. See
@@ -370,18 +367,17 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         session_key: Uuid,
     ) -> Result<Vec<HeaderValue>, SessionError> {
         let aad = self.sealer.aad("session_ptr");
-        let bundle = self
+        let sealed = self
             .sealer
             .cipher
             .seal(session_key.as_bytes(), &aad)
             .await
             .map_err(|e| SessionError::new(SessionErrorKind::Crypto, e))?;
-        // See cookie_session.rs for the rationale on reading `key_id()` from
-        // the same cipher that just sealed the bundle: stable for single-key
-        // ciphers; if multi-key sealers land, switch to `AeadCipherSelector`.
-        let kid = self.sealer.key_id();
+        // The seal returns the kid of the key that sealed this bundle, so the
+        // sidecar always names the right key even under a multi-key cipher.
+        let kid = sealed.kid;
         self.sealer.record_encrypt(kid.as_deref());
-        let cookie_value = URL_SAFE_NO_PAD.encode(&bundle);
+        let cookie_value = URL_SAFE_NO_PAD.encode(&sealed.bundle);
         let attrs = self.sealer.cookie_attrs();
         let pointer = HeaderValue::from_str(&format!(
             "{}={cookie_value}; {attrs}",
@@ -401,29 +397,25 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
 
         let Ok(bundle) = URL_SAFE_NO_PAD.decode(encoded) else {
             self.sealer
-                .record_decrypt(kid.as_deref(), &DecryptResult::BadEncoding);
+                .record_decrypt(&DecryptResult::BadEncoding);
             return None;
         };
-        let cipher_match = kid
-            .as_deref()
-            .map(|k| CipherMatch::builder().kid(k).build());
         let aad = self.sealer.aad("session_ptr");
         let Some(plaintext) =
-            unseal_with_kid_fallback(&self.sealer.cipher, cipher_match.as_ref(), &bundle, &aad)
-                .await
+            unseal_with_kid_fallback(&self.sealer.cipher, kid.as_deref(), &bundle, &aad).await
         else {
             self.sealer
-                .record_decrypt(kid.as_deref(), &DecryptResult::DecryptFailed);
+                .record_decrypt(&DecryptResult::DecryptFailed);
             return None;
         };
         // Must be exactly 16 bytes (UUID); anything else is a corrupted cookie.
         if let Ok(bytes) = <[u8; 16]>::try_from(plaintext) {
             self.sealer
-                .record_decrypt(kid.as_deref(), &DecryptResult::Ok);
+                .record_decrypt(&DecryptResult::Ok);
             Some(Uuid::from_bytes(bytes))
         } else {
             self.sealer
-                .record_decrypt(kid.as_deref(), &DecryptResult::PayloadInvalid);
+                .record_decrypt(&DecryptResult::PayloadInvalid);
             None
         }
     }
@@ -578,8 +570,8 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
         self.max_lifetime = max_lifetime;
     }
 
-    fn session_aead_cipher(&self) -> Arc<dyn AeadCipher> {
-        self.sealer.aead.clone()
+    fn session_sealer(&self) -> Arc<dyn AeadSealerUnsealer> {
+        self.sealer.cipher.clone()
     }
 
     async fn create(
@@ -710,9 +702,9 @@ mod tests {
     use super::*;
     use crate::{
         cookie::encode_kid,
-        core::{crypto::cipher::AeadV1Cipher, platform::MaybeSendBoxFuture},
+        core::{crypto::seal::AeadV1Sealer, platform::MaybeSendBoxFuture},
         session_state::{Session, SessionState},
-        test_support::{aes_key_with_kid, test_cipher, test_cipher_with_kid},
+        test_support::{aes_key_with_kid, test_cipher, test_sealer, test_sealer_with_kid},
     };
 
     #[derive(Clone)]
@@ -817,7 +809,7 @@ mod tests {
         let session = test_session();
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session))
-            .cipher(test_cipher().await)
+            .sealer(test_sealer().await)
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build_with_enricher(MinimalEnricher);
@@ -876,7 +868,7 @@ mod tests {
     ) -> StoreBackedSessionStore<MinimalExternalStore> {
         StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session))
-            .cipher(test_cipher().await)
+            .sealer(test_sealer().await)
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build()
@@ -888,7 +880,7 @@ mod tests {
         let session = test_session();
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session.clone()))
-            .cipher(test_cipher().await)
+            .sealer(test_sealer().await)
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build();
@@ -1019,7 +1011,7 @@ mod tests {
         let session = test_session();
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session.clone()))
-            .cipher(test_cipher().await)
+            .sealer(test_sealer().await)
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build()
@@ -1185,7 +1177,7 @@ mod tests {
     async fn store_over(external: VersioningStore) -> StoreBackedSessionStore<VersioningStore> {
         StoreBackedSessionStore::builder()
             .external(external)
-            .cipher(test_cipher().await)
+            .sealer(test_sealer().await)
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build()
@@ -1314,7 +1306,7 @@ mod tests {
 
         let store = StoreBackedSessionStore::builder()
             .external(external.clone())
-            .cipher(test_cipher().await)
+            .sealer(test_sealer().await)
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build()
@@ -1357,7 +1349,7 @@ mod tests {
 
         let store = StoreBackedSessionStore::builder()
             .external(external.clone())
-            .cipher(test_cipher().await)
+            .sealer(test_sealer().await)
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build();
@@ -1594,7 +1586,7 @@ mod tests {
         let original_key = session.persisted.session_key;
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session.clone()))
-            .cipher(test_cipher().await)
+            .sealer(test_sealer().await)
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build();
@@ -1639,7 +1631,7 @@ mod tests {
         let session = test_session();
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session.clone()))
-            .cipher(test_cipher_with_kid("kid-7").await)
+            .sealer(test_sealer_with_kid("kid-7").await)
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build();
@@ -1674,7 +1666,7 @@ mod tests {
         let original_key = session.persisted.session_key;
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session))
-            .cipher(cipher)
+            .sealer(AeadV1Sealer::new(cipher))
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build();
@@ -1794,7 +1786,7 @@ mod tests {
         let inserted = std::sync::Arc::new(std::sync::Mutex::new(None));
         let store = StoreBackedSessionStore::builder()
             .external(EnrichedExternalStore(inserted.clone()))
-            .cipher(test_cipher().await)
+            .sealer(test_sealer().await)
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build_with_claims(|seed, completed| {
@@ -1832,7 +1824,7 @@ mod tests {
             .external(EnrichedExternalStore(std::sync::Arc::new(
                 std::sync::Mutex::new(None),
             )))
-            .cipher(test_cipher().await)
+            .sealer(test_sealer().await)
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build_with_claims(|_seed, _completed| {
@@ -1859,20 +1851,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_aead_cipher_returns_the_configured_cipher() {
+    async fn session_sealer_returns_the_configured_sealer() {
         // The accessor a convenience layer uses to default the login-state
-        // cipher: it must hand back the store's actual configured cipher
-        // (matched here by reported key id), not a re-wrapped or empty one.
-        use crate::core::crypto::cipher::AeadEncryptor as _;
+        // sealer: it must hand back the store's configured sealer (identified
+        // here by the kid it stamps on a seal), not a re-wrapped or empty one.
         let session = test_session();
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session))
-            .cipher(test_cipher_with_kid("v5").await)
+            .sealer(test_sealer_with_kid("v5").await)
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build();
-        let cipher = SessionDriver::session_aead_cipher(&store);
-        assert_eq!(cipher.key_id().as_deref(), Some("v5"));
+        let sealed = SessionDriver::session_sealer(&store)
+            .seal(b"probe", b"aad")
+            .await
+            .unwrap();
+        assert_eq!(sealed.kid.as_deref(), Some("v5"));
     }
 
     #[tokio::test]
@@ -1880,7 +1874,7 @@ mod tests {
         let session = test_session();
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session.clone()))
-            .cipher(test_cipher().await)
+            .sealer(test_sealer().await)
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build();
@@ -1907,13 +1901,10 @@ mod tests {
         (s.clone(), MinimalExternalStore(s))
     }
 
-    /// Counter labels for a pointer-cookie decrypt with the given kid and outcome.
-    fn decrypt_labels<'a>(kid: &'a str, outcome: &'a str) -> [(&'a str, &'a str); 3] {
-        [
-            ("cookie", "__Host-session"),
-            ("kid", kid),
-            ("outcome", outcome),
-        ]
+    /// Counter labels for a pointer-cookie decrypt with the given outcome. The
+    /// decrypt counter carries no kid label (see [`CookieSealer::record_decrypt`]).
+    fn decrypt_labels(outcome: &str) -> [(&str, &str); 2] {
+        [("cookie", "__Host-session"), ("outcome", outcome)]
     }
 
     #[test]
@@ -1922,7 +1913,7 @@ mod tests {
             let (session, external) = test_session_and_store();
             let store = StoreBackedSessionStore::builder()
                 .external(external)
-                .cipher(test_cipher().await)
+                .sealer(test_sealer().await)
                 .cookie_name("session".parse().unwrap())
                 .cookie_path("/".parse().unwrap())
                 .build();
@@ -1947,7 +1938,7 @@ mod tests {
             let (session, external) = test_session_and_store();
             let store = StoreBackedSessionStore::builder()
                 .external(external)
-                .cipher(test_cipher_with_kid("v5").await)
+                .sealer(test_sealer_with_kid("v5").await)
                 .cookie_name("session".parse().unwrap())
                 .cookie_path("/".parse().unwrap())
                 .build();
@@ -1972,7 +1963,7 @@ mod tests {
             let (_, external) = test_session_and_store();
             let store = StoreBackedSessionStore::builder()
                 .external(external)
-                .cipher(test_cipher().await)
+                .sealer(test_sealer().await)
                 .cookie_name("session".parse().unwrap())
                 .cookie_path("/".parse().unwrap())
                 .build();
@@ -1992,7 +1983,7 @@ mod tests {
             let (_, external) = test_session_and_store();
             let store = StoreBackedSessionStore::builder()
                 .external(external)
-                .cipher(test_cipher().await)
+                .sealer(test_sealer().await)
                 .cookie_name("session".parse().unwrap())
                 .cookie_path("/".parse().unwrap())
                 .build();
@@ -2007,7 +1998,7 @@ mod tests {
             counter_value(
                 &counters,
                 "huskarl.session_cookie.decrypt",
-                &decrypt_labels("none", "bad_encoding"),
+                &decrypt_labels("bad_encoding"),
             ),
             1
         );
@@ -2019,7 +2010,7 @@ mod tests {
             let (_, external) = test_session_and_store();
             let store = StoreBackedSessionStore::builder()
                 .external(external)
-                .cipher(test_cipher().await)
+                .sealer(test_sealer().await)
                 .cookie_name("session".parse().unwrap())
                 .cookie_path("/".parse().unwrap())
                 .build();
@@ -2034,7 +2025,7 @@ mod tests {
             counter_value(
                 &counters,
                 "huskarl.session_cookie.decrypt",
-                &decrypt_labels("none", "decrypt_failed"),
+                &decrypt_labels("decrypt_failed"),
             ),
             1
         );
@@ -2046,17 +2037,17 @@ mod tests {
             let (_, external) = test_session_and_store();
             let store = StoreBackedSessionStore::builder()
                 .external(external)
-                .cipher(test_cipher().await)
+                .sealer(test_sealer().await)
                 .cookie_name("session".parse().unwrap())
                 .cookie_path("/".parse().unwrap())
                 .build();
             // Seal 17 bytes under session_ptr AAD — AEAD passes but the UUID
             // conversion ([u8; 16]) fails, exercising PayloadInvalid.
-            let bundle = AeadV1Cipher::new(test_cipher().await)
+            let sealed = AeadV1Sealer::new(test_cipher().await)
                 .seal(&[0u8; 17], &store.sealer.aad("session_ptr"))
                 .await
                 .unwrap();
-            let encoded = URL_SAFE_NO_PAD.encode(&bundle);
+            let encoded = URL_SAFE_NO_PAD.encode(&sealed.bundle);
             let mut headers = http::HeaderMap::new();
             headers.insert(
                 http::header::COOKIE,
@@ -2068,19 +2059,19 @@ mod tests {
             counter_value(
                 &counters,
                 "huskarl.session_cookie.decrypt",
-                &decrypt_labels("none", "payload_invalid"),
+                &decrypt_labels("payload_invalid"),
             ),
             1
         );
     }
 
     #[test]
-    fn metrics_read_pointer_cookie_success_records_ok_with_kid() {
+    fn metrics_read_pointer_cookie_success_records_ok() {
         let ((), counters) = with_metrics(async {
             let (session, external) = test_session_and_store();
             let store = StoreBackedSessionStore::builder()
                 .external(external)
-                .cipher(test_cipher_with_kid("v5").await)
+                .sealer(test_sealer_with_kid("v5").await)
                 .cookie_name("session".parse().unwrap())
                 .cookie_path("/".parse().unwrap())
                 .build();
@@ -2110,56 +2101,7 @@ mod tests {
             counter_value(
                 &counters,
                 "huskarl.session_cookie.decrypt",
-                &decrypt_labels("v5", "ok"),
-            ),
-            1
-        );
-    }
-
-    #[test]
-    fn metrics_read_pointer_cookie_forged_kid_is_normalized_to_unknown() {
-        // The sidecar is client-supplied: a pointer sealed under "v5" carrying
-        // an attacker-chosen kid must not let that value reach the metrics
-        // label. The read still succeeds (kid is a hint, not a filter), but the
-        // label collapses to "unknown".
-        let ((), counters) = with_metrics(async {
-            let (session, external) = test_session_and_store();
-            let store = StoreBackedSessionStore::builder()
-                .external(external)
-                .cipher(test_cipher_with_kid("v5").await)
-                .cookie_name("session".parse().unwrap())
-                .cookie_path("/".parse().unwrap())
-                .build();
-            let headers_out = store
-                .pointer_cookie_headers(session.persisted.session_key)
-                .await
-                .unwrap();
-            let pointer_value = headers_out
-                .iter()
-                .find_map(|h| {
-                    let s = h.to_str().ok()?;
-                    let pair = s.split(';').next()?;
-                    let (name, v) = pair.split_once('=')?;
-                    (name.trim() == "__Host-session" && !v.is_empty()).then(|| v.to_owned())
-                })
-                .expect("pointer cookie present");
-            let mut req = http::HeaderMap::new();
-            req.insert(
-                http::header::COOKIE,
-                format!(
-                    "__Host-session={pointer_value}; __Host-session.kid={}",
-                    encode_kid("totally-bogus")
-                )
-                .parse()
-                .unwrap(),
-            );
-            store.read_pointer_cookie(&req).await;
-        });
-        assert_eq!(
-            counter_value(
-                &counters,
-                "huskarl.session_cookie.decrypt",
-                &decrypt_labels("unknown", "ok"),
+                &decrypt_labels("ok"),
             ),
             1
         );
@@ -2171,7 +2113,7 @@ mod tests {
             let (session, external) = test_session_and_store();
             let mut store = StoreBackedSessionStore::builder()
                 .external(external)
-                .cipher(test_cipher().await)
+                .sealer(test_sealer().await)
                 .cookie_name("session".parse().unwrap())
                 .cookie_path("/".parse().unwrap())
                 .build();
@@ -2206,7 +2148,7 @@ mod tests {
             external.insert(&old).await.unwrap();
             let store = StoreBackedSessionStore::builder()
                 .external(external)
-                .cipher(test_cipher().await)
+                .sealer(test_sealer().await)
                 .cookie_name("session".parse().unwrap())
                 .cookie_path("/".parse().unwrap())
                 .build();
@@ -2236,7 +2178,7 @@ mod tests {
             let session = test_session();
             let store = StoreBackedSessionStore::builder()
                 .external(MinimalExternalStore(session.clone()))
-                .cipher(test_cipher().await)
+                .sealer(test_sealer().await)
                 .cookie_name("session".parse().unwrap())
                 .cookie_path("/".parse().unwrap())
                 .build()

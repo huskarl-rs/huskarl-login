@@ -2,20 +2,21 @@
 
 use serde::Serialize;
 
-use crate::config::LoginConfig;
+use crate::config::RoutePath;
 
 /// Reconstructs the client-facing URL to redirect back to after login.
 ///
+/// `base` is the reconstructed base URL (the grant's `redirect_uri` origin
+/// joined with the config's `base_path`); it carries scheme and authority.
+///
 /// Returns `None` if `strip_prefix` is set but does not match the request path.
-///
-/// # Panics
-///
-/// Never in practice (`base_url` carries scheme and authority).
-pub fn original_url(config: &LoginConfig, req_uri: &http::Uri) -> Option<String> {
-    let base = config.base_url.as_uri();
-
+pub fn original_url(
+    base: &http::Uri,
+    strip_prefix: Option<&RoutePath>,
+    req_uri: &http::Uri,
+) -> Option<String> {
     let req_path = req_uri.path();
-    let stripped = match &config.strip_prefix {
+    let stripped = match strip_prefix {
         Some(prefix) => {
             if let Some(s) = req_path.strip_prefix(prefix.as_str()) {
                 s
@@ -85,10 +86,9 @@ pub fn build_end_session_url(
     })
 }
 
-/// Returns the configured `base_url` as a string (scheme, authority, and path).
-pub fn base_url_as_string(config: &LoginConfig) -> String {
-    let base = config.base_url.as_uri();
-    // `base_url` is an `EndpointUrl`: scheme and authority are guaranteed present;
+/// Returns the reconstructed `base` URL as a string (scheme, authority, and path).
+pub fn base_url_as_string(base: &http::Uri) -> String {
+    // The reconstructed base carries scheme and authority by construction;
     // the `else` (raw URI string) is unreachable in practice.
     let (Some(scheme), Some(authority)) = (
         base.scheme_str(),
@@ -104,35 +104,22 @@ pub fn base_url_as_string(config: &LoginConfig) -> String {
     }
 }
 
-/// Returns the default post-logout redirect: the configured `base_url`.
-pub fn default_post_logout_redirect(config: &LoginConfig) -> String {
-    base_url_as_string(config)
+/// Returns the default post-logout redirect: the reconstructed base URL.
+pub fn default_post_logout_redirect(base: &http::Uri) -> String {
+    base_url_as_string(base)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SessionLifetime;
 
-    fn make_config_with_base(base_url: &str) -> LoginConfig {
-        LoginConfig::builder()
-            .callback_path("/callback")
-            .scope(vec![])
-            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url(base_url.parse().unwrap())
-            .build()
-            .unwrap()
+    /// The reconstructed base URL (origin + `base_path`) the engine passes in.
+    fn base(s: &str) -> http::Uri {
+        s.parse().unwrap()
     }
 
-    fn make_config_with_strip(base_url: &str, strip: &str) -> LoginConfig {
-        LoginConfig::builder()
-            .callback_path(format!("{strip}/callback"))
-            .scope(vec![])
-            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .base_url(base_url.parse().unwrap())
-            .strip_prefix(strip)
-            .build()
-            .unwrap()
+    fn strip(s: &str) -> RoutePath {
+        s.parse().unwrap()
     }
 
     // -- build_end_session_url tests --
@@ -194,18 +181,16 @@ mod tests {
 
     #[test]
     fn default_post_logout_redirect_simple() {
-        let config = make_config_with_base("https://app.example.com");
         assert_eq!(
-            default_post_logout_redirect(&config),
+            default_post_logout_redirect(&base("https://app.example.com")),
             "https://app.example.com/"
         );
     }
 
     #[test]
     fn default_post_logout_redirect_with_path() {
-        let config = make_config_with_base("https://app.example.com/myapp");
         assert_eq!(
-            default_post_logout_redirect(&config),
+            default_post_logout_redirect(&base("https://app.example.com/myapp")),
             "https://app.example.com/myapp"
         );
     }
@@ -214,87 +199,81 @@ mod tests {
 
     #[test]
     fn original_url_simple_path() {
-        let config = make_config_with_base("https://app.example.com");
         let uri: http::Uri = "/page".parse().unwrap();
         assert_eq!(
-            original_url(&config, &uri),
+            original_url(&base("https://app.example.com"), None, &uri),
             Some("https://app.example.com/page".into())
         );
     }
 
     #[test]
     fn original_url_root_path() {
-        let config = make_config_with_base("https://app.example.com");
         let uri: http::Uri = "/".parse().unwrap();
         assert_eq!(
-            original_url(&config, &uri),
+            original_url(&base("https://app.example.com"), None, &uri),
             Some("https://app.example.com/".into())
         );
     }
 
     #[test]
     fn original_url_preserves_query_string() {
-        let config = make_config_with_base("https://app.example.com");
         let uri: http::Uri = "/search?q=hello&page=1".parse().unwrap();
         assert_eq!(
-            original_url(&config, &uri),
+            original_url(&base("https://app.example.com"), None, &uri),
             Some("https://app.example.com/search?q=hello&page=1".into())
         );
     }
 
     #[test]
     fn original_url_base_url_with_path() {
-        let config = make_config_with_base("https://app.example.com/base");
         let uri: http::Uri = "/page".parse().unwrap();
         assert_eq!(
-            original_url(&config, &uri),
+            original_url(&base("https://app.example.com/base"), None, &uri),
             Some("https://app.example.com/base/page".into())
         );
     }
 
     #[test]
     fn original_url_base_url_with_trailing_slash() {
-        let config = make_config_with_base("https://app.example.com/base/");
         let uri: http::Uri = "/page".parse().unwrap();
         assert_eq!(
-            original_url(&config, &uri),
+            original_url(&base("https://app.example.com/base/"), None, &uri),
             Some("https://app.example.com/base/page".into())
         );
     }
 
     #[test]
     fn original_url_strip_prefix_removes_prefix() {
-        let config = make_config_with_strip("https://app.example.com", "/internal");
         let uri: http::Uri = "/internal/page".parse().unwrap();
         assert_eq!(
-            original_url(&config, &uri),
+            original_url(&base("https://app.example.com"), Some(&strip("/internal")), &uri),
             Some("https://app.example.com/page".into())
         );
     }
 
     #[test]
     fn original_url_strip_prefix_preserves_query() {
-        let config = make_config_with_strip("https://app.example.com", "/internal");
         let uri: http::Uri = "/internal/page?foo=bar".parse().unwrap();
         assert_eq!(
-            original_url(&config, &uri),
+            original_url(&base("https://app.example.com"), Some(&strip("/internal")), &uri),
             Some("https://app.example.com/page?foo=bar".into())
         );
     }
 
     #[test]
     fn original_url_strip_prefix_mismatch_returns_none() {
-        let config = make_config_with_strip("https://app.example.com", "/internal");
         let uri: http::Uri = "/other/page".parse().unwrap();
-        assert_eq!(original_url(&config, &uri), None);
+        assert_eq!(
+            original_url(&base("https://app.example.com"), Some(&strip("/internal")), &uri),
+            None
+        );
     }
 
     #[test]
     fn original_url_strip_prefix_with_base_path() {
-        let config = make_config_with_strip("https://app.example.com/base", "/internal");
         let uri: http::Uri = "/internal/page".parse().unwrap();
         assert_eq!(
-            original_url(&config, &uri),
+            original_url(&base("https://app.example.com/base"), Some(&strip("/internal")), &uri),
             Some("https://app.example.com/base/page".into())
         );
     }

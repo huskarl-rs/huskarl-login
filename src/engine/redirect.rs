@@ -3,7 +3,7 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::{HeaderValue, Uri};
 use crate::client::grant::authorization_code::StartInput;
-use crate::core::{crypto::cipher::AeadSealer as _, platform::SystemTime};
+use crate::core::{platform::SystemTime, prelude::*};
 
 use super::{EngineError, LoginEngine, LoginResponse, LoginStateCookie};
 use crate::{
@@ -20,8 +20,9 @@ where
         &self,
         request_uri: &Uri,
     ) -> Result<LoginResponse, EngineError> {
-        let orig_url = original_url(&self.config, request_uri)
-            .unwrap_or_else(|| base_url_as_string(&self.config));
+        let orig_url =
+            original_url(&self.base_url, self.config.strip_prefix.as_ref(), request_uri)
+                .unwrap_or_else(|| base_url_as_string(&self.base_url));
 
         let start = self
             .grant
@@ -57,20 +58,20 @@ where
             created_at: SystemTime::now(),
         })
         .map_err(|e| SessionError::new(SessionErrorKind::Encoding, e))?;
-        let bundle = self
+        let sealed = self
             .cipher
             .seal(&payload, &super::login_state_aad(state))
             .await
             .map_err(|e| SessionError::new(SessionErrorKind::Crypto, e))?;
         let cookie_name = login_state_cookie_name(
             state,
-            self.config.secure,
+            self.secure,
             self.config.browser_callback_path.as_str(),
             self.config.login_cookie_prefix.as_str(),
         );
-        let cookie_value = URL_SAFE_NO_PAD.encode(&bundle);
+        let cookie_value = URL_SAFE_NO_PAD.encode(&sealed.bundle);
         let attrs = cookie_attrs(
-            self.config.secure,
+            self.secure,
             self.config.browser_callback_path.as_str(),
         );
         let max_age = self.config.login_state_ttl.as_secs();

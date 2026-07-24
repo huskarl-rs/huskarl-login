@@ -23,7 +23,7 @@ bon = { version = "3.9", features = ["experimental-generics-setters"] }
 bytes = "1"
 ciborium = "0.2"
 http = { version = "1", default-features = false }
-huskarl = { version = "0.9", default-features = false }
+huskarl = { version = "0.10", path = "../huskarl/huskarl", default-features = false }
 log = "0.4"
 metrics = { version = "0.24", default-features = false }
 rand = "0.10"
@@ -39,7 +39,7 @@ uuid = { version = "1", features = ["v7", "serde", "js"] }
 
 [dev-dependencies]
 hex = "0.4"
-huskarl-crypto-native = { version = "0.9" }
+huskarl-crypto-native = { version = "0.10", path = "../huskarl/huskarl-crypto-native" }
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 rand = "0.10"
 rstest = "0.26.1"
