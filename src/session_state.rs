@@ -2,15 +2,18 @@
 //! token/timing fields, [`Session`] exposes them to the middleware. State is
 //! immutable. Liveness is tracked separately (see [`crate::liveness`]).
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
-    client::grant::core::TokenResponse,
-    client::token::{IdToken, RefreshToken},
+    client::{
+        grant::core::TokenResponse,
+        token::{IdToken, RefreshToken},
+    },
     core::{
         platform::{Duration, SystemTime},
         serde_utils::time::{option_unix_secs, unix_secs},
     },
 };
-use serde::{Deserialize, Serialize};
 
 /// Common token and timing state shared by all session types.
 ///

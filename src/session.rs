@@ -2,16 +2,18 @@
 
 use std::{fmt, sync::Arc};
 
+use http::HeaderValue;
+
 use crate::{
     client::grant::core::TokenResponse,
+    completed_login::CompletedLogin,
     core::{
         crypto::seal::AeadSealerUnsealer,
         platform::{MaybeSend, MaybeSendSync, SystemTime},
     },
+    liveness::LivenessVerdict,
+    session_state::Session,
 };
-use http::HeaderValue;
-
-use crate::{completed_login::CompletedLogin, liveness::LivenessVerdict, session_state::Session};
 
 /// A type-erased session-error cause (`Send + Sync` except on WASM).
 #[cfg(not(target_arch = "wasm32"))]

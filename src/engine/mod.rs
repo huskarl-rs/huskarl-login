@@ -4,20 +4,6 @@
 
 use std::sync::{Arc, LazyLock};
 
-use crate::core::{
-    Error, RetryAdvice,
-    crypto::seal::AeadSealerUnsealer,
-    platform::{Duration, MaybeSendSync, SystemTime, sleep},
-    serde_utils::time::unix_secs,
-};
-use crate::{
-    client::grant::{
-        authorization_code::{AuthorizationCodeGrant, PendingState},
-        core::{OAuth2ExchangeGrant as _, TokenResponse},
-        refresh::RefreshGrantParameters,
-    },
-    client::token::RefreshToken,
-};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use rand::RngExt as _;
@@ -26,7 +12,21 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ConfigError, DefaultErrorPage, ErrorPage, LivenessVerdict, LoginConfig, Session, SessionDriver,
     SessionError, SessionErrorKind,
+    client::{
+        grant::{
+            authorization_code::{AuthorizationCodeGrant, PendingState},
+            core::{OAuth2ExchangeGrant as _, TokenResponse},
+            refresh::RefreshGrantParameters,
+        },
+        token::RefreshToken,
+    },
     cookie::SessionCipher,
+    core::{
+        Error, RetryAdvice,
+        crypto::seal::AeadSealerUnsealer,
+        platform::{Duration, MaybeSendSync, SystemTime, sleep},
+        serde_utils::time::unix_secs,
+    },
     metrics::{LoginCompleteResult, LoginStartResult, RefreshResult},
     session::advises_retry,
 };

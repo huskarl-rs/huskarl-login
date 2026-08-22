@@ -1,9 +1,6 @@
 //! `handle_callback` — exchange the authorization code for tokens and create
 //! the session.
 
-use crate::client::grant::authorization_code::{CompleteInput, CompleteOutput};
-use crate::core::platform::SystemTime;
-use crate::core::prelude::*;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use serde::Deserialize;
@@ -11,10 +8,12 @@ use serde::Deserialize;
 use super::{LoginEngine, LoginResponse, LoginStateCookie, error_chain};
 use crate::{
     CompletedLogin, Session, SessionDriver,
+    client::grant::authorization_code::{CompleteInput, CompleteOutput},
     cookie::{
         cookie_attrs, decode_payload, get_cookie, is_valid_oauth_state, login_state_cookie_name,
         login_state_cookie_name_prefix, login_state_cookie_names,
     },
+    core::{platform::SystemTime, prelude::*},
     metrics::{LoginCompleteResult, normalize_as_error},
     url::base_url_as_string,
 };

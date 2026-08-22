@@ -1,14 +1,14 @@
 //! `redirect_to_as` — start the OAuth flow by redirecting to the AS.
 
-use crate::client::grant::authorization_code::StartInput;
-use crate::core::{platform::SystemTime, prelude::*};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::{HeaderValue, Uri};
 
 use super::{EngineError, LoginEngine, LoginResponse, LoginStateCookie};
 use crate::{
     SessionDriver, SessionError, SessionErrorKind,
+    client::grant::authorization_code::StartInput,
     cookie::{cookie_attrs, encode_payload, login_state_cookie_name},
+    core::{platform::SystemTime, prelude::*},
     url::{base_url_as_string, original_url},
 };
 

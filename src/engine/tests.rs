@@ -7,7 +7,19 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::Bytes;
+use http::{HeaderMap, HeaderValue, Method, StatusCode};
+use rstest::rstest;
+use snafu::Snafu;
+
+use super::{
+    LoadedSession, LoginEngine, PendingPersist, TeardownReason, error_chain, is_cors_preflight,
+    is_cross_site_request, is_navigation_request,
+};
 use crate::{
+    ActivityPolicy, CompletedLogin, LivenessVerdict, LoginConfig, LogoutConfig, Session,
+    SessionDriver, SessionError, SessionErrorKind, SessionLifetime, SessionState,
     client::{
         grant::authorization_code::{AuthorizationCodeGrant, PendingState},
         token::RefreshToken,
@@ -22,20 +34,6 @@ use crate::{
         http::{HttpClient, HttpResponse, Idempotency},
         platform::MaybeSendBoxFuture,
     },
-};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use bytes::Bytes;
-use http::{HeaderMap, HeaderValue, Method, StatusCode};
-use rstest::rstest;
-use snafu::Snafu;
-
-use super::{
-    LoadedSession, LoginEngine, PendingPersist, TeardownReason, error_chain, is_cors_preflight,
-    is_cross_site_request, is_navigation_request,
-};
-use crate::{
-    ActivityPolicy, CompletedLogin, LivenessVerdict, LoginConfig, LogoutConfig, Session,
-    SessionDriver, SessionError, SessionErrorKind, SessionLifetime, SessionState,
     session::sealed::Sealed,
     test_support::{header_map as headers, test_cipher, test_sealer},
 };

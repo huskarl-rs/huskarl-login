@@ -18,5 +18,4 @@
 
 // `client::prelude` already re-exports `core::prelude::*`; the second re-export
 // keeps the guarantee explicit and independent of that upstream detail.
-pub use crate::client::prelude::*;
-pub use crate::core::prelude::*;
+pub use crate::{client::prelude::*, core::prelude::*};

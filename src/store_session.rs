@@ -6,14 +6,6 @@
 
 use std::{sync::Arc, time::Duration};
 
-use crate::{
-    client::grant::core::TokenResponse,
-    core::{
-        crypto::seal::AeadSealerUnsealer,
-        platform::{MaybeSend, MaybeSendSync, SystemTime},
-        prelude::*,
-    },
-};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::HeaderValue;
 use serde::{Deserialize, Serialize};
@@ -21,10 +13,16 @@ use snafu::Snafu;
 use uuid::Uuid;
 
 use crate::{
+    client::grant::core::TokenResponse,
     config::RoutePath,
     cookie::{
         CookieName, CookieSealer, DEFAULT_COOKIE_MAX_AGE, get_cookie, get_kid_cookie,
         kid_cookie_name, unseal_with_kid_fallback,
+    },
+    core::{
+        crypto::seal::AeadSealerUnsealer,
+        platform::{MaybeSend, MaybeSendSync, SystemTime},
+        prelude::*,
     },
     enrich::{NoEnrichment, SessionEnricher},
     liveness::{LivenessConfig, LivenessStore, LivenessVerdict},
