@@ -59,7 +59,6 @@ let grant = AuthorizationCodeGrant::builder_from_metadata(&metadata)
 let store = CookieSessionStore::builder()
     .sealer(AeadV1Sealer::new(key))
     .cookie_name("session".parse()?)
-    .cookie_path("/".parse()?)
     .build();
 
 // 4a. Login config: only the callback mount path and requested scopes. The

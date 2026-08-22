@@ -204,6 +204,12 @@ impl RoutePath {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The root path `/`. Infallible — `/` is always cookie- and header-safe.
+    #[must_use]
+    pub fn root() -> Self {
+        Self("/".to_owned())
+    }
 }
 
 /// Error returned by [`RoutePath::new`] when a path fails validation.

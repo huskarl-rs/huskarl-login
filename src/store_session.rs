@@ -216,7 +216,10 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         sealer: Arc<dyn AeadSealerUnsealer>,
         /// Base name for the session cookie.
         cookie_name: CookieName,
-        /// Cookie `Path` scope.
+        /// Cookie `Path` scope. Defaults to `/` — which also enables the
+        /// strongest `__Host-` cookie prefix; set a narrower path only
+        /// deliberately.
+        #[builder(default = RoutePath::root())]
         cookie_path: RoutePath,
         /// Cookie `Max-Age`; defaults to 400 days. The engine clamps it to the
         /// [`SessionLifetime::Bounded`](crate::SessionLifetime) cap at
