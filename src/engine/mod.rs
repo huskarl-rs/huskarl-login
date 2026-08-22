@@ -5,7 +5,7 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::core::{
-    Error,
+    Error, RetryAdvice,
     crypto::seal::AeadSealerUnsealer,
     platform::{Duration, MaybeSendSync, SystemTime, sleep},
     serde_utils::time::unix_secs,
@@ -28,6 +28,7 @@ use crate::{
     SessionError, SessionErrorKind,
     cookie::SessionCipher,
     metrics::{LoginCompleteResult, LoginStartResult, RefreshResult},
+    session::advises_retry,
 };
 
 mod callback;
@@ -959,7 +960,7 @@ where
             }
             // Re-read the clock: the retry loop slept, and the token may have
             // expired while we were waiting.
-            Err(e) if e.is_retryable() && SystemTime::now() < session.token_expiry() => {
+            Err(e) if advises_retry(&e) && SystemTime::now() < session.token_expiry() => {
                 log::warn!(
                     "token refresh failed transiently; retaining session while access token \
                      is still valid: {}",
@@ -979,7 +980,7 @@ where
             // its refresh token) that resumes by itself once the authorization
             // server recovers — an AS blip at the wrong moment must not force
             // every idle user back through login.
-            Err(e) if e.is_retryable() => {
+            Err(e) if advises_retry(&e) => {
                 log::warn!(
                     "token refresh unavailable; retaining session for a later retry: {}",
                     error_chain(&e)
@@ -1018,8 +1019,10 @@ where
     }
 
     /// Exchanges the refresh token up to [`REFRESH_MAX_ATTEMPTS`] times,
-    /// retrying retryable errors with exponential backoff plus jitter
-    /// ([`refresh_retry_delay`]); non-retryable errors return immediately.
+    /// retrying [`RetryAdvice::Retry`] errors with exponential backoff plus
+    /// jitter ([`refresh_retry_delay`]), extended to any delay the server asked
+    /// for and capped at [`REFRESH_RETRY_MAX_DELAY`]. Errors advising no retry,
+    /// and delays past that cap, return immediately.
     async fn refresh_with_retry(&self, rt: &RefreshToken) -> Result<TokenResponse, Error> {
         let refresh_grant = self.grant.to_refresh_grant();
         let mut attempt = 0;
@@ -1030,14 +1033,34 @@ where
                 .await
             {
                 Ok(tr) => return Ok(tr),
-                Err(e) if attempt < REFRESH_MAX_ATTEMPTS && e.is_retryable() => {
-                    let delay = refresh_retry_delay(attempt);
+                Err(e) => {
+                    // Only a transient failure is worth repeating, and only
+                    // within the attempt budget.
+                    let RetryAdvice::Retry { after } = e.retry_advice() else {
+                        return Err(e);
+                    };
+                    if attempt >= REFRESH_MAX_ATTEMPTS {
+                        return Err(e);
+                    }
+                    // Honour a server-supplied delay (`Retry-After`, `slow_down`)
+                    // when it exceeds our own backoff, but never hold the request
+                    // longer than `REFRESH_RETRY_MAX_DELAY`: past that the caller
+                    // is better served by the retryable-failure path, which keeps
+                    // the session and lets the next request try again.
+                    let delay = refresh_retry_delay(attempt).max(after.unwrap_or_default());
+                    if delay > REFRESH_RETRY_MAX_DELAY {
+                        log::warn!(
+                            "token refresh failed (attempt {attempt}/{REFRESH_MAX_ATTEMPTS}); \
+                             authorization server asked to wait {delay:?}, longer than the \
+                             {REFRESH_RETRY_MAX_DELAY:?} in-request budget: {e}"
+                        );
+                        return Err(e);
+                    }
                     log::warn!(
                         "token refresh failed (attempt {attempt}/{REFRESH_MAX_ATTEMPTS}, retrying in {delay:?}): {e}"
                     );
                     sleep(delay).await;
                 }
-                Err(e) => return Err(e),
             }
         }
     }
@@ -1150,6 +1173,12 @@ const REFRESH_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 
 /// Maximum random jitter added on top of the exponential base.
 const REFRESH_RETRY_JITTER_MAX: Duration = Duration::from_millis(50);
+
+/// Longest a single refresh retry may wait, server-supplied delays included.
+///
+/// The retry happens inside a request the browser is waiting on, so a
+/// `Retry-After` of a minute must not become a minute of latency.
+const REFRESH_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
 /// Wait before retry `attempt` (1-indexed): `base * 2^(attempt-1) + jitter`,
 /// jitter uniform in `[0, REFRESH_RETRY_JITTER_MAX)`.

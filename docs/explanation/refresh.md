@@ -73,7 +73,11 @@ irreversible: an AS outage longer than a token lifetime would otherwise destroy
 every idle user's session (and refresh token) even though all of them would
 resume by themselves the moment the AS recovers. Refreshes are retried a few
 times with exponential backoff and jitter so a short outage doesn't produce a
-synchronized thundering herd.
+synchronized thundering herd. A delay the authorization server itself asks for
+(`Retry-After`, or a `slow_down` verdict) extends that backoff when it is
+longer, but only up to a one-second budget: the retries happen inside a request
+the browser is waiting on, so a longer delay ends the attempts and leaves the
+outcome to the retained-session paths above.
 
 ## Concurrent refresh
 

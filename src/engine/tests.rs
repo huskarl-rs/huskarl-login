@@ -13,7 +13,7 @@ use crate::{
         token::RefreshToken,
     },
     core::{
-        Error, ErrorKind,
+        Error, RetryAdvice,
         client_auth::NoAuth,
         crypto::{
             cipher::DecryptError,
@@ -46,22 +46,26 @@ use crate::{
 #[snafu(display("flaky transport error"))]
 struct FlakyError;
 
-/// Fails every request with a transport error of the given retryability,
-/// counting calls. One refresh attempt makes exactly one token-endpoint
+/// Fails every request with a transport error carrying the given retry
+/// advice, counting calls. One refresh attempt makes exactly one token-endpoint
 /// request (`NoAuth` needs no HTTP and no `DPoP` is configured), so the call
 /// count equals the attempt count.
 struct FailingHttp {
     calls: Arc<AtomicU32>,
-    retryable: bool,
+    advice: RetryAdvice,
 }
 
 impl FailingHttp {
     fn new(retryable: bool) -> (Self, Arc<AtomicU32>) {
+        Self::with_advice(RetryAdvice::retry_if(retryable))
+    }
+
+    fn with_advice(advice: RetryAdvice) -> (Self, Arc<AtomicU32>) {
         let calls = Arc::new(AtomicU32::new(0));
         (
             Self {
                 calls: Arc::clone(&calls),
-                retryable,
+                advice,
             },
             calls,
         )
@@ -75,8 +79,8 @@ impl HttpClient for FailingHttp {
         _: Idempotency,
     ) -> MaybeSendBoxFuture<'_, Result<HttpResponse, Error>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let retryable = self.retryable;
-        Box::pin(async move { Err(Error::new(ErrorKind::Transport { retryable }, FlakyError)) })
+        let advice = self.advice;
+        Box::pin(async move { Err(Error::new(advice, FlakyError)) })
     }
 }
 
@@ -1298,7 +1302,16 @@ async fn engine_with_failing_refresh(
     retryable: bool,
     session: MockSession,
 ) -> (LoginEngine<MockSessionStore>, Arc<AtomicU32>) {
-    let (http, calls) = FailingHttp::new(retryable);
+    engine_with_refresh_advice(RetryAdvice::retry_if(retryable), session).await
+}
+
+/// As [`engine_with_failing_refresh`], with the failure's retry advice given
+/// in full (so a server-supplied delay can be exercised).
+async fn engine_with_refresh_advice(
+    advice: RetryAdvice,
+    session: MockSession,
+) -> (LoginEngine<MockSessionStore>, Arc<AtomicU32>) {
+    let (http, calls) = FailingHttp::with_advice(advice);
     let e = LoginEngine::builder()
         .config(default_config())
         .grant(test_grant(http).await)
@@ -1317,6 +1330,19 @@ async fn refresh_retries_when_error_is_retryable() {
     let _ = e.load_session(&HeaderMap::new()).await;
     // Initial call + REFRESH_MAX_ATTEMPTS - 1 retries == REFRESH_MAX_ATTEMPTS total.
     assert_eq!(calls.load(Ordering::SeqCst), super::REFRESH_MAX_ATTEMPTS);
+}
+
+#[tokio::test]
+async fn refresh_does_not_retry_when_server_asks_for_a_long_delay() {
+    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    // A `Retry-After` past the in-request budget: waiting it out would hold the
+    // browser's request, so the attempt stops and the session survives for the
+    // next request to retry.
+    let advice = RetryAdvice::retry_after(Duration::from_mins(1));
+    let (e, calls) = engine_with_refresh_advice(advice, session).await;
+    let loaded = e.load_session(&HeaderMap::new()).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(loaded, Ok(LoadedSession::RefreshUnavailable)));
 }
 
 #[tokio::test]

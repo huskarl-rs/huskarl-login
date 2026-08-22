@@ -683,6 +683,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "huskarl"
 version = "0.10.1"
 dependencies = [
@@ -720,6 +726,8 @@ dependencies = [
  "gloo-timers",
  "hex",
  "http",
+ "httpdate",
+ "huskarl-macros",
  "rand 0.10.2",
  "secrecy",
  "serde",
@@ -727,6 +735,7 @@ dependencies = [
  "sha2",
  "snafu",
  "strum",
+ "subtle",
  "tokio",
  "url",
  "web-time",
@@ -743,6 +752,7 @@ dependencies = [
  "ed25519-dalek",
  "hmac",
  "huskarl-core",
+ "huskarl-macros",
  "p256",
  "p384",
  "pkcs8",
@@ -788,6 +798,7 @@ name = "huskarl-macros"
 version = "0.3.1"
 dependencies = [
  "darling",
+ "proc-macro-crate",
  "proc-macro2",
  "quote",
  "syn",

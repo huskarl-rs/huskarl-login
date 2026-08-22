@@ -41,15 +41,14 @@ let metadata = AuthorizationServerMetadata::oidc_fetch()
     .issuer("https://auth.example.com")
     .call()
     .await?;
-let grant = AuthorizationCodeGrant::builder_from_metadata(&metadata)
-    .ok_or("authorization server does not advertise an authorization endpoint")?
+//    `builder_from_metadata` fails when the metadata omits an endpoint the
+//    grant needs, naming the absent field in the error.
+let grant = AuthorizationCodeGrant::builder_from_metadata(&metadata)?
     .client_id("my-client")
     .client_auth(NoAuth)
     .http_client(http_client.clone())
     .redirect_uri("https://app.example.com/callback")
-    .jws_verifier_factory(Arc::new(
-        JwksSource::builder().http_client(http_client).build(),
-    ))
+    .jws_verifier_factory(JwksSource::builder().http_client(http_client).build())
     .build()
     .await?;
 

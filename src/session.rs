@@ -93,13 +93,21 @@ impl From<SessionErrorKind> for SessionError {
 impl From<crate::core::Error> for SessionError {
     /// Carry a huskarl error as a session error, preserving its retryability.
     fn from(err: crate::core::Error) -> Self {
-        let kind = if err.is_retryable() {
+        let kind = if advises_retry(&err) {
             SessionErrorKind::Unavailable
         } else {
             SessionErrorKind::Store
         };
         Self::new(kind, err)
     }
+}
+
+/// Whether a huskarl error advises retrying the failed operation.
+///
+/// [`RetryAdvice`](crate::core::RetryAdvice) is `#[non_exhaustive]`; an unknown
+/// variant is treated conservatively, like `No`.
+pub(crate) fn advises_retry(err: &crate::core::Error) -> bool {
+    matches!(err.retry_advice(), crate::core::RetryAdvice::Retry { .. })
 }
 
 impl fmt::Display for SessionError {
