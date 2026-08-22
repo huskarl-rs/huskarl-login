@@ -25,8 +25,17 @@ where
     pub(super) async fn handle_callback(&self, uri: &Uri, headers: &HeaderMap) -> LoginResponse {
         let (code, state, iss) = match parse_callback_params(uri.query().unwrap_or("")) {
             CallbackParse::Valid { code, state, iss } => (code, state, iss),
-            CallbackParse::AuthServerError { error, description } => {
-                return self.handle_as_error(&error, description.as_deref());
+            CallbackParse::AuthServerError {
+                error,
+                description,
+                state,
+            } => {
+                return self.handle_as_error(
+                    headers,
+                    &error,
+                    description.as_deref(),
+                    state.as_deref(),
+                );
             }
             CallbackParse::Missing => {
                 self.record_login_complete(&LoginCompleteResult::InvalidRequest, None);
@@ -49,7 +58,7 @@ where
             // send it home instead of failing the navigation.
             if self.has_usable_session(headers).await {
                 self.record_login_complete(&LoginCompleteResult::AlreadyAuthenticated, None);
-                return self.redirect_to_base_url();
+                return self.redirect_to_base_url(headers);
             }
             self.record_login_complete(&LoginCompleteResult::InvalidRequest, None);
             return self.build_error_response(StatusCode::BAD_REQUEST, "invalid or missing state");
@@ -139,20 +148,43 @@ where
         }
     }
 
-    /// A plain `302 Found` to the configured `base_url`.
-    fn redirect_to_base_url(&self) -> LoginResponse {
+    /// A `302 Found` to the configured `base_url`, sweeping the request's
+    /// login-state cookies because a usable session already exists.
+    fn redirect_to_base_url(&self, headers: &HeaderMap) -> LoginResponse {
         LoginResponse::Redirect {
             status: StatusCode::FOUND,
             location: HeaderValue::from_str(&base_url_as_string(&self.base_url))
                 .unwrap_or_else(|_| HeaderValue::from_static("/")),
-            set_cookies: vec![],
+            set_cookies: self.login_state_sweep(headers),
         }
     }
 
+    /// `Set-Cookie` clears for every login-state cookie on the request. Only
+    /// names whose suffix is a valid OAuth state are included.
+    fn login_state_sweep(&self, headers: &HeaderMap) -> Vec<HeaderValue> {
+        let prefix = login_state_cookie_name_prefix(
+            self.secure,
+            self.config.browser_callback_path.as_str(),
+            self.config.login_cookie_prefix.as_str(),
+        );
+        login_state_cookie_names(headers, &prefix)
+            .iter()
+            .filter_map(|name| self.clear_login_state_cookie(name))
+            .collect()
+    }
+
     /// Handles an RFC 6749 §4.1.2.1 error response from the authorization server:
-    /// records the metric (error code normalized to a closed set) and renders a
-    /// 403. The raw `description` reaches the error page, which must escape it.
-    fn handle_as_error(&self, error: &str, description: Option<&str>) -> LoginResponse {
+    /// records the metric (error code normalized to a closed set), renders a
+    /// 403, and clears the failed flow's login-state cookie when the AS echoed
+    /// a valid `state` that names a cookie on the request. The raw `description`
+    /// reaches the error page, which must escape it.
+    fn handle_as_error(
+        &self,
+        headers: &HeaderMap,
+        error: &str,
+        description: Option<&str>,
+        state: Option<&str>,
+    ) -> LoginResponse {
         let message = match description {
             Some(desc) => format!("authorization denied: {desc}"),
             None => format!("authorization denied ({error})"),
@@ -161,7 +193,21 @@ where
             &LoginCompleteResult::AsDenied,
             Some(normalize_as_error(error)),
         );
-        self.build_error_response(StatusCode::FORBIDDEN, &message)
+        let mut response = self.build_error_response(StatusCode::FORBIDDEN, &message);
+        if let Some(state) = state {
+            let cookie_name = login_state_cookie_name(
+                state,
+                self.secure,
+                self.config.browser_callback_path.as_str(),
+                self.config.login_cookie_prefix.as_str(),
+            );
+            if get_cookie(headers, &cookie_name).is_some()
+                && let Some(clear) = self.clear_login_state_cookie(&cookie_name)
+            {
+                response.push_rendered_header(header::SET_COOKIE, clear);
+            }
+        }
+        response
     }
 
     /// Assembles the 302 back to `original_url`, with clears for every pending
@@ -180,20 +226,8 @@ where
         // that completed: the session now exists, so pending flows in other
         // tabs are moot, and clearing them keeps abandoned flows from piling
         // toward the browser's per-domain cookie cap (where eviction could
-        // hit the session cookie itself). The sweep only touches names whose
-        // suffix is a valid state value — names this crate could have minted.
-        let prefix = login_state_cookie_name_prefix(
-            self.secure,
-            self.config.browser_callback_path.as_str(),
-            self.config.login_cookie_prefix.as_str(),
-        );
-        let names = login_state_cookie_names(headers, &prefix);
-        let mut set_cookies = Vec::with_capacity(session_cookies.len() + names.len());
-        for name in &names {
-            if let Some(v) = self.clear_login_state_cookie(name) {
-                set_cookies.push(v);
-            }
-        }
+        // hit the session cookie itself).
+        let mut set_cookies = self.login_state_sweep(headers);
         set_cookies.extend(session_cookies);
         LoginResponse::Redirect {
             status: StatusCode::FOUND,
@@ -272,9 +306,12 @@ enum CallbackParse {
         iss: Option<String>,
     },
     /// Authorization server returned an error response per RFC 6749 §4.1.2.1.
+    /// `state` retains the echoed request state only when it is syntactically
+    /// valid, so it can safely identify the failed flow's cookie namespace.
     AuthServerError {
         error: String,
         description: Option<String>,
+        state: Option<String>,
     },
     /// Neither error nor a usable code/state pair was provided.
     Missing,
@@ -297,6 +334,7 @@ fn parse_callback_params(query: &str) -> CallbackParse {
         return CallbackParse::AuthServerError {
             error,
             description: params.error_description,
+            state: params.state.filter(|state| is_valid_oauth_state(state)),
         };
     }
     match (params.code, params.state) {
@@ -344,6 +382,7 @@ mod parse_tests {
             CallbackParse::AuthServerError {
                 error: "access_denied".to_owned(),
                 description: Some("user rejected".to_owned()),
+                state: None,
             }
         );
     }
@@ -355,6 +394,31 @@ mod parse_tests {
             CallbackParse::AuthServerError {
                 error: "server_error".to_owned(),
                 description: None,
+                state: None,
+            }
+        );
+    }
+
+    #[test]
+    fn auth_server_error_keeps_valid_echoed_state() {
+        assert_eq!(
+            parse_callback_params("error=access_denied&state=xyz"),
+            CallbackParse::AuthServerError {
+                error: "access_denied".to_owned(),
+                description: None,
+                state: Some("xyz".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn auth_server_error_drops_invalid_echoed_state() {
+        assert_eq!(
+            parse_callback_params("error=access_denied&state=xyz%3Bfoo"),
+            CallbackParse::AuthServerError {
+                error: "access_denied".to_owned(),
+                description: None,
+                state: None,
             }
         );
     }

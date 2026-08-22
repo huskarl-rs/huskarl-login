@@ -715,12 +715,7 @@ async fn seal_login_cookie_at(state: &str, original_url: &str, created_at: Syste
 }
 
 fn headers_with_login_cookie(state: &str, value: &str) -> HeaderMap {
-    let name = crate::cookie::login_state_cookie_name(
-        state,
-        true,
-        "/callback",
-        crate::cookie::DEFAULT_LOGIN_COOKIE_PREFIX,
-    );
+    let name = login_cookie_name(state);
     headers(&[("cookie", &format!("{name}={value}"))])
 }
 
@@ -1724,6 +1719,50 @@ async fn callback_as_error_with_description_returns_403() {
 }
 
 #[tokio::test]
+async fn callback_as_error_clears_only_the_failed_flows_cookie() {
+    let e = engine(MockSessionStore::empty()).await;
+    let state = "denied_state";
+    let sealed = seal_login_cookie(state, "https://app.example.com/page").await;
+    let failed_name = login_cookie_name(state);
+    let other_name = login_cookie_name("other");
+    let cookie_header = format!("{failed_name}={sealed}; {other_name}=other-flow");
+    let h = headers(&[("cookie", &cookie_header)]);
+    let uri = format!("/callback?error=access_denied&state={state}")
+        .parse()
+        .unwrap();
+
+    let response = e
+        .try_handle_login_route(&Method::GET, &h, &uri)
+        .await
+        .expect("callback handled");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(cookie_is_cleared(&response, &failed_name));
+    assert!(!cookie_is_cleared(&response, &other_name));
+}
+
+#[tokio::test]
+async fn callback_as_error_without_matching_cookie_sets_no_cookie() {
+    let e = engine(MockSessionStore::empty()).await;
+    let uri = "/callback?error=access_denied&state=unknown_state"
+        .parse()
+        .unwrap();
+
+    let response = e
+        .try_handle_login_route(&Method::GET, &HeaderMap::new(), &uri)
+        .await
+        .expect("callback handled");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !response
+            .headers()
+            .iter()
+            .any(|(name, _)| *name == http::header::SET_COOKIE)
+    );
+}
+
+#[tokio::test]
 async fn callback_no_state_cookie_returns_400() {
     let status = callback_status("/callback?code=authcode&state=mystate", &HeaderMap::new()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1880,6 +1919,40 @@ async fn callback_without_state_cookie_but_with_session_redirects_home() {
         .find(|(n, _)| *n == http::header::LOCATION)
         .map(|(_, v)| v.to_str().unwrap());
     assert_eq!(loc, Some("https://app.example.com/"));
+}
+
+#[tokio::test]
+async fn callback_already_authenticated_sweeps_login_state_cookies() {
+    let e = engine(MockSessionStore::with_session(valid_session())).await;
+    let first_name = login_cookie_name("stale_a");
+    let second_name = login_cookie_name("stale_b");
+    let cookie_header = format!("{first_name}=stale1; unrelated=keep; {second_name}=stale2");
+    let h = headers(&[("cookie", &cookie_header)]);
+    let uri = "/callback?code=authcode&state=mystate".parse().unwrap();
+
+    let response = e
+        .try_handle_login_route(&Method::GET, &h, &uri)
+        .await
+        .expect("callback handled");
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert!(cookie_is_cleared(&response, &first_name));
+    assert!(cookie_is_cleared(&response, &second_name));
+    assert!(!response.headers().iter().any(|(name, value)| {
+        *name == http::header::SET_COOKIE && value.to_str().unwrap().starts_with("unrelated=")
+    }));
+}
+
+fn cookie_is_cleared(response: &super::LoginResponse, cookie_name: &str) -> bool {
+    response.headers().iter().any(|(name, value)| {
+        *name == http::header::SET_COOKIE
+            && value
+                .to_str()
+                .is_ok_and(|value| value.starts_with(&format!("{cookie_name}=;")))
+            && value
+                .to_str()
+                .is_ok_and(|value| value.contains("Max-Age=0"))
+    })
 }
 
 #[tokio::test]

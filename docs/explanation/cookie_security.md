@@ -62,7 +62,13 @@ toward the browser's per-domain cookie cap — where eviction could hit the
 session cookie itself. A callback that arrives after its cookie was swept (a
 second tab finishing the race, or a re-navigated stale callback URL) redirects
 home when the browser already holds a usable session, instead of failing with
-a 400.
+a 400, and performs the same sweep because the pending flows are now moot.
+
+An authorization-server error response (`error=access_denied&state=...`) ends
+only the flow it identifies, so the callback clears that flow's login-state
+cookie while preserving other tabs' pending flows. The echoed `state` is
+untrusted callback input: it is retained only when syntactically valid, and a
+clear is emitted only when the derived cookie name is present on the request.
 
 ## Key rotation
 
