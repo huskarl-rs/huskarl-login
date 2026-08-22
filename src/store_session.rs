@@ -28,7 +28,7 @@ use crate::{
     liveness::{LivenessConfig, LivenessStore, LivenessVerdict},
     metrics::{DecryptResult, LivenessFailure, SupersededDeleteResult},
     session::{SessionDriver, SessionError, SessionErrorKind, to_session_err},
-    session_state::{Session, SessionState},
+    session_state::{Session, SessionState, bounded_time_add},
 };
 
 /// Pure-storage backend (Redis, SQL, …) for a [`StoreBackedSessionStore`]:
@@ -669,7 +669,7 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
         // deadline. An entry must not expire before its record — a missing
         // entry reads as active, which would resurrect an idle session whose
         // record is still stored. See the liveness explanation page.
-        let horizon = session.token_expiry().max(now) + config.idle_timeout;
+        let horizon = bounded_time_add(session.token_expiry().max(now), config.idle_timeout);
         let deadline = Some(expire_at.map_or(horizon, |e| e.min(horizon)));
         if record_activity
             && verdict == LivenessVerdict::Active

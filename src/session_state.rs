@@ -15,6 +15,23 @@ use crate::{
     },
 };
 
+/// A finite fallback for duration additions that exceed [`SystemTime`]'s
+/// representable range. This mirrors the access-token expiry policy in
+/// `huskarl`: an overflowing deadline remains far in the future without
+/// becoming unrepresentable (and therefore unserializable).
+const OVERFLOW_TIME_HORIZON: Duration = Duration::from_hours(100 * 365 * 24);
+
+/// Adds a duration to wall-clock time without panicking.
+///
+/// An unrepresentable result is bounded to a century after `base`; on a
+/// pathological platform where even that is unrepresentable, it falls back to
+/// `base`.
+pub(crate) fn bounded_time_add(base: SystemTime, duration: Duration) -> SystemTime {
+    base.checked_add(duration)
+        .or_else(|| base.checked_add(OVERFLOW_TIME_HORIZON))
+        .unwrap_or(base)
+}
+
 /// Common token and timing state shared by all session types.
 ///
 /// Use [`SessionState::builder`] for tests and custom flows. The raw `id_token`
@@ -57,11 +74,9 @@ impl SessionState {
     ) -> Self {
         let now = SystemTime::now();
         let token_response = completed.token_response();
-        let lifetime = token_response
-            .raw_token_response()
-            .expires_in
-            .map_or(default_lifetime, Duration::from_secs);
-        let token_expiry = now + lifetime;
+        let token_expiry = token_response
+            .access_token()
+            .effective_expiry(default_lifetime, Duration::ZERO);
         let sub = completed.subject().map(str::to_string);
         let sid = completed
             .id_token_claims()
@@ -73,7 +88,7 @@ impl SessionState {
             sub,
             sid,
             created_at: now,
-            expire_at: max_lifetime.map(|max| now + max),
+            expire_at: max_lifetime.map(|max| bounded_time_add(now, max)),
         }
     }
 
@@ -81,14 +96,11 @@ impl SessionState {
     /// keeping the existing refresh token unless the response rotates it.
     #[must_use]
     pub fn refreshed(&self, token_response: &TokenResponse, default_lifetime: Duration) -> Self {
-        let now = SystemTime::now();
         let mut new = self.clone();
 
-        let lifetime = token_response
-            .raw_token_response()
-            .expires_in
-            .map_or(default_lifetime, Duration::from_secs);
-        new.token_expiry = now + lifetime;
+        new.token_expiry = token_response
+            .access_token()
+            .effective_expiry(default_lifetime, Duration::ZERO);
 
         if let Some(rt) = token_response.refresh_token() {
             new.refresh_token = Some(rt.clone());
@@ -157,7 +169,7 @@ pub trait Session {
     /// [`idle_timeout`](crate::LivenessConfig::idle_timeout) they configured —
     /// see the [external store guide](crate::_docs::guide::external_store).
     fn storage_deadline(&self, now: SystemTime, idle_timeout: Duration) -> SystemTime {
-        let horizon = self.token_expiry().max(now) + idle_timeout;
+        let horizon = bounded_time_add(self.token_expiry().max(now), idle_timeout);
         self.expire_at().map_or(horizon, |e| e.min(horizon))
     }
 
@@ -213,5 +225,33 @@ mod tests {
             .maybe_expire_at(expire_at)
             .build());
         assert_eq!(s.storage_deadline(at(DAY), DAY), expected);
+    }
+
+    #[test]
+    fn oversized_duration_is_bounded_without_panicking() {
+        let base = at(DAY);
+        assert_eq!(
+            bounded_time_add(base, Duration::MAX),
+            base + OVERFLOW_TIME_HORIZON
+        );
+    }
+
+    #[test]
+    fn oversized_token_expires_in_is_bounded_without_panicking() {
+        let received_at = at(DAY);
+        let token_response = crate::client::grant::core::RawTokenResponse::builder()
+            .access_token(crate::core::secrets::SecretString::new("access-token"))
+            .token_type("Bearer")
+            .expires_in(u64::MAX)
+            .build()
+            .into_token_response(None, received_at)
+            .unwrap();
+        let completed = crate::CompletedLogin::builder()
+            .token_response(token_response)
+            .build();
+
+        let state = SessionState::from_completed(&completed, HOUR, None);
+
+        assert_eq!(state.token_expiry, received_at + OVERFLOW_TIME_HORIZON);
     }
 }

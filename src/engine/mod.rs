@@ -29,6 +29,7 @@ use crate::{
     },
     metrics::{LoginCompleteResult, LoginStartResult, RefreshResult},
     session::advises_retry,
+    session_state::bounded_time_add,
 };
 
 mod callback;
@@ -821,7 +822,13 @@ where
             return Ok(LoadedSession::Cleared { reason, clears });
         }
 
-        if now + self.config.token_refresh_margin >= session.token_expiry() {
+        let refresh_due = session
+            .token_expiry()
+            .duration_since(now)
+            .map_or(true, |remaining| {
+                remaining <= self.config.token_refresh_margin
+            });
+        if refresh_due {
             return Ok(self.refresh_or_clear(session, headers).await);
         }
 
@@ -875,7 +882,7 @@ where
             .config
             .session_lifetime
             .bound()
-            .map(|max| session.created_at() + max);
+            .map(|max| bounded_time_add(session.created_at(), max));
         match (session.expire_at(), configured) {
             (Some(frozen), Some(configured)) => Some(frozen.min(configured)),
             (frozen, configured) => frozen.or(configured),
