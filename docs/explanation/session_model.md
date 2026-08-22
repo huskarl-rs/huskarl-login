@@ -44,6 +44,11 @@ methods (`save`, `touch`, `delete`) return `Vec<HeaderValue>`. Framework
 adapters that need a different shape (e.g. Pingora's `&mut ResponseHeader`)
 adapt with a small helper that appends the returned headers.
 
+Browser-local logout is deliberately separate from server-side deletion:
+[`clear_session_cookies`](crate::SessionDriver::clear_session_cookies) builds
+cookie clears without store I/O, so the logout response can invalidate the
+current browser even while an external store is unavailable.
+
 ## Who bounds the session lifetime
 
 Every deployment states, via the required

@@ -493,6 +493,12 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
                 self.record_liveness_failure(&LivenessFailure::Clear);
             }
         }
+        Ok(self.delete_headers())
+    }
+
+    /// Clears the browser's pointer cookie and key-identity sidecar without
+    /// touching the backing store.
+    fn delete_headers(&self) -> Vec<HeaderValue> {
         // Clear the pointer cookie and the kid sidecar.
         let clear_attrs = format!("{}; Max-Age=0", self.sealer.base_cookie_attrs());
         let mut headers = Vec::new();
@@ -505,7 +511,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         if let Ok(v) = HeaderValue::from_str(&format!("{kid_name}=; {clear_attrs}")) {
             headers.push(v);
         }
-        Ok(headers)
+        headers
     }
 
     /// Delete the record a still-valid incoming pointer cookie references,
@@ -568,6 +574,10 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
 
     fn session_sealer(&self) -> Arc<dyn AeadSealerUnsealer> {
         self.sealer.cipher.clone()
+    }
+
+    fn clear_session_cookies(&self, _headers: &http::HeaderMap) -> Vec<HeaderValue> {
+        self.delete_headers()
     }
 
     async fn create(

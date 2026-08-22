@@ -264,6 +264,7 @@ struct MockSessionStore {
     save_called: Mutex<bool>,
     delete_called: Mutex<bool>,
     fail_save: bool,
+    fail_delete: bool,
     /// Liveness verdict returned by [`SessionDriver::check_liveness`], so a
     /// test can drive the engine's verdict-mapping without re-implementing the
     /// idle/throttle logic (which is tested elsewhere).
@@ -294,6 +295,7 @@ impl MockSessionStore {
             save_called: Mutex::new(false),
             delete_called: Mutex::new(false),
             fail_save: false,
+            fail_delete: false,
             verdict: LivenessVerdict::Untracked,
             last_record_activity: Mutex::new(None),
             applied_policy: Mutex::new(None),
@@ -303,6 +305,12 @@ impl MockSessionStore {
     fn with_session_failing_save(s: MockSession) -> Self {
         Self {
             fail_save: true,
+            ..Self::with_session(s)
+        }
+    }
+    fn with_session_failing_delete(s: MockSession) -> Self {
+        Self {
+            fail_delete: true,
             ..Self::with_session(s)
         }
     }
@@ -320,6 +328,7 @@ impl MockSessionStore {
             save_called: Mutex::new(false),
             delete_called: Mutex::new(false),
             fail_save: false,
+            fail_delete: false,
             verdict: LivenessVerdict::Untracked,
             last_record_activity: Mutex::new(None),
             applied_policy: Mutex::new(None),
@@ -370,6 +379,10 @@ impl SessionDriver for MockSessionStore {
             .unwrap_or_else(|| Arc::new(NoopSealer))
     }
 
+    fn clear_session_cookies(&self, _: &HeaderMap) -> Vec<HeaderValue> {
+        vec![HeaderValue::from_static("mock-session=; Max-Age=0")]
+    }
+
     async fn create(
         &self,
         completed: CompletedLogin,
@@ -415,6 +428,12 @@ impl SessionDriver for MockSessionStore {
         _: &HeaderMap,
     ) -> Result<Vec<HeaderValue>, SessionError> {
         *self.delete_called.lock().unwrap() = true;
+        if self.fail_delete {
+            return Err(SessionError::new(
+                SessionErrorKind::Unavailable,
+                StoreDeleteError,
+            ));
+        }
         Ok(vec![])
     }
 }
@@ -424,6 +443,10 @@ impl SessionDriver for MockSessionStore {
 #[derive(Debug, Snafu)]
 #[snafu(display("store save error"))]
 struct StoreSaveError;
+
+#[derive(Debug, Snafu)]
+#[snafu(display("store delete error"))]
+struct StoreDeleteError;
 
 // ── ErrorSessionStore — load always fails ─────────────────────────────────
 
@@ -450,6 +473,10 @@ impl SessionDriver for ErrorSessionStore {
 
     fn session_sealer(&self) -> Arc<dyn AeadSealerUnsealer> {
         unimplemented!()
+    }
+
+    fn clear_session_cookies(&self, _: &HeaderMap) -> Vec<HeaderValue> {
+        vec![HeaderValue::from_static("mock-session=; Max-Age=0")]
     }
 
     async fn create(
@@ -1904,6 +1931,49 @@ async fn logout_with_session_deletes_session() {
         .try_handle_login_route(&Method::POST, &HeaderMap::new(), &uri)
         .await;
     assert!(e.session_store.delete_called());
+}
+
+#[tokio::test]
+async fn logout_load_failure_still_clears_browser_session() {
+    let e = LoginEngine::builder()
+        .config(config_with_logout())
+        .grant(test_grant(FailingHttp::new(false).0).await)
+        .session_store(ErrorSessionStore)
+        .sealer(test_sealer().await)
+        .build()
+        .unwrap();
+    let uri = "/logout".parse().unwrap();
+    let r = e
+        .try_handle_login_route(&Method::POST, &HeaderMap::new(), &uri)
+        .await
+        .expect("logout handled");
+
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert!(has_mock_session_clear(&r));
+}
+
+#[tokio::test]
+async fn logout_delete_failure_still_clears_browser_session() {
+    let e = engine_with_config(
+        MockSessionStore::with_session_failing_delete(valid_session()),
+        config_with_logout(),
+    )
+    .await;
+    let uri = "/logout".parse().unwrap();
+    let r = e
+        .try_handle_login_route(&Method::POST, &HeaderMap::new(), &uri)
+        .await
+        .expect("logout handled");
+
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert!(e.session_store.delete_called());
+    assert!(has_mock_session_clear(&r));
+}
+
+fn has_mock_session_clear(response: &super::LoginResponse) -> bool {
+    response.headers().iter().any(|(name, value)| {
+        *name == http::header::SET_COOKIE && value == "mock-session=; Max-Age=0"
+    })
 }
 
 #[tokio::test]

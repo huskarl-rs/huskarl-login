@@ -270,6 +270,16 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
         async { Ok(LivenessVerdict::Untracked) }
     }
 
+    /// Builds `Set-Cookie` values that invalidate this driver's session
+    /// cookies in the current browser, without loading or deleting server-side
+    /// state.
+    ///
+    /// Logout emits these clears even when a backing store is unavailable, so
+    /// browser-local logout does not depend on server-side revocation. For a
+    /// store-backed session, copied pointer cookies remain usable until the
+    /// backing record is deleted or expires.
+    fn clear_session_cookies(&self, headers: &http::HeaderMap) -> Vec<HeaderValue>;
+
     /// Delete a session, returning `Set-Cookie` values that clear its cookies
     /// (only those present in `headers`).
     fn delete(

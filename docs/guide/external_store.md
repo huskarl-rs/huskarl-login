@@ -70,6 +70,10 @@ where `expire_at` is `None`.
 
 The framework deletes what it can reach: logout deletes the session, and a new
 login that still presents the old pointer cookie deletes the record it names.
+Logout clears the browser's pointer cookie independently, even when loading or
+deleting the record fails. That logs out the current browser during a store
+outage, but a copied pointer remains usable until deletion succeeds or the
+record reaches its storage deadline; monitor the logged revocation failures.
 Records it cannot reach — the pointer cookie was cleared, or its cookie key
 was rotated out without a grace period — are the backend's to reap, and
 `storage_deadline` is the detector: a record past its deadline is one your

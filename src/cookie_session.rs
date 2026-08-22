@@ -398,6 +398,10 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
         self.sealer.cipher.clone()
     }
 
+    fn clear_session_cookies(&self, headers: &http::HeaderMap) -> Vec<HeaderValue> {
+        self.delete_headers(headers)
+    }
+
     async fn create(
         &self,
         completed: CompletedLogin,

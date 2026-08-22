@@ -43,10 +43,14 @@ where
             }
         };
 
-        let mut set_cookies = Vec::new();
+        // Browser-local logout must not depend on the backing store: clear the
+        // session cookies even when loading or revoking server-side state
+        // fails. `delete` still attempts backend-wide revocation below; copied
+        // store pointers remain usable until that succeeds or their record TTL
+        // expires.
+        let set_cookies = self.session_store.clear_session_cookies(headers);
         if let Some(ref s) = loaded_session {
-            self.append_session_delete_cookies(s, headers, &mut set_cookies)
-                .await;
+            self.delete_session_best_effort(s, headers).await;
         }
 
         // 303, not 302: logout is a POST, and See Other pins the follow-up
@@ -104,16 +108,15 @@ where
         })
     }
 
-    /// Deletes the session and appends the returned cookie clears to
-    /// `set_cookies`; logs and continues on error.
-    async fn append_session_delete_cookies(
+    /// Attempts server-side revocation; browser-local cookie clearing is
+    /// performed independently by [`SessionDriver::clear_session_cookies`].
+    async fn delete_session_best_effort(
         &self,
         session: &SD::SessionType,
         request_headers: &HeaderMap,
-        set_cookies: &mut Vec<HeaderValue>,
     ) {
         match self.session_store.delete(session, request_headers).await {
-            Ok(cookies) => set_cookies.extend(cookies),
+            Ok(_) => {}
             Err(e) => {
                 log::error!("failed to delete session on logout: {}", error_chain(&e));
             }
