@@ -205,6 +205,29 @@ impl RoutePath {
         &self.0
     }
 
+    /// Removes this path prefix from `path` when it ends on a path-segment
+    /// boundary. The returned path always starts with `/`.
+    ///
+    /// `/app` therefore matches `/app` and `/app/page`, but not
+    /// `/application`. A root prefix is a no-op, while a trailing slash in the
+    /// prefix is retained as the returned path's leading slash.
+    pub(crate) fn strip_from<'a>(&self, path: &'a str) -> Option<&'a str> {
+        let prefix = self.as_str();
+
+        if prefix == "/" {
+            return path.starts_with('/').then_some(path);
+        }
+
+        let remainder = path.strip_prefix(prefix)?;
+        if prefix.ends_with('/') {
+            return Some(&path[prefix.len() - 1..]);
+        }
+        if remainder.is_empty() {
+            return Some(&path[..1]);
+        }
+        remainder.starts_with('/').then_some(remainder)
+    }
+
     /// The root path `/`. Infallible — `/` is always cookie- and header-safe.
     #[must_use]
     pub fn root() -> Self {
@@ -324,9 +347,7 @@ fn compute_browser_callback_path(
 ) -> String {
     let callback_path = callback_path.as_str();
     let stripped_callback = match strip_prefix {
-        Some(prefix) => callback_path
-            .strip_prefix(prefix.as_str())
-            .unwrap_or(callback_path),
+        Some(prefix) => prefix.strip_from(callback_path).unwrap_or(callback_path),
         None => callback_path,
     };
     match base_path {
@@ -538,18 +559,18 @@ impl LoginConfig {
         // would silently never match a real request (and, for the callback,
         // corrupt the derived cookie scope) — reject the contradiction.
         if let Some(ref prefix) = strip_prefix {
-            if !callback_path.as_str().starts_with(prefix.as_str()) {
+            if prefix.strip_from(callback_path.as_str()).is_none() {
                 return Err(ConfigError::InvalidCallbackPath {
                     path: callback_path.as_str().to_owned(),
-                    reason: "must start with strip_prefix when strip_prefix is set",
+                    reason: "must be within strip_prefix when strip_prefix is set",
                 });
             }
             if let Some(ref logout) = logout
-                && !logout.path.as_str().starts_with(prefix.as_str())
+                && prefix.strip_from(logout.path.as_str()).is_none()
             {
                 return Err(ConfigError::InvalidLogoutPath {
                     path: logout.path.as_str().to_owned(),
-                    reason: "must start with strip_prefix when strip_prefix is set",
+                    reason: "must be within strip_prefix when strip_prefix is set",
                 });
             }
         }
@@ -1090,6 +1111,21 @@ mod tests {
     }
 
     #[test]
+    fn route_path_prefix_stripping_observes_segment_boundaries() {
+        let prefix = RoutePath::new("/app").unwrap();
+        assert_eq!(prefix.strip_from("/app"), Some("/"));
+        assert_eq!(prefix.strip_from("/app/page"), Some("/page"));
+        assert_eq!(prefix.strip_from("/application"), None);
+
+        let root = RoutePath::root();
+        assert_eq!(root.strip_from("/app/page"), Some("/app/page"));
+
+        let trailing_slash = RoutePath::new("/app/").unwrap();
+        assert_eq!(trailing_slash.strip_from("/app/page"), Some("/page"));
+        assert_eq!(trailing_slash.strip_from("/app/"), Some("/"));
+    }
+
+    #[test]
     fn route_path_try_from() {
         assert!(RoutePath::try_from("/ok").is_ok());
         assert!(RoutePath::try_from("/bad;x".to_owned()).is_err());
@@ -1188,6 +1224,19 @@ mod tests {
     }
 
     #[test]
+    fn strip_prefix_segment_collision_in_callback_path_is_rejected() {
+        let err = LoginConfig::builder()
+            .callback_path("/application/callback")
+            .base_path("/public")
+            .scope(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
+            .strip_prefix("/app")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidCallbackPath { .. }));
+    }
+
+    #[test]
     fn strip_prefix_not_matching_logout_path_is_rejected() {
         let err = LoginConfig::builder()
             .callback_path("/internal/callback")
@@ -1195,6 +1244,24 @@ mod tests {
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .strip_prefix("/internal")
             .logout(LogoutConfig::builder().path("/logout").build().unwrap())
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidLogoutPath { .. }));
+    }
+
+    #[test]
+    fn strip_prefix_segment_collision_in_logout_path_is_rejected() {
+        let err = LoginConfig::builder()
+            .callback_path("/app/callback")
+            .scope(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
+            .strip_prefix("/app")
+            .logout(
+                LogoutConfig::builder()
+                    .path("/application/logout")
+                    .build()
+                    .unwrap(),
+            )
             .build()
             .unwrap_err();
         assert!(matches!(err, ConfigError::InvalidLogoutPath { .. }));

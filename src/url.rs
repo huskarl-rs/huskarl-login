@@ -18,7 +18,7 @@ pub fn original_url(
     let req_path = req_uri.path();
     let stripped = match strip_prefix {
         Some(prefix) => {
-            if let Some(s) = req_path.strip_prefix(prefix.as_str()) {
+            if let Some(s) = prefix.strip_from(req_path) {
                 s
             } else {
                 log::error!(
@@ -277,6 +277,15 @@ mod tests {
                 Some(&strip("/internal")),
                 &uri
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn original_url_strip_prefix_segment_collision_returns_none() {
+        let uri: http::Uri = "/application/page".parse().unwrap();
+        assert_eq!(
+            original_url(&base("https://app.example.com"), Some(&strip("/app")), &uri),
             None
         );
     }
