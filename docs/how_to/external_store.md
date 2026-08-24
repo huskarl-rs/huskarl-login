@@ -6,6 +6,13 @@ implement over your backend (Redis, SQL, DynamoDB, …). The trait is pure
 storage — insert, load, save, compare-and-swap, delete. Session _construction_
 from a login is the enricher's job, not the store's.
 
+If you are converting from [`CookieSessionStore`](crate::CookieSessionStore),
+audit `cookie_path` before switching. Cookie sessions may use a path that does
+not cover the callback. Store-backed sessions may not: the callback needs the
+old pointer to revoke the record superseded by re-login, so engine construction
+rejects that configuration. The cookie path must also cover any configured
+logout route for both drivers.
+
 ## The session type
 
 Your session type embeds a [`PersistedSessionState`](crate::PersistedSessionState)
@@ -26,10 +33,13 @@ the trait methods instead:
   the session, and the framework hands it back verbatim as `expected`.
 - [`save`](crate::ExternalSessionStore::save) is last-writer-wins; every write
   must change the stored version, so an in-flight compare-and-swap cannot
-  succeed against overwritten state.
+  succeed against overwritten state. It is update-only: if logout already
+  deleted the row, return [`SaveOutcome::Missing`](crate::SaveOutcome) instead
+  of recreating it.
 - [`compare_and_swap`](crate::ExternalSessionStore::compare_and_swap) writes
   only if the stored version still equals `expected`, changing it on success
-  and returning [`SaveOutcome::Conflict`](crate::SaveOutcome) otherwise.
+  and returning [`SaveOutcome::Conflict`](crate::SaveOutcome) on a version
+  mismatch or [`SaveOutcome::Missing`](crate::SaveOutcome) if the row is gone.
 
 Version is compared by **equality only**, so any per-write-unique value works:
 an integer column you `+ 1` on write, a database row version (e.g. Postgres
@@ -37,15 +47,14 @@ an integer column you `+ 1` on write, a database row version (e.g. Postgres
 
 ## TTL contract
 
-Every record gets an absolute deadline:
-[`Session::storage_deadline`](crate::Session::storage_deadline), the sooner of
-the [`expire_at`](crate::Session::expire_at) frozen at login (under a
-[`Bounded`](crate::SessionLifetime) lifetime) and the activity horizon
-`max(now, token_expiry) + idle_timeout`. Pass the same
-[`idle_timeout`](crate::LivenessConfig::idle_timeout) you configure on the
-liveness side, or [`DEFAULT_IDLE_TIMEOUT`](crate::DEFAULT_IDLE_TIMEOUT) (30
-days) when you attach no liveness store. Apply the deadline as the record's
-absolute TTL on **every** write, erring late:
+Every insert, save, and compare-and-swap receives an absolute `deadline` from
+the driver. It is the sooner of the effective absolute session cap and the
+activity horizon `max(now, token_expiry) + idle_timeout`; the driver also keeps
+that idle horizon in lockstep with the [`LivenessConfig`](crate::LivenessConfig)
+attached through
+[`with_liveness`](crate::StoreBackedSessionStore::with_liveness). Apply the
+supplied deadline as the record's absolute TTL on **every** successful write,
+erring late:
 
 - The deadline is measured on the application's clock, so a backend expiring
   exactly at it by its own clock can already be early — deleting early logs a
@@ -76,7 +85,7 @@ outage, but a copied pointer remains usable until deletion succeeds or the
 record reaches its storage deadline; monitor the logged revocation failures.
 Records it cannot reach — the pointer cookie was cleared, or its cookie key
 was rotated out without a grace period — are the backend's to reap, and
-`storage_deadline` is the detector: a record past its deadline is one your
+the stored deadline is the detector: a record past its deadline is one your
 lifetime cap or activity bound says must not be served again, so deleting it
 is always safe. Deleting it is also what _enforces_ the bound: liveness fails
 open, so once the liveness entry is gone, a record that is still stored would
@@ -98,7 +107,10 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Mutex;
 
-use huskarl_login::core::crypto::{cipher::AeadCipher, seal::AeadV1Sealer};
+use huskarl_login::core::{
+    crypto::{cipher::AeadCipher, seal::AeadV1Sealer},
+    platform::SystemTime,
+};
 use huskarl_login::{
     ExternalSessionStore, PersistedSession, PersistedSessionState, SaveOutcome, Session,
     SessionState, StoreBackedSessionStore,
@@ -126,7 +138,7 @@ impl From<PersistedSessionState> for MySession {
 
 #[derive(Default)]
 struct InMemoryStore {
-    rows: Mutex<HashMap<Uuid, (MySession, i32)>>,
+    rows: Mutex<HashMap<Uuid, (MySession, i32, SystemTime)>>,
 }
 
 impl ExternalSessionStore for InMemoryStore {
@@ -134,40 +146,53 @@ impl ExternalSessionStore for InMemoryStore {
     type Version = i32;
     type Error = Infallible;
 
-    // A real backend applies `session.storage_deadline(now, idle_timeout)`
-    // as the record's absolute TTL on every write (see "TTL contract" above);
-    // this in-memory demo skips it.
-    async fn insert(&self, session: &MySession) -> Result<(), Infallible> {
+    // A real backend also applies `deadline` as an absolute TTL. This demo
+    // stores it so a sweeper could remove expired rows.
+    async fn insert(
+        &self,
+        session: &MySession,
+        deadline: SystemTime,
+    ) -> Result<(), Infallible> {
         let key = session.persisted().session_key;
-        self.rows.lock().unwrap().insert(key, (session.clone(), 0));
+        self.rows.lock().unwrap().insert(key, (session.clone(), 0, deadline));
         Ok(())
     }
 
     async fn load(&self, session_key: Uuid) -> Result<Option<(MySession, i32)>, Infallible> {
-        Ok(self.rows.lock().unwrap().get(&session_key).cloned())
+        Ok(self.rows.lock().unwrap().get(&session_key)
+            .map(|(session, version, _)| (session.clone(), *version)))
     }
 
-    async fn save(&self, session: &MySession) -> Result<(), Infallible> {
+    async fn save(
+        &self,
+        session: &MySession,
+        deadline: SystemTime,
+    ) -> Result<SaveOutcome, Infallible> {
         let key = session.persisted().session_key;
         let mut rows = self.rows.lock().unwrap();
-        let next = rows.get(&key).map_or(0, |(_, v)| v + 1);
-        rows.insert(key, (session.clone(), next));
-        Ok(())
+        let Some((_, version, _)) = rows.get(&key) else {
+            return Ok(SaveOutcome::Missing);
+        };
+        let next = version + 1;
+        rows.insert(key, (session.clone(), next, deadline));
+        Ok(SaveOutcome::Committed)
     }
 
     async fn compare_and_swap(
         &self,
         session: &MySession,
         expected: i32,
+        deadline: SystemTime,
     ) -> Result<SaveOutcome, Infallible> {
         let key = session.persisted().session_key;
         let mut rows = self.rows.lock().unwrap();
         match rows.get(&key) {
-            Some((_, v)) if *v == expected => {
-                rows.insert(key, (session.clone(), expected + 1));
+            Some((_, version, _)) if *version == expected => {
+                rows.insert(key, (session.clone(), expected + 1, deadline));
                 Ok(SaveOutcome::Committed)
             }
-            _ => Ok(SaveOutcome::Conflict),
+            Some(_) => Ok(SaveOutcome::Conflict),
+            None => Ok(SaveOutcome::Missing),
         }
     }
 

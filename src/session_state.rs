@@ -164,21 +164,9 @@ pub trait Session {
 
     /// Absolute session deadline fixed at login, if the deployment bounded
     /// it — see [`SessionState::expire_at`]. The engine enforces it alongside
-    /// the live config; storage deadlines derive from it via
-    /// [`storage_deadline`](Self::storage_deadline).
+    /// the live config and derives external-store deadlines from it.
     fn expire_at(&self) -> Option<SystemTime> {
         self.state().expire_at
-    }
-
-    /// Absolute storage deadline for a record written at `now`: the sooner of
-    /// [`expire_at`](Self::expire_at) and the activity horizon
-    /// `max(now, token_expiry) + idle_timeout`. External stores apply this as
-    /// the record TTL on every write, with the
-    /// [`idle_timeout`](crate::LivenessConfig::idle_timeout) they configured —
-    /// see the [external store guide](crate::_docs::how_to::external_store).
-    fn storage_deadline(&self, now: SystemTime, idle_timeout: Duration) -> SystemTime {
-        let horizon = bounded_time_add(self.token_expiry().max(now), idle_timeout);
-        self.expire_at().map_or(horizon, |e| e.min(horizon))
     }
 
     /// Apply tokens from a refresh response via [`SessionState::refreshed`].
@@ -186,6 +174,20 @@ pub trait Session {
         let new_state = self.state().refreshed(token_response, default_lifetime);
         self.set_state(new_state);
     }
+}
+
+/// Absolute retention deadline for a session record written at `now`.
+///
+/// Kept crate-private so external stores cannot drift from the driver policy;
+/// [`StoreBackedSessionStore`](crate::StoreBackedSessionStore) supplies the
+/// resulting deadline to every write.
+pub(crate) fn storage_deadline<S: Session + ?Sized>(
+    session: &S,
+    now: SystemTime,
+    idle_timeout: Duration,
+) -> SystemTime {
+    let horizon = bounded_time_add(session.token_expiry().max(now), idle_timeout);
+    session.expire_at().map_or(horizon, |e| e.min(horizon))
 }
 
 #[cfg(test)]
@@ -222,7 +224,7 @@ mod tests {
         Some(at(DAY * 400)),
         at(DAY * 2 + HOUR)
     )]
-    fn storage_deadline(
+    fn storage_deadline_cases(
         #[case] token_expiry: SystemTime,
         #[case] expire_at: Option<SystemTime>,
         #[case] expected: SystemTime,
@@ -232,7 +234,7 @@ mod tests {
             .created_at(SystemTime::UNIX_EPOCH)
             .maybe_expire_at(expire_at)
             .build());
-        assert_eq!(s.storage_deadline(at(DAY), DAY), expected);
+        assert_eq!(storage_deadline(&s, at(DAY), DAY), expected);
     }
 
     #[test]

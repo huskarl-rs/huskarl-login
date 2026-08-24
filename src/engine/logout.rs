@@ -1,11 +1,11 @@
 //! `handle_logout` — clear the local session and redirect to either the OIDC
 //! end-session endpoint or the configured post-logout target.
 
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode, header};
 
 use super::{LoginEngine, LoginResponse, error_chain, is_cross_site_request};
 use crate::{
-    LogoutConfig, Session, SessionDriver,
+    DriverLoad, LogoutConfig, Session, SessionDriver,
     url::{build_end_session_url, default_post_logout_redirect},
 };
 
@@ -18,14 +18,13 @@ where
         logout: &LogoutConfig,
         headers: &HeaderMap,
     ) -> LoginResponse {
-        // Logout is POST-only (enforced by the route dispatcher) and session
-        // cookies are SameSite=Lax, which already keeps them off cross-site
-        // POSTs — so cross-site forgery is blocked at the cookie layer. This
-        // Sec-Fetch-Site check is defense-in-depth: it also rejects a forged
-        // cross-site POST should the cookie ever be issued without SameSite=Lax.
-        if is_cross_site_request(headers) {
-            return self
-                .build_error_response(StatusCode::FORBIDDEN, "cross-site logout request rejected");
+        // Logout changes authentication state and may propagate to the OP.
+        // SameSite is not sufficient: a sibling origin is "same-site" and can
+        // submit the browser's host-only cookie. Require the POST's Origin to
+        // match the exact public origin; Fetch Metadata remains a fast
+        // defense-in-depth rejection.
+        if is_cross_site_request(headers) || !self.has_same_origin(headers) {
+            return self.build_error_response(StatusCode::FORBIDDEN, "logout origin rejected");
         }
 
         // A missing or unreadable session is not an error during logout.
@@ -45,12 +44,12 @@ where
 
         // Browser-local logout must not depend on the backing store: clear the
         // session cookies even when loading or revoking server-side state
-        // fails. `delete` still attempts backend-wide revocation below; copied
+        // fails. Logout still attempts backend-wide revocation below; copied
         // store pointers remain usable until that succeeds or their record TTL
         // expires.
         let set_cookies = self.session_store.clear_session_cookies(headers);
         if let Some(ref s) = loaded_session {
-            self.delete_session_best_effort(s, headers).await;
+            self.revoke_session_best_effort(s).await;
         }
 
         // 303, not 302: logout is a POST, and See Other pins the follow-up
@@ -63,10 +62,25 @@ where
         }
     }
 
+    fn has_same_origin(&self, headers: &HeaderMap) -> bool {
+        let Some(origin) = headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<http::Uri>().ok())
+        else {
+            return false;
+        };
+        if origin.query().is_some() || !matches!(origin.path(), "" | "/") {
+            return false;
+        }
+        same_origin(&origin, &self.base_url)
+    }
+
     /// Loads the session for logout, swallowing load errors as `None`.
     async fn load_session_for_logout(&self, headers: &HeaderMap) -> Option<SD::SessionType> {
         match self.session_store.load(headers).await {
-            Ok(s) => s,
+            Ok(DriverLoad::Valid(session)) => Some(session),
+            Ok(DriverLoad::Absent | DriverLoad::Invalid(_)) => None,
             Err(e) => {
                 log::warn!("failed to load session during logout: {}", error_chain(&e));
                 None
@@ -110,16 +124,32 @@ where
 
     /// Attempts server-side revocation; browser-local cookie clearing is
     /// performed independently by [`SessionDriver::clear_session_cookies`].
-    async fn delete_session_best_effort(
-        &self,
-        session: &SD::SessionType,
-        request_headers: &HeaderMap,
-    ) {
-        match self.session_store.delete(session, request_headers).await {
-            Ok(_) => {}
+    async fn revoke_session_best_effort(&self, session: &SD::SessionType) {
+        match self.session_store.revoke(session).await {
+            Ok(()) => {}
             Err(e) => {
-                log::error!("failed to delete session on logout: {}", error_chain(&e));
+                log::error!("failed to revoke session on logout: {}", error_chain(&e));
             }
         }
     }
+}
+
+fn same_origin(left: &http::Uri, right: &http::Uri) -> bool {
+    match (origin_parts(left), origin_parts(right)) {
+        (Some((ls, lh, lp)), Some((rs, rh, rp))) => {
+            ls.eq_ignore_ascii_case(rs) && lh.eq_ignore_ascii_case(rh) && lp == rp
+        }
+        _ => false,
+    }
+}
+
+fn origin_parts(uri: &http::Uri) -> Option<(&str, &str, u16)> {
+    let scheme = uri.scheme_str()?;
+    let host = uri.host()?;
+    let port = uri.port_u16().or(match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    })?;
+    Some((scheme, host, port))
 }

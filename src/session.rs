@@ -10,6 +10,7 @@ use std::{fmt, sync::Arc};
 use http::HeaderValue;
 
 use crate::{
+    ConfigError, RoutePath,
     client::grant::core::TokenResponse,
     completed_login::CompletedLogin,
     core::{
@@ -19,6 +20,136 @@ use crate::{
     liveness::LivenessVerdict,
     session_state::Session,
 };
+
+/// Engine-derived policy applied to a session driver at construction.
+///
+/// The engine is the only constructor. Keeping the route and cookie policy in
+/// one value lets a driver validate that its cookie is visible on every route
+/// which must observe or clear it.
+#[derive(Debug, Clone)]
+pub struct SessionPolicy {
+    secure: bool,
+    max_lifetime: Option<std::time::Duration>,
+    metrics_name: Option<String>,
+    browser_callback_path: RoutePath,
+    browser_logout_path: Option<RoutePath>,
+}
+
+/// Result of inspecting request cookies for a session.
+///
+/// `Absent` means no session-shaped cookie was presented. `Invalid` means the
+/// browser did present session state, but it cannot authenticate and should be
+/// cleared rather than treated as anonymous indefinitely.
+#[derive(Debug)]
+pub enum DriverLoad<S> {
+    /// No session cookie was presented.
+    Absent,
+    /// A valid session was loaded.
+    Valid(S),
+    /// Session-shaped browser state was present but unusable.
+    Invalid(InvalidSessionReason),
+}
+
+impl<S> DriverLoad<S> {
+    /// Test helper for extracting a valid session after the classification was
+    /// already asserted. Production code must match all variants explicitly.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn into_valid(self) -> Option<S> {
+        match self {
+            Self::Valid(session) => Some(session),
+            Self::Absent | Self::Invalid(_) => None,
+        }
+    }
+}
+
+/// Why presented browser session state could not be loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::AsRefStr, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+#[non_exhaustive]
+pub enum InvalidSessionReason {
+    /// Cookie chunks were missing or non-contiguous.
+    IncompleteChunks,
+    /// A cookie value was not valid base64url.
+    BadEncoding,
+    /// The sealed cookie could not be authenticated or decrypted.
+    DecryptionFailed,
+    /// The decrypted payload had the wrong shape.
+    InvalidPayload,
+    /// A valid store pointer referenced no session record.
+    SessionNotFound,
+}
+
+impl InvalidSessionReason {
+    /// Returns a `&'static str` suitable for use as a Prometheus label value.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        self.into()
+    }
+}
+
+impl SessionPolicy {
+    pub(crate) fn new(
+        secure: bool,
+        max_lifetime: Option<std::time::Duration>,
+        metrics_name: Option<&str>,
+        browser_callback_path: RoutePath,
+        browser_logout_path: Option<RoutePath>,
+    ) -> Self {
+        Self {
+            secure,
+            max_lifetime,
+            metrics_name: metrics_name.map(str::to_owned),
+            browser_callback_path,
+            browser_logout_path,
+        }
+    }
+
+    pub(crate) fn secure(&self) -> bool {
+        self.secure
+    }
+
+    pub(crate) fn max_lifetime(&self) -> Option<std::time::Duration> {
+        self.max_lifetime
+    }
+
+    pub(crate) fn metrics_name(&self) -> Option<&str> {
+        self.metrics_name.as_deref()
+    }
+
+    fn validate_cookie_path_for_route(
+        cookie_path: &RoutePath,
+        route: &'static str,
+        route_path: &RoutePath,
+    ) -> Result<(), ConfigError> {
+        cookie_path
+            .strip_from(route_path.as_str())
+            .is_some()
+            .then_some(())
+            .ok_or_else(|| ConfigError::InvalidSessionCookiePath {
+                path: cookie_path.as_str().to_owned(),
+                route,
+                route_path: route_path.as_str().to_owned(),
+            })
+    }
+
+    pub(crate) fn validate_callback_cookie_path(
+        &self,
+        cookie_path: &RoutePath,
+    ) -> Result<(), ConfigError> {
+        Self::validate_cookie_path_for_route(cookie_path, "callback", &self.browser_callback_path)
+    }
+
+    pub(crate) fn validate_logout_cookie_path(
+        &self,
+        cookie_path: &RoutePath,
+    ) -> Result<(), ConfigError> {
+        if let Some(logout_path) = &self.browser_logout_path {
+            Self::validate_cookie_path_for_route(cookie_path, "logout", logout_path)?;
+        }
+        Ok(())
+    }
+}
 
 /// A type-erased session-error cause (`Send + Sync` except on WASM).
 #[cfg(not(target_arch = "wasm32"))]
@@ -188,12 +319,12 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// delegated) clamps the cookie `Max-Age`, so no session cookie outlives
     /// the session cap; `metrics_name` becomes the `name` label on every
     /// counter the driver emits (`None` omits it).
-    fn apply_session_policy(
-        &mut self,
-        secure: bool,
-        max_lifetime: Option<std::time::Duration>,
-        metrics_name: Option<&str>,
-    );
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when the driver's cookie scope cannot cover a
+    /// browser route that must receive or clear the session cookie.
+    fn apply_session_policy(&mut self, policy: &SessionPolicy) -> Result<(), ConfigError>;
 
     /// The sealer this driver seals session data with (AAD-domain-separated
     /// from the login-state seal, so the underlying key may be shared).
@@ -214,11 +345,11 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
         headers: &http::HeaderMap,
     ) -> impl Future<Output = Result<(Self::SessionType, Vec<HeaderValue>), SessionError>> + MaybeSend;
 
-    /// Load a session from the request's cookie headers.
+    /// Inspect and load a session from the request's cookie headers.
     fn load(
         &self,
         headers: &http::HeaderMap,
-    ) -> impl Future<Output = Result<Option<Self::SessionType>, Self::LoadError>> + MaybeSend;
+    ) -> impl Future<Output = Result<DriverLoad<Self::SessionType>, Self::LoadError>> + MaybeSend;
 
     /// Persist updated session state, returning any `Set-Cookie` header values
     /// (re-encrypted cookies plus `Max-Age=0` clears for now-unused chunks; none
@@ -291,11 +422,14 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// backing record is deleted or expires.
     fn clear_session_cookies(&self, headers: &http::HeaderMap) -> Vec<HeaderValue>;
 
-    /// Delete a session, returning `Set-Cookie` values that clear its cookies
-    /// (only those present in `headers`).
-    fn delete(
+    /// Revoke a session's authoritative state.
+    ///
+    /// Browser clearing is deliberately separate through
+    /// [`clear_session_cookies`](Self::clear_session_cookies), so a backend
+    /// failure can never prevent local logout. Cookie-backed sessions have no
+    /// authoritative server state and implement this as a no-op.
+    fn revoke(
         &self,
         session: &Self::SessionType,
-        headers: &http::HeaderMap,
-    ) -> impl Future<Output = Result<Vec<HeaderValue>, SessionError>> + MaybeSend;
+    ) -> impl Future<Output = Result<(), SessionError>> + MaybeSend;
 }

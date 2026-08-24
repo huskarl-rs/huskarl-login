@@ -4,7 +4,7 @@ use crate::client::{grant::core::TokenResponse, token::id_token::IdTokenClaims};
 
 /// Input available when building an application session after login.
 ///
-/// It contains the OAuth token response and, for OpenID Connect flows, the
+/// It contains the OAuth token response and, for `OpenID` Connect flows, the
 /// validated subject and ID-token claims. A [`SessionEnricher`](crate::SessionEnricher)
 /// combines this value with framework-managed state; this value is not itself
 /// the persisted session.

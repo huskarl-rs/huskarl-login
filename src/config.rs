@@ -54,8 +54,7 @@ pub enum SessionLifetime {
     /// The **authorization server (AS)** bounds the session: it lives exactly
     /// as long as the AS keeps honoring the refresh token (re-verified on every
     /// token refresh), and this crate imposes no cap of its own; storage
-    /// stays bounded by the activity horizon
-    /// ([`Session::storage_deadline`](crate::Session::storage_deadline)).
+    /// stays bounded by the external-store activity horizon.
     /// Provides no re-authentication freshness and no cookie-theft
     /// containment — see [the session
     /// model](crate::_docs::explanation::session_model) for when to choose
@@ -139,6 +138,19 @@ pub enum ConfigError {
         /// Why the prefix was rejected.
         reason: &'static str,
     },
+    /// The session cookie's `Path` does not cover an engine route that needs
+    /// to observe or clear it.
+    #[snafu(display(
+        "invalid session cookie path {path:?}: it must cover the browser-facing {route} path {route_path:?}"
+    ))]
+    InvalidSessionCookiePath {
+        /// The configured session-cookie path.
+        path: String,
+        /// The engine route the cookie must cover (`"callback"` or `"logout"`).
+        route: &'static str,
+        /// The browser-facing route path.
+        route_path: String,
+    },
     /// A duration setting holds an invalid value (e.g. zero).
     #[snafu(display("invalid {field}: {reason}"))]
     InvalidDuration {
@@ -159,15 +171,15 @@ pub enum ConfigError {
     },
 }
 
-/// A validated request path or path prefix, cookie- and header-safe by
-/// construction: starts with `/` and contains no `?`, `#`, `;`, or ASCII
-/// control characters.
+/// A validated ASCII request path or path prefix, cookie- and header-safe by
+/// construction: starts with `/` and contains no `?`, `#`, `;`, control
+/// characters, or non-ASCII bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutePath(String);
 
 impl RoutePath {
-    /// Validates `path` (must start with `/`; no `?`, `#`, `;`, or control
-    /// chars) and wraps it.
+    /// Validates `path` (must be ASCII and start with `/`; no `?`, `#`, `;`, or
+    /// control chars) and wraps it.
     ///
     /// # Errors
     ///
@@ -190,6 +202,12 @@ impl RoutePath {
             return Err(InvalidRoutePath {
                 path,
                 reason: "must not contain ASCII control characters",
+            });
+        }
+        if !path.is_ascii() {
+            return Err(InvalidRoutePath {
+                path,
+                reason: "must contain only ASCII characters; percent-encode non-ASCII path bytes",
             });
         }
         Ok(Self(path))
@@ -342,29 +360,52 @@ fn validate_durations(
     Ok(())
 }
 
-/// Computes the browser-facing callback path: the `base_path` prefix joined to
-/// `callback_path` with `strip_prefix` removed. Independent of the origin.
-fn compute_browser_callback_path(
-    callback_path: &RoutePath,
+/// Validates the configured post-logout redirect while preserving the exact
+/// string supplied for the authorization server's byte-for-byte comparison.
+fn validate_post_logout_redirect_uri(logout: Option<&LogoutConfig>) -> Result<(), ConfigError> {
+    let Some(uri) = logout.and_then(|logout| logout.post_logout_redirect_uri.as_ref()) else {
+        return Ok(());
+    };
+    let absolute = uri
+        .parse::<http::Uri>()
+        .is_ok_and(|parsed| parsed.scheme().is_some() && parsed.authority().is_some());
+    if !absolute {
+        return Err(ConfigError::InvalidPostLogoutRedirectUri {
+            url: uri.clone(),
+            reason: "must be an absolute URL with scheme and authority",
+        });
+    }
+    Ok(())
+}
+
+/// Computes and validates a browser-facing route path: the `base_path` prefix
+/// joined to `route_path` with `strip_prefix` removed. Independent of the
+/// origin.
+fn browser_path(
+    route_path: &RoutePath,
     strip_prefix: Option<&RoutePath>,
     base_path: Option<&RoutePath>,
-) -> String {
-    let callback_path = callback_path.as_str();
-    let stripped_callback = match strip_prefix {
-        Some(prefix) => prefix.strip_from(callback_path).unwrap_or(callback_path),
-        None => callback_path,
+) -> Result<RoutePath, ConfigError> {
+    let route_path = route_path.as_str();
+    let stripped_route = match strip_prefix {
+        Some(prefix) => prefix.strip_from(route_path).unwrap_or(route_path),
+        None => route_path,
     };
-    match base_path {
+    let browser_path = match base_path {
         Some(base) => {
             let base = base.as_str().trim_end_matches('/');
-            if stripped_callback.starts_with('/') {
-                format!("{base}{stripped_callback}")
+            if stripped_route.starts_with('/') {
+                format!("{base}{stripped_route}")
             } else {
-                format!("{base}/{stripped_callback}")
+                format!("{base}/{stripped_route}")
             }
         }
-        None => stripped_callback.to_owned(),
-    }
+        None => stripped_route.to_owned(),
+    };
+    RoutePath::new(browser_path).map_err(|e| ConfigError::InvalidBasePath {
+        path: base_path.map_or_else(String::new, |path| path.as_str().to_owned()),
+        reason: e.reason,
+    })
 }
 
 /// Logout endpoint configuration. Grouped under [`LoginConfig::logout`].
@@ -378,7 +419,7 @@ pub struct LogoutConfig {
     pub end_session_endpoint: Option<EndpointUrl>,
     /// Absolute URI to redirect to after the local session is cleared; defaults
     /// to the reconstructed base URL (the grant's `redirect_uri` origin joined
-    /// with `base_path`). Held as the exact string supplied, as the OpenID
+    /// with `base_path`). Held as the exact string supplied, as the `OpenID`
     /// Provider (OP) matches
     /// it byte-for-byte (OIDC RP-Initiated Logout 1.0 §3): it (and the base-URL
     /// default, if relied on) must be registered at the authorization server, or
@@ -465,10 +506,67 @@ pub struct LoginConfig {
     /// Browser-facing callback path, derived from `base_path`, `strip_prefix`,
     /// and `callback_path`; used as the `Path` scope on login-state cookies.
     pub browser_callback_path: RoutePath,
+    /// Browser-facing logout path, derived from `base_path`, `strip_prefix`,
+    /// and [`LogoutConfig::path`]. `None` when logout is disabled.
+    pub browser_logout_path: Option<RoutePath>,
 }
 
 #[bon::bon]
 impl LoginConfig {
+    /// Revalidates mutable settings and recomputes browser-facing paths from
+    /// the canonical route configuration.
+    ///
+    /// `LoginConfig` exposes its fields for adapter inspection, so callers can
+    /// mutate them after using the builder. The engine calls this before it
+    /// derives cookie policy to ensure stale derived fields cannot bypass route
+    /// visibility checks.
+    pub(crate) fn validate_and_recompute(&mut self) -> Result<(), ConfigError> {
+        validate_durations(
+            self.session_lifetime,
+            self.token_refresh_margin,
+            self.default_token_lifetime,
+            self.login_state_ttl,
+        )?;
+        validate_post_logout_redirect_uri(self.logout.as_ref())?;
+
+        if let Some(prefix) = &self.strip_prefix {
+            if prefix.strip_from(self.callback_path.as_str()).is_none() {
+                return Err(ConfigError::InvalidCallbackPath {
+                    path: self.callback_path.as_str().to_owned(),
+                    reason: "must be within strip_prefix when strip_prefix is set",
+                });
+            }
+            if let Some(logout) = &self.logout
+                && prefix.strip_from(logout.path.as_str()).is_none()
+            {
+                return Err(ConfigError::InvalidLogoutPath {
+                    path: logout.path.as_str().to_owned(),
+                    reason: "must be within strip_prefix when strip_prefix is set",
+                });
+            }
+        }
+
+        let browser_callback_path = browser_path(
+            &self.callback_path,
+            self.strip_prefix.as_ref(),
+            self.base_path.as_ref(),
+        )?;
+        let browser_logout_path = self
+            .logout
+            .as_ref()
+            .map(|logout| {
+                browser_path(
+                    &logout.path,
+                    self.strip_prefix.as_ref(),
+                    self.base_path.as_ref(),
+                )
+            })
+            .transpose()?;
+        self.browser_callback_path = browser_callback_path;
+        self.browser_logout_path = browser_logout_path;
+        Ok(())
+    }
+
     /// Builds a [`LoginConfig`], validating paths.
     ///
     /// The client-facing origin (scheme + host) is **not** configured here: it
@@ -546,21 +644,8 @@ impl LoginConfig {
             .transpose()?;
         // `logout.path`'s shape was validated by `LogoutConfig::builder`; the
         // redirect URI still needs an absolute-URL check. It is parsed only to
-        // validate — the stored value stays the exact string, since the OP
-        // matches it byte-for-byte (OIDC RP-Initiated Logout 1.0 §3).
-        if let Some(ref logout) = logout
-            && let Some(ref uri) = logout.post_logout_redirect_uri
-        {
-            let absolute = uri
-                .parse::<http::Uri>()
-                .is_ok_and(|parsed| parsed.scheme().is_some() && parsed.authority().is_some());
-            if !absolute {
-                return Err(ConfigError::InvalidPostLogoutRedirectUri {
-                    url: uri.clone(),
-                    reason: "must be an absolute URL with scheme and authority",
-                });
-            }
-        }
+        // validate — the stored value stays exact for the OP's byte comparison.
+        validate_post_logout_redirect_uri(logout.as_ref())?;
         // Engine-side paths carry the front proxy's prefix; a path outside it
         // would silently never match a real request (and, for the callback,
         // corrupt the derived cookie scope) — reject the contradiction.
@@ -601,18 +686,12 @@ impl LoginConfig {
         // joined result is re-validated before it is emitted as a cookie `Path`,
         // closing the one route by which a `;`/control char could reach a
         // `Set-Cookie` header. Independent of the origin, so it's known here.
-        let browser_callback_path = compute_browser_callback_path(
-            &callback_path,
-            strip_prefix.as_ref(),
-            base_path.as_ref(),
-        );
         let browser_callback_path =
-            RoutePath::new(browser_callback_path).map_err(|e| ConfigError::InvalidBasePath {
-                path: base_path
-                    .as_ref()
-                    .map_or_else(String::new, |p| p.as_str().to_owned()),
-                reason: e.reason,
-            })?;
+            browser_path(&callback_path, strip_prefix.as_ref(), base_path.as_ref())?;
+        let browser_logout_path = logout
+            .as_ref()
+            .map(|logout| browser_path(&logout.path, strip_prefix.as_ref(), base_path.as_ref()))
+            .transpose()?;
 
         Ok(Self {
             callback_path,
@@ -627,6 +706,7 @@ impl LoginConfig {
             logout,
             login_cookie_prefix,
             browser_callback_path,
+            browser_logout_path,
         })
     }
 }
@@ -634,6 +714,8 @@ impl LoginConfig {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use rstest::rstest;
 
     use super::*;
     use crate::test_support::header_map as req;
@@ -645,11 +727,6 @@ mod tests {
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .build()
             .unwrap()
-    }
-
-    #[test]
-    fn browser_callback_path_is_callback_path_without_base_path() {
-        assert_eq!(default_policy_config().browser_callback_path, "/callback");
     }
 
     #[test]
@@ -1054,52 +1131,55 @@ mod tests {
 
     // -- browser_callback_path tests --
 
-    #[test]
-    fn browser_callback_path_simple() {
+    #[rstest]
+    #[case::direct("/callback", None, None, "/callback")]
+    #[case::base_path("/callback", Some("/base"), None, "/base/callback")]
+    #[case::strip_prefix("/internal/callback", None, Some("/internal"), "/callback")]
+    #[case::base_and_strip(
+        "/internal/callback",
+        Some("/base"),
+        Some("/internal"),
+        "/base/callback"
+    )]
+    fn browser_callback_path_mapping(
+        #[case] callback_path: &str,
+        #[case] base_path: Option<&str>,
+        #[case] strip_prefix: Option<&str>,
+        #[case] expected: &str,
+    ) {
         let config = LoginConfig::builder()
-            .callback_path("/callback")
+            .callback_path(callback_path)
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
+            .maybe_base_path(base_path.map(str::to_owned))
+            .maybe_strip_prefix(strip_prefix.map(str::to_owned))
             .build()
             .unwrap();
-        assert_eq!(config.browser_callback_path, "/callback");
+        assert_eq!(config.browser_callback_path, expected);
     }
 
     #[test]
-    fn browser_callback_path_with_base_path() {
-        let config = LoginConfig::builder()
-            .callback_path("/callback")
-            .base_path("/base")
-            .scope(vec![])
-            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .build()
-            .unwrap();
-        assert_eq!(config.browser_callback_path, "/base/callback");
-    }
-
-    #[test]
-    fn browser_callback_path_with_strip_prefix() {
-        let config = LoginConfig::builder()
-            .callback_path("/internal/callback")
-            .scope(vec![])
-            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-            .strip_prefix("/internal")
-            .build()
-            .unwrap();
-        assert_eq!(config.browser_callback_path, "/callback");
-    }
-
-    #[test]
-    fn browser_callback_path_with_base_path_and_strip_prefix() {
+    fn browser_logout_path_uses_the_same_external_path_mapping() {
         let config = LoginConfig::builder()
             .callback_path("/internal/callback")
             .base_path("/base")
             .scope(vec![])
             .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
             .strip_prefix("/internal")
+            .logout(
+                LogoutConfig::builder()
+                    .path("/internal/logout")
+                    .build()
+                    .unwrap(),
+            )
             .build()
             .unwrap();
+
         assert_eq!(config.browser_callback_path, "/base/callback");
+        assert_eq!(
+            config.browser_logout_path.as_ref().map(RoutePath::as_str),
+            Some("/base/logout")
+        );
     }
 
     // -- RoutePath tests --
@@ -1114,6 +1194,8 @@ mod tests {
         assert!(RoutePath::new("/a;b").is_err());
         assert!(RoutePath::new("/a?b").is_err());
         assert!(RoutePath::new("/a\r\nb").is_err());
+        assert!(RoutePath::new("/café").is_err());
+        assert!(RoutePath::new("/caf%C3%A9").is_ok());
     }
 
     #[test]

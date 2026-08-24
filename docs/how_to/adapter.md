@@ -145,6 +145,8 @@ async fn handle_request<SD: SessionDriver>(
 
     // 2. The engine's own routes: the OAuth callback and logout. `None`
     //    means "not mine" and the request falls through to the app.
+    //    Forward Origin unchanged: logout POSTs require an exact public-origin
+    //    match as their CSRF boundary.
     if let Some(resp) = engine.try_handle_login_route(method, headers, uri).await {
         return lower(resp);
     }
@@ -281,7 +283,7 @@ anonymously instead of redirecting. Two invariants survive the split:
 - `Active`'s `set_cookies` still go out even though the route is public — an
   eager refresh can happen on any authenticated request.
 
-## Application-initiated saves and deletes
+## Application-initiated saves and terminations
 
 Beyond the lifecycle above, expose the engine's explicit persistence methods
 to the application in whatever shape fits the framework:
@@ -291,14 +293,16 @@ to the application in whatever shape fits the framework:
   write; for store-backed sessions mutated concurrently, prefer
   [`StoreBackedSessionStore::update`](crate::StoreBackedSessionStore::update),
   which merges via compare-and-swap and returns no cookies to deliver.
-- [`delete_session`](crate::engine::LoginEngine::delete_session) to end a
-  session outside the logout route.
+- [`terminate_session`](crate::engine::LoginEngine::terminate_session) to end a
+  session outside the logout route. It returns a
+  [`TerminateSessionOutcome`](crate::TerminateSessionOutcome): always deliver its
+  browser clears, then independently handle the server-side revocation result.
 
-Both return [`SetCookies`](crate::engine::SetCookies) — route them through the
-same `attach_cookies` helper. If the application deletes the session while an
+Route all returned [`SetCookies`](crate::engine::SetCookies) through the same
+`attach_cookies` helper. If the application terminates the session while an
 `ActivePending` persist is in flight, the owed save is moot: spell that with
-[`abandon`](crate::engine::PendingPersist::abandon) instead of letting the
-drop guard fire.
+[`abandon`](crate::engine::PendingPersist::abandon) instead of letting the drop
+guard fire.
 
 ## URIs behind a front proxy
 
@@ -342,7 +346,7 @@ in-flight state is carried on the per-request context:
   redirects, errors) are written directly and end the request; otherwise the
   session, any un-committed [`PendingPersist`](crate::engine::PendingPersist),
   the owed cookie headers, and a **clone of the request headers** (`commit`
-  and `delete_session` need them after the request parts are gone) are
+  and `terminate_session` need them after the request parts are gone) are
   stashed on the context and the request proceeds upstream.
 - The *response-header filter* is the persist phase: append the owed cookies
   to the upstream's `&mut ResponseHeader` (the response is the upstream's —

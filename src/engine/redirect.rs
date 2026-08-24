@@ -7,7 +7,7 @@ use super::{EngineError, LoginEngine, LoginResponse, LoginStateCookie};
 use crate::{
     SessionDriver, SessionError, SessionErrorKind,
     client::grant::authorization_code::StartInput,
-    cookie::{cookie_attrs, encode_payload, login_state_cookie_name},
+    cookie::{cookie_attrs, cookie_max_age_seconds, encode_payload, login_state_cookie_name},
     core::{platform::SystemTime, prelude::*},
     url::{base_url_as_string, original_url},
 };
@@ -74,7 +74,7 @@ where
         );
         let cookie_value = URL_SAFE_NO_PAD.encode(&sealed.bundle);
         let attrs = cookie_attrs(self.secure, self.config.browser_callback_path.as_str());
-        let max_age = self.config.login_state_ttl.as_secs();
+        let max_age = cookie_max_age_seconds(self.config.login_state_ttl);
         HeaderValue::from_str(&format!(
             "{cookie_name}={cookie_value}; {attrs}; Max-Age={max_age}"
         ))

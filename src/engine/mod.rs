@@ -21,8 +21,8 @@ use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ConfigError, DefaultErrorPage, ErrorPage, LivenessVerdict, LoginConfig, Session, SessionDriver,
-    SessionError, SessionErrorKind,
+    ConfigError, DefaultErrorPage, DriverLoad, ErrorPage, InvalidSessionReason, LivenessVerdict,
+    LoginConfig, Session, SessionDriver, SessionError, SessionErrorKind,
     client::{
         grant::{
             authorization_code::{AuthorizationCodeGrant, PendingState},
@@ -157,7 +157,7 @@ impl LoginResponse {
 ///
 /// A drop-guard around the cookie headers produced by
 /// [`load_session`](LoginEngine::load_session) and the explicit
-/// persist/save/delete methods. Consume it with
+/// persist/save/terminate methods. Consume it with
 /// [`into_headers`](Self::into_headers) (or iterate it) and append every
 /// value to the outgoing response.
 ///
@@ -264,6 +264,36 @@ impl Drop for SetCookies {
              of discarding it",
             self.headers.len()
         );
+    }
+}
+
+/// Result of explicit session termination.
+///
+/// Browser clearing and authoritative server-side revocation are independent:
+/// even when revocation fails, the clears returned by [`into_parts`](Self::into_parts)
+/// must still be appended to the current response. Keeping both values in one
+/// outcome prevents an error return from accidentally discarding the browser
+/// action.
+#[must_use = "session cookie clears and the revocation result must both be handled"]
+pub struct TerminateSessionOutcome {
+    clears: SetCookies,
+    revocation: Result<(), SessionError>,
+}
+
+impl TerminateSessionOutcome {
+    /// Consumes the outcome into the browser clears and revocation result.
+    #[must_use = "append the cookie clears and inspect the revocation result"]
+    pub fn into_parts(self) -> (SetCookies, Result<(), SessionError>) {
+        (self.clears, self.revocation)
+    }
+}
+
+impl std::fmt::Debug for TerminateSessionOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminateSessionOutcome")
+            .field("clears", &self.clears.len())
+            .field("revocation", &self.revocation)
+            .finish()
     }
 }
 
@@ -528,6 +558,9 @@ pub enum TeardownReason {
     RefreshRejected,
     /// The access token expired and the session holds no refresh token.
     NoRefreshToken,
+    /// Session-shaped browser state was malformed, undecryptable, or pointed
+    /// to a record that no longer exists.
+    InvalidSession,
 }
 
 impl TeardownReason {
@@ -555,24 +588,31 @@ pub trait PersistFailurePolicy: MaybeSendSync + 'static {
 ///
 /// The replacement status is derived from a [`SessionError`]'s
 /// [`SessionErrorKind`]: [`Conflict`](SessionErrorKind::Conflict) → `409`,
+/// [`Gone`](SessionErrorKind::Gone) → `401`,
 /// [`Crypto`](SessionErrorKind::Crypto)/[`Encoding`](SessionErrorKind::Encoding)/
-/// [`Store`](SessionErrorKind::Store) → `500`, anything else → `503`.
+/// [`Store`](SessionErrorKind::Store) → `500`, and
+/// [`Unavailable`](SessionErrorKind::Unavailable) → `503`.
 pub struct DefaultPersistFailurePolicy;
 
 impl PersistFailurePolicy for DefaultPersistFailurePolicy {
     fn handle(&self, error: &SessionError) -> Option<LoginResponse> {
         let status = match error.kind() {
+            SessionErrorKind::Gone => StatusCode::UNAUTHORIZED,
             SessionErrorKind::Conflict => StatusCode::CONFLICT,
             SessionErrorKind::Crypto | SessionErrorKind::Encoding | SessionErrorKind::Store => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
-            _ => StatusCode::SERVICE_UNAVAILABLE,
+            SessionErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         };
+        let mut headers = vec![(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+        if status == StatusCode::UNAUTHORIZED {
+            headers.push((header::WWW_AUTHENTICATE, HeaderValue::from_static("Cookie")));
+        }
         Some(LoginResponse::Rendered {
             status,
             // Same rule as every engine-rendered response: session-adjacent
             // responses are never cacheable.
-            headers: vec![(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+            headers,
             body: Bytes::new(),
         })
     }
@@ -621,10 +661,11 @@ pub(super) fn login_state_aad(state: &str) -> Vec<u8> {
 #[non_exhaustive]
 pub struct LoginEngine<SD> {
     /// The login configuration.
-    pub config: LoginConfig,
+    config: LoginConfig,
     grant: AuthorizationCodeGrant,
-    /// The session store.
-    pub session_store: SD,
+    /// The session store, kept private so construction-time policy stamping
+    /// cannot be invalidated by replacing it afterward.
+    session_store: SD,
     /// Client-facing base URL, reconstructed at build from the grant's
     /// `redirect_uri` origin joined with [`LoginConfig::base_path`].
     base_url: http::Uri,
@@ -662,7 +703,7 @@ where
     /// is defensive.)
     #[builder]
     pub fn new(
-        config: LoginConfig,
+        mut config: LoginConfig,
         grant: AuthorizationCodeGrant,
         session_store: SD,
         #[builder(with = |sealer: impl AeadSealerUnsealer + 'static| Arc::new(sealer) as Arc<dyn AeadSealerUnsealer>)]
@@ -676,6 +717,12 @@ where
         #[builder(into)]
         metrics_name: Option<String>,
     ) -> Result<Self, ConfigError> {
+        // Re-derive these values at the trust boundary. `LoginConfig` fields
+        // are public for adapter inspection and may have been changed after
+        // the builder ran; stale derived paths must not bypass cookie-scope
+        // validation or leak into login-state cookies.
+        config.validate_and_recompute()?;
+
         // The client-facing origin is the single source of truth: the grant's
         // `redirect_uri`. Reconstruct the base URL from its origin joined with
         // the config's `base_path`, and derive `secure` from its scheme. Because
@@ -714,11 +761,14 @@ where
         // `session_lifetime` bound, so session cookies share one
         // `secure`/`__Host-` policy and no cookie outlives the session cap.
         let mut session_store = session_store;
-        session_store.apply_session_policy(
+        let session_policy = crate::session::SessionPolicy::new(
             secure,
             config.session_lifetime.bound(),
             metrics_name.as_deref(),
+            config.browser_callback_path.clone(),
+            config.browser_logout_path.clone(),
         );
+        session_store.apply_session_policy(&session_policy)?;
         // Default here rather than in each adapter, so every adapter gets the
         // shared-key setup (and its safety argument) without reimplementing it.
         let sealer = sealer.unwrap_or_else(|| session_store.session_sealer());
@@ -741,6 +791,26 @@ impl<SD> LoginEngine<SD>
 where
     SD: SessionDriver,
 {
+    /// Returns the immutable login configuration validated at construction.
+    ///
+    /// Route and browser-cookie paths are frozen together so their visibility
+    /// invariants cannot drift after the engine has stamped its session
+    /// driver policy.
+    #[must_use]
+    pub fn config(&self) -> &LoginConfig {
+        &self.config
+    }
+
+    /// Returns the session store stamped with this engine's cookie, lifetime,
+    /// route, and metrics policy.
+    ///
+    /// The reference is immutable so the validated store cannot be replaced or
+    /// have its construction-time policy changed after engine construction.
+    #[must_use]
+    pub fn session_store(&self) -> &SD {
+        &self.session_store
+    }
+
     /// If `uri`'s path is the configured callback or logout path, returns the
     /// corresponding response; otherwise `None` (the adapter falls through).
     ///
@@ -798,19 +868,28 @@ where
         &self,
         headers: &HeaderMap,
     ) -> Result<LoadedSession<SD::SessionType>, SessionError> {
-        let Some(session) = self
+        let session = match self
             .session_store
             .load(headers)
             .await
             .map_err(crate::session::to_session_err)?
-        else {
-            return Ok(LoadedSession::Missing);
+        {
+            DriverLoad::Absent => return Ok(LoadedSession::Missing),
+            DriverLoad::Valid(session) => session,
+            DriverLoad::Invalid(invalid_reason) => {
+                let reason = TeardownReason::InvalidSession;
+                self.record_teardown_with_invalid_reason(reason, Some(invalid_reason));
+                return Ok(LoadedSession::Cleared {
+                    reason,
+                    clears: SetCookies::new(self.session_store.clear_session_cookies(headers)),
+                });
+            }
         };
 
         let now = SystemTime::now();
 
         if let Some(reason) = self.session_teardown_reason(&session, now) {
-            let clears = self.delete_best_effort(&session, headers).await;
+            let clears = self.terminate_best_effort(&session, headers).await;
             self.record_teardown(reason);
             return Ok(LoadedSession::Cleared { reason, clears });
         }
@@ -833,7 +912,7 @@ where
             .await?
             == LivenessVerdict::Expired
         {
-            let clears = self.delete_best_effort(&session, headers).await;
+            let clears = self.terminate_best_effort(&session, headers).await;
             let reason = TeardownReason::IdleTimeout;
             self.record_teardown(reason);
             return Ok(LoadedSession::Cleared { reason, clears });
@@ -938,7 +1017,7 @@ where
         headers: &HeaderMap,
     ) -> LoadedSession<SD::SessionType> {
         let Some(rt) = session.refresh_token().cloned() else {
-            let clears = self.delete_best_effort(&session, headers).await;
+            let clears = self.terminate_best_effort(&session, headers).await;
             self.record_refresh(&RefreshResult::NoRefreshToken);
             let reason = TeardownReason::NoRefreshToken;
             self.record_teardown(reason);
@@ -970,6 +1049,20 @@ where
                         session,
                         set_cookies: SetCookies::new(set_cookies),
                     },
+                    Err(e) if e.kind() == SessionErrorKind::Gone => {
+                        let reason = self
+                            .session_teardown_reason(&session, SystemTime::now())
+                            .unwrap_or(TeardownReason::InvalidSession);
+                        let invalid_reason = (reason == TeardownReason::InvalidSession)
+                            .then_some(InvalidSessionReason::SessionNotFound);
+                        self.record_teardown_with_invalid_reason(reason, invalid_reason);
+                        LoadedSession::Cleared {
+                            reason,
+                            clears: SetCookies::new(
+                                self.session_store.clear_session_cookies(headers),
+                            ),
+                        }
+                    }
                     Err(e) => {
                         log::warn!(
                             "failed to eagerly persist refreshed session; deferring to \
@@ -1018,7 +1111,7 @@ where
             Err(e) => {
                 log::error!("token refresh failed: {}", error_chain(&e));
                 let reason = TeardownReason::RefreshRejected;
-                let clears = self.delete_best_effort(&session, headers).await;
+                let clears = self.terminate_best_effort(&session, headers).await;
                 self.record_refresh(&RefreshResult::Failed);
                 self.record_teardown(reason);
                 LoadedSession::Cleared { reason, clears }
@@ -1026,20 +1119,19 @@ where
         }
     }
 
-    /// Calls `session_store.delete`, logging on failure and returning an empty
-    /// set so callers can use the result unconditionally.
-    async fn delete_best_effort(
+    /// Builds browser clears first, then attempts authoritative revocation.
+    /// A backend failure is logged but can never keep the current browser from
+    /// dropping its dead session state.
+    async fn terminate_best_effort(
         &self,
         session: &SD::SessionType,
         headers: &HeaderMap,
     ) -> SetCookies {
-        match self.session_store.delete(session, headers).await {
-            Ok(c) => SetCookies::new(c),
-            Err(e) => {
-                log::error!("failed to delete session: {}", error_chain(&e));
-                SetCookies::default()
-            }
+        let clears = SetCookies::new(self.session_store.clear_session_cookies(headers));
+        if let Err(e) = self.session_store.revoke(session).await {
+            log::error!("failed to revoke session: {}", error_chain(&e));
         }
+        clears
     }
 
     /// Exchanges the refresh token up to [`REFRESH_MAX_ATTEMPTS`] times,
@@ -1117,28 +1209,41 @@ where
     }
 
     fn record_teardown(&self, reason: TeardownReason) {
+        self.record_teardown_with_invalid_reason(reason, None);
+    }
+
+    fn record_teardown_with_invalid_reason(
+        &self,
+        reason: TeardownReason,
+        invalid_reason: Option<InvalidSessionReason>,
+    ) {
         crate::metrics::emit_counter(
             "huskarl.session.teardown",
-            vec![metrics::Label::new("reason", reason.as_str())],
+            vec![
+                metrics::Label::new("reason", reason.as_str()),
+                metrics::Label::new(
+                    "invalid_reason",
+                    invalid_reason.map_or("none", |reason| reason.as_str()),
+                ),
+            ],
             self.metrics_name.as_deref(),
         );
     }
 
-    /// Deletes a session, returning [`SetCookies`] that clear the session
-    /// cookies. See [`PendingPersist::commit`] for `request_headers`.
+    /// Terminates a session, returning both the [`SetCookies`] that clear the
+    /// browser and the independent server-side revocation result.
     ///
-    /// # Errors
-    ///
-    /// Returns [`SessionError`] if the session store fails to delete.
-    pub async fn delete_session(
+    /// The clears are constructed before revocation and remain available when
+    /// the backend fails. Consume [`TerminateSessionOutcome::into_parts`], append
+    /// the clears to the response, then handle or report the revocation result.
+    pub async fn terminate_session(
         &self,
         session: &SD::SessionType,
         request_headers: &HeaderMap,
-    ) -> Result<SetCookies, SessionError> {
-        self.session_store
-            .delete(session, request_headers)
-            .await
-            .map(SetCookies::new)
+    ) -> TerminateSessionOutcome {
+        let clears = SetCookies::new(self.session_store.clear_session_cookies(request_headers));
+        let revocation = self.session_store.revoke(session).await;
+        TerminateSessionOutcome { clears, revocation }
     }
 
     /// Explicitly and unconditionally saves a session (e.g. after the

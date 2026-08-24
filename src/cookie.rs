@@ -14,7 +14,7 @@ use crate::{
     config::RoutePath,
     core::crypto::seal::{AeadSealerUnsealer, AeadUnsealer},
     metrics::DecryptResult,
-    session::{SessionError, SessionErrorKind},
+    session::{InvalidSessionReason, SessionError, SessionErrorKind, SessionPolicy},
 };
 
 /// The type-erased sealer used to seal/unseal cookie values. Any
@@ -25,6 +25,14 @@ pub(crate) type SessionCipher = Arc<dyn AeadSealerUnsealer>;
 
 /// Default `Max-Age` for session cookies (400 days, the browser ceiling).
 pub(crate) const DEFAULT_COOKIE_MAX_AGE: Duration = Duration::from_hours(9600);
+
+/// Converts a positive duration to cookie delta-seconds without turning a
+/// sub-second lifetime into `Max-Age=0`.
+pub(crate) fn cookie_max_age_seconds(duration: Duration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() != 0))
+}
 
 /// Encodes a cookie payload as CBOR (before AEAD-sealing and base64-encoding).
 pub(crate) fn encode_payload<T: Serialize>(
@@ -309,6 +317,20 @@ impl CookieSealer {
         );
     }
 
+    /// Applies the cookie-related portion of the engine's session policy.
+    pub(crate) fn apply_session_policy(&mut self, policy: &SessionPolicy) {
+        self.apply_secure(policy.secure());
+        self.metrics_name = policy.metrics_name().map(str::to_owned);
+        if let Some(max_lifetime) = policy.max_lifetime() {
+            self.clamp_max_age(max_lifetime);
+        }
+    }
+
+    /// Browser path scope configured for this cookie.
+    pub(crate) fn cookie_path(&self) -> &RoutePath {
+        &self.cookie_path
+    }
+
     /// Cookie attributes without `Max-Age` (clears append their own).
     pub(crate) fn base_cookie_attrs(&self) -> String {
         cookie_attrs(self.secure, self.cookie_path.as_str())
@@ -316,22 +338,66 @@ impl CookieSealer {
 
     /// Full cookie attributes including this store's configured `Max-Age`.
     pub(crate) fn cookie_attrs(&self) -> String {
+        self.cookie_attrs_with_max_age(self.max_age)
+    }
+
+    /// Full cookie attributes with a per-write `Max-Age`, clamped to the
+    /// store's configured browser retention bound.
+    pub(crate) fn cookie_attrs_with_max_age(&self, max_age: Duration) -> String {
         format!(
             "{}; Max-Age={}",
             self.base_cookie_attrs(),
-            self.max_age.as_secs()
+            cookie_max_age_seconds(self.max_age.min(max_age))
         )
     }
 
     /// Builds the `Set-Cookie` for the kid sidecar: the base64url-encoded
     /// identity when `kid` is `Some`, otherwise a `Max-Age=0` clear.
     pub(crate) fn build_kid_header(&self, kid: Option<&str>) -> Result<HeaderValue, SessionError> {
+        self.build_kid_header_with_attrs(kid, &self.cookie_attrs())
+    }
+
+    /// Builds the key-identity sidecar using caller-supplied per-write attributes.
+    pub(crate) fn build_kid_header_with_attrs(
+        &self,
+        kid: Option<&str>,
+        attrs: &str,
+    ) -> Result<HeaderValue, SessionError> {
         let name = kid_cookie_name(&self.cookie_name);
-        let value = match kid {
-            Some(k) => format!("{name}={}; {}", encode_kid(k), self.cookie_attrs()),
-            None => format!("{name}=; {}; Max-Age=0", self.base_cookie_attrs()),
-        };
-        HeaderValue::from_str(&value).map_err(|e| SessionError::new(SessionErrorKind::Encoding, e))
+        match kid {
+            Some(k) => HeaderValue::from_str(&format!("{name}={}; {attrs}", encode_kid(k)))
+                .map_err(|e| SessionError::new(SessionErrorKind::Encoding, e)),
+            None => self.build_clear_header(&name),
+        }
+    }
+
+    /// Builds a `Set-Cookie` value that clears `name` under this cookie's
+    /// configured security and path attributes.
+    pub(crate) fn build_clear_header(&self, name: &str) -> Result<HeaderValue, SessionError> {
+        HeaderValue::from_str(&format!("{name}=; {}; Max-Age=0", self.base_cookie_attrs()))
+            .map_err(|e| SessionError::new(SessionErrorKind::Encoding, e))
+    }
+
+    /// Decodes and authenticates one of this store's cookie values, recording
+    /// the shared failure metrics. Payload-shape validation remains with the
+    /// caller because cookie and pointer sessions encode different values.
+    pub(crate) async fn unseal_cookie_value(
+        &self,
+        headers: &http::HeaderMap,
+        encoded: &str,
+        purpose: &str,
+    ) -> Result<Vec<u8>, InvalidSessionReason> {
+        let bundle = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| {
+            self.record_decrypt(&DecryptResult::BadEncoding);
+            InvalidSessionReason::BadEncoding
+        })?;
+        let kid = get_kid_cookie(headers, &self.cookie_name);
+        unseal_with_kid_fallback(&self.cipher, kid.as_deref(), &bundle, &self.aad(purpose))
+            .await
+            .ok_or_else(|| {
+                self.record_decrypt(&DecryptResult::DecryptFailed);
+                InvalidSessionReason::DecryptionFailed
+            })
     }
 
     /// Records an encrypt event (active key id).
@@ -425,7 +491,17 @@ pub fn get_cookie<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a st
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
+
+    #[rstest]
+    #[case::subsecond(Duration::from_nanos(1), 1)]
+    #[case::fractional_second(Duration::from_millis(1_001), 2)]
+    #[case::whole_seconds(Duration::from_secs(2), 2)]
+    fn cookie_max_age_rounding(#[case] duration: Duration, #[case] expected: u64) {
+        assert_eq!(cookie_max_age_seconds(duration), expected);
+    }
 
     #[test]
     fn get_cookie_present() {
@@ -482,37 +558,40 @@ mod tests {
 
     // -- login_state_cookie_name tests --
 
-    #[test]
-    fn cookie_name_secure_root_uses_host_prefix() {
-        let name = login_state_cookie_name("abc123", true, "/", DEFAULT_LOGIN_COOKIE_PREFIX);
-        assert!(name.starts_with("__Host-"));
-    }
-
-    #[test]
-    fn cookie_name_secure_subpath_uses_secure_prefix() {
-        let name = login_state_cookie_name("abc123", true, "/app", DEFAULT_LOGIN_COOKIE_PREFIX);
-        assert!(name.starts_with("__Secure-"));
-    }
-
-    #[test]
-    fn cookie_name_insecure_no_prefix() {
-        let name = login_state_cookie_name("abc123", false, "/", DEFAULT_LOGIN_COOKIE_PREFIX);
-        assert!(!name.starts_with("__"));
-    }
-
-    #[test]
-    fn cookie_name_is_prefix_plus_state() {
-        for (secure, path) in [(true, "/"), (true, "/app"), (false, "/")] {
-            let name = login_state_cookie_name("abc123", secure, path, DEFAULT_LOGIN_COOKIE_PREFIX);
-            let prefix = login_state_cookie_name_prefix(secure, path, DEFAULT_LOGIN_COOKIE_PREFIX);
-            assert_eq!(name, format!("{prefix}abc123"));
-        }
-    }
-
-    #[test]
-    fn cookie_name_contains_state() {
-        let name = login_state_cookie_name("mystate", true, "/", DEFAULT_LOGIN_COOKIE_PREFIX);
-        assert!(name.contains("mystate"));
+    #[rstest]
+    #[case::secure_root(
+        "abc123",
+        true,
+        "/",
+        DEFAULT_LOGIN_COOKIE_PREFIX,
+        "__Host-huskarl_login_abc123"
+    )]
+    #[case::secure_subpath(
+        "abc123",
+        true,
+        "/app",
+        DEFAULT_LOGIN_COOKIE_PREFIX,
+        "__Secure-huskarl_login_abc123"
+    )]
+    #[case::insecure(
+        "abc123",
+        false,
+        "/",
+        DEFAULT_LOGIN_COOKIE_PREFIX,
+        "huskarl_login_abc123"
+    )]
+    #[case::custom_prefix("mystate", true, "/", "custom", "__Host-custom_mystate")]
+    fn login_state_cookie_name_cases(
+        #[case] state: &str,
+        #[case] secure: bool,
+        #[case] path: &str,
+        #[case] prefix: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            login_state_cookie_name(state, secure, path, prefix),
+            expected
+        );
     }
 
     // -- login_state_cookie_names tests --
@@ -611,26 +690,13 @@ mod tests {
 
     // -- session_cookie_name tests --
 
-    #[test]
-    fn session_cookie_name_prefixes_secure_root() {
-        assert_eq!(session_cookie_name("sess", true, "/"), "__Host-sess");
-    }
-
-    #[test]
-    fn session_cookie_name_skips_insecure() {
-        assert_eq!(session_cookie_name("sess", false, "/"), "sess");
-    }
-
-    #[test]
-    fn session_cookie_name_secure_subpath_uses_secure_prefix() {
-        // A sub-path scope can't satisfy `__Host-` (which demands `Path=/`),
-        // but `__Secure-` is valid and matches the login-state cookies.
-        assert_eq!(session_cookie_name("sess", true, "/app"), "__Secure-sess");
-    }
-
-    #[test]
-    fn session_cookie_name_insecure_subpath_stays_bare() {
-        assert_eq!(session_cookie_name("sess", false, "/app"), "sess");
+    #[rstest]
+    #[case::secure_root(true, "/", "__Host-sess")]
+    #[case::insecure_root(false, "/", "sess")]
+    #[case::secure_subpath(true, "/app", "__Secure-sess")]
+    #[case::insecure_subpath(false, "/app", "sess")]
+    fn session_cookie_name_cases(#[case] secure: bool, #[case] path: &str, #[case] expected: &str) {
+        assert_eq!(session_cookie_name("sess", secure, path), expected);
     }
 
     // -- CookieName tests --

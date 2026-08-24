@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use super::{LoginEngine, LoginResponse, LoginStateCookie, error_chain};
 use crate::{
-    CompletedLogin, Session, SessionDriver,
+    CompletedLogin, DriverLoad, Session, SessionDriver,
     client::grant::authorization_code::{CompleteInput, CompleteOutput},
     cookie::{
         cookie_attrs, decode_payload, get_cookie, is_valid_oauth_state, login_state_cookie_name,
@@ -132,12 +132,12 @@ where
     /// request runs the full [`load_session`](LoginEngine::load_session).
     async fn has_usable_session(&self, headers: &HeaderMap) -> bool {
         match self.session_store.load(headers).await {
-            Ok(Some(session)) => {
+            Ok(DriverLoad::Valid(session)) => {
                 let now = SystemTime::now();
                 self.session_teardown_reason(&session, now).is_none()
                     && now < session.token_expiry()
             }
-            Ok(None) => false,
+            Ok(DriverLoad::Absent | DriverLoad::Invalid(_)) => false,
             Err(e) => {
                 log::debug!(
                     "session load failed during callback fallback: {}",

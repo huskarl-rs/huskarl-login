@@ -16,10 +16,7 @@ use uuid::Uuid;
 use crate::{
     client::grant::core::TokenResponse,
     config::RoutePath,
-    cookie::{
-        CookieName, CookieSealer, DEFAULT_COOKIE_MAX_AGE, get_cookie, get_kid_cookie,
-        kid_cookie_name, unseal_with_kid_fallback,
-    },
+    cookie::{CookieName, CookieSealer, DEFAULT_COOKIE_MAX_AGE, get_cookie},
     core::{
         crypto::seal::AeadSealerUnsealer,
         platform::{MaybeSend, MaybeSendSync, SystemTime},
@@ -28,8 +25,11 @@ use crate::{
     enrich::{NoEnrichment, SessionEnricher},
     liveness::{LivenessConfig, LivenessStore, LivenessVerdict},
     metrics::{DecryptResult, LivenessFailure, SupersededDeleteResult},
-    session::{SessionDriver, SessionError, SessionErrorKind, to_session_err},
-    session_state::{Session, SessionState, bounded_time_add},
+    session::{
+        DriverLoad, InvalidSessionReason, SessionDriver, SessionError, SessionErrorKind,
+        SessionPolicy, to_session_err,
+    },
+    session_state::{Session, SessionState, bounded_time_add, storage_deadline},
 };
 
 /// Persistence backend for a [`StoreBackedSessionStore`].
@@ -42,7 +42,7 @@ use crate::{
 /// A missing record and a version conflict are normal outcomes, represented
 /// by [`LoadOutcome`] and [`SaveOutcome`]. Reserve [`Self::Error`] for backend
 /// failures. Every successful write must change [`Self::Version`] and apply
-/// [`Session::storage_deadline`] as the record's absolute retention deadline.
+/// the supplied `deadline` as the record's absolute retention deadline.
 /// See [Implement an external session
 /// store](crate::_docs::how_to::external_store) for the complete contract.
 pub trait ExternalSessionStore: MaybeSendSync {
@@ -70,6 +70,7 @@ pub trait ExternalSessionStore: MaybeSendSync {
     fn insert(
         &self,
         session: &Self::SessionType,
+        deadline: SystemTime,
     ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 
     /// Load a session by its key, together with the stored
@@ -79,27 +80,33 @@ pub trait ExternalSessionStore: MaybeSendSync {
         session_key: Uuid,
     ) -> impl Future<Output = Result<LoadOutcome<Self>, Self::Error>> + MaybeSend;
 
-    /// Save a session unconditionally (last-writer-wins). Every write — this
-    /// one included — must change the stored [`Version`](Self::Version).
+    /// Save a session unconditionally (last-writer-wins) **only if its record
+    /// still exists**. Return [`SaveOutcome::Missing`] rather than inserting a
+    /// record: this prevents an in-flight save from resurrecting a session
+    /// deleted by logout. Every committed write must change the stored
+    /// [`Version`](Self::Version).
     ///
-    /// Apply [`Session::storage_deadline`]
-    /// as the record's absolute TTL on **every** write — backends like Redis
-    /// drop a key's TTL on a plain overwrite — and never as a sliding window.
+    /// Apply the supplied `deadline` as the record's absolute TTL on **every**
+    /// write — backends like Redis drop a key's TTL on a plain overwrite — and
+    /// never convert it to a sliding duration.
     /// See the [external store guide](crate::_docs::how_to::external_store)
     /// for the full retention contract.
     fn save(
         &self,
         session: &Self::SessionType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
+        deadline: SystemTime,
+    ) -> impl Future<Output = Result<SaveOutcome, Self::Error>> + MaybeSend;
 
     /// Save `session` only if the stored [`Version`](Self::Version) still
-    /// equals `expected`, changing it on success; otherwise returns
-    /// [`SaveOutcome::Conflict`] without writing. The retention contract on
-    /// [`save`](Self::save) applies.
+    /// equals `expected`, changing it on success. Return
+    /// [`SaveOutcome::Conflict`] for a version mismatch or
+    /// [`SaveOutcome::Missing`] when the record does not exist, without
+    /// writing. The retention contract on [`save`](Self::save) applies.
     fn compare_and_swap(
         &self,
         session: &Self::SessionType,
         expected: Self::Version,
+        deadline: SystemTime,
     ) -> impl Future<Output = Result<SaveOutcome, Self::Error>> + MaybeSend;
 
     /// Delete the session's stored record. Idempotent: a missing record is
@@ -117,13 +124,19 @@ pub type LoadOutcome<E> = Option<(
     <E as ExternalSessionStore>::Version,
 )>;
 
-/// Outcome of [`ExternalSessionStore::compare_and_swap`].
+/// Outcome of an [`ExternalSessionStore`] save or compare-and-swap write.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveOutcome {
     /// The version matched; the session was written and the version changed.
     Committed,
     /// Another writer changed the version first; nothing was written.
     Conflict,
+    /// The record no longer exists; nothing was written.
+    ///
+    /// In particular, a save racing logout must return this instead of
+    /// recreating the deleted record.
+    Missing,
 }
 
 /// [`StoreBackedSessionStore::update`] found no session for the key.
@@ -208,6 +221,9 @@ pub struct StoreBackedSessionStore<E: ExternalSessionStore> {
     /// [`SessionState::expire_at`](crate::SessionState) at login. `None`
     /// until stamped (or when the lifetime is delegated).
     max_lifetime: Option<Duration>,
+    /// Retention horizon used to derive the absolute deadline passed to every
+    /// external-store write. Kept in lockstep with liveness configuration.
+    retention_idle_timeout: Duration,
 }
 
 #[bon::bon]
@@ -226,7 +242,8 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         cookie_name: CookieName,
         /// Cookie `Path` scope. Defaults to `/` — which also enables the
         /// strongest `__Host-` cookie prefix; set a narrower path only
-        /// deliberately.
+        /// deliberately. It must cover the configured callback and logout
+        /// routes so re-login and logout can revoke the referenced record.
         #[builder(default = RoutePath::root())]
         cookie_path: RoutePath,
         /// Cookie `Max-Age`; defaults to 400 days. The engine clamps it to the
@@ -241,6 +258,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             sealer: CookieSealer::new(sealer, cookie_name, cookie_path, max_age),
             liveness: None,
             max_lifetime: None,
+            retention_idle_timeout: crate::liveness::DEFAULT_IDLE_TIMEOUT,
         }
     }
 }
@@ -294,8 +312,18 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         store: impl LivenessStore + 'static,
         config: LivenessConfig,
     ) -> Self {
+        self.retention_idle_timeout = config.idle_timeout;
         self.liveness = Some((Box::new(store), config));
         self
+    }
+
+    /// Derives the single authoritative absolute retention deadline for a
+    /// write, including both the session's frozen cap and a tighter live cap.
+    fn write_deadline(&self, session: &E::SessionType, now: SystemTime) -> SystemTime {
+        let deadline = storage_deadline(session, now, self.retention_idle_timeout);
+        self.max_lifetime.map_or(deadline, |cap| {
+            bounded_time_add(session.created_at(), cap).min(deadline)
+        })
     }
 
     /// Atomically apply `mutate` to the stored session, retrying on concurrent
@@ -356,12 +384,19 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             mutate(&mut session)?;
             match self
                 .external
-                .compare_and_swap(&session, version)
+                .compare_and_swap(
+                    &session,
+                    version,
+                    self.write_deadline(&session, SystemTime::now()),
+                )
                 .await
                 .map_err(to_session_err)?
             {
                 SaveOutcome::Committed => return Ok(session),
                 SaveOutcome::Conflict => {}
+                SaveOutcome::Missing => {
+                    return Err(SessionError::new(SessionErrorKind::Gone, SessionNotFound));
+                }
             }
         }
         Err(SessionError::new(
@@ -372,9 +407,11 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
 
     /// Encrypt the pointer cookie (the UUID's 16 raw bytes) and emit it
     /// alongside the kid sidecar (a `Max-Age=0` clear when there is no identity).
-    async fn pointer_cookie_headers(
+    /// When `deadline` is present, both cookies use its remaining lifetime.
+    async fn pointer_cookie_headers_with_deadline(
         &self,
         session_key: Uuid,
+        deadline: Option<SystemTime>,
     ) -> Result<Vec<HeaderValue>, SessionError> {
         let aad = self.sealer.aad("session_ptr");
         let sealed = self
@@ -388,41 +425,70 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         let kid = sealed.kid;
         self.sealer.record_encrypt(kid.as_deref());
         let cookie_value = URL_SAFE_NO_PAD.encode(&sealed.bundle);
-        let attrs = self.sealer.cookie_attrs();
+        let attrs = if let Some(deadline) = deadline {
+            let remaining = deadline
+                .duration_since(SystemTime::now())
+                .map_err(|_| SessionError::from(SessionErrorKind::Gone))?;
+            if remaining == Duration::ZERO {
+                return Err(SessionErrorKind::Gone.into());
+            }
+            self.sealer.cookie_attrs_with_max_age(remaining)
+        } else {
+            self.sealer.cookie_attrs()
+        };
         let pointer = HeaderValue::from_str(&format!(
             "{}={cookie_value}; {attrs}",
             self.sealer.cookie_name
         ))
         .map_err(|e| SessionError::new(SessionErrorKind::Encoding, e))?;
-        let kid_header = self.sealer.build_kid_header(kid.as_deref())?;
+        let kid_header = self
+            .sealer
+            .build_kid_header_with_attrs(kid.as_deref(), &attrs)?;
         Ok(vec![pointer, kid_header])
     }
 
+    #[cfg(test)]
+    async fn pointer_cookie_headers(
+        &self,
+        session_key: Uuid,
+    ) -> Result<Vec<HeaderValue>, SessionError> {
+        self.pointer_cookie_headers_with_deadline(session_key, None)
+            .await
+    }
+
+    /// Effective absolute cap for browser cookies, combining the frozen
+    /// session deadline with the policy currently stamped on the driver.
+    fn session_deadline(&self, session: &E::SessionType) -> Option<SystemTime> {
+        let configured = self
+            .max_lifetime
+            .map(|cap| bounded_time_add(session.created_at(), cap));
+        match (session.expire_at(), configured) {
+            (Some(frozen), Some(configured)) => Some(frozen.min(configured)),
+            (frozen, configured) => frozen.or(configured),
+        }
+    }
+
     /// Read and decrypt the pointer cookie to get the session key.
-    async fn read_pointer_cookie(&self, headers: &http::HeaderMap) -> Option<Uuid> {
-        let encoded = get_cookie(headers, &self.sealer.cookie_name)?;
-
-        // A pointer-cookie-shaped value is present — record the outcome.
-        let kid = get_kid_cookie(headers, &self.sealer.cookie_name);
-
-        let Ok(bundle) = URL_SAFE_NO_PAD.decode(encoded) else {
-            self.sealer.record_decrypt(&DecryptResult::BadEncoding);
-            return None;
+    async fn read_pointer_cookie(&self, headers: &http::HeaderMap) -> DriverLoad<Uuid> {
+        let Some(encoded) = get_cookie(headers, &self.sealer.cookie_name) else {
+            return DriverLoad::Absent;
         };
-        let aad = self.sealer.aad("session_ptr");
-        let Some(plaintext) =
-            unseal_with_kid_fallback(&self.sealer.cipher, kid.as_deref(), &bundle, &aad).await
-        else {
-            self.sealer.record_decrypt(&DecryptResult::DecryptFailed);
-            return None;
+
+        let plaintext = match self
+            .sealer
+            .unseal_cookie_value(headers, encoded, "session_ptr")
+            .await
+        {
+            Ok(plaintext) => plaintext,
+            Err(reason) => return DriverLoad::Invalid(reason),
         };
         // Must be exactly 16 bytes (UUID); anything else is a corrupted cookie.
         if let Ok(bytes) = <[u8; 16]>::try_from(plaintext) {
             self.sealer.record_decrypt(&DecryptResult::Ok);
-            Some(Uuid::from_bytes(bytes))
+            DriverLoad::Valid(Uuid::from_bytes(bytes))
         } else {
             self.sealer.record_decrypt(&DecryptResult::PayloadInvalid);
-            None
+            DriverLoad::Invalid(InvalidSessionReason::InvalidPayload)
         }
     }
 }
@@ -441,13 +507,21 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         };
 
         let session = self.enricher.build_session(seed, completed).await?;
+        let deadline = self.session_deadline(&session);
+        // Prepare every fallible browser artifact before inserting. Once the
+        // record exists, only best-effort superseded-session cleanup remains,
+        // so a local seal/encoding failure cannot orphan the new record.
+        let cookies = self
+            .pointer_cookie_headers_with_deadline(session.persisted().session_key, deadline)
+            .await?;
+        let now = SystemTime::now();
+        if deadline.is_some_and(|deadline| deadline <= now) {
+            return Err(SessionErrorKind::Gone.into());
+        }
         self.external
-            .insert(&session)
+            .insert(&session, self.write_deadline(&session, now))
             .await
             .map_err(to_session_err)?;
-        let cookies = self
-            .pointer_cookie_headers(session.persisted().session_key)
-            .await?;
         Ok((session, cookies))
     }
 
@@ -463,33 +537,50 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     pub(crate) async fn load_session(
         &self,
         headers: &http::HeaderMap,
-    ) -> Result<Option<E::SessionType>, E::Error> {
-        let Some(session_key) = self.read_pointer_cookie(headers).await else {
-            return Ok(None);
+    ) -> Result<DriverLoad<E::SessionType>, E::Error> {
+        let session_key = match self.read_pointer_cookie(headers).await {
+            DriverLoad::Absent => return Ok(DriverLoad::Absent),
+            DriverLoad::Invalid(reason) => return Ok(DriverLoad::Invalid(reason)),
+            DriverLoad::Valid(key) => key,
         };
 
-        Ok(self
-            .external
-            .load(session_key)
-            .await?
-            .map(|(session, _version)| session))
+        Ok(match self.external.load(session_key).await? {
+            Some((session, _version)) => DriverLoad::Valid(session),
+            None => DriverLoad::Invalid(InvalidSessionReason::SessionNotFound),
+        })
     }
 
     pub(crate) async fn save_session(
         &self,
         session: &E::SessionType,
     ) -> Result<Vec<HeaderValue>, SessionError> {
-        self.external.save(session).await.map_err(to_session_err)?;
+        match self
+            .external
+            .save(session, self.write_deadline(session, SystemTime::now()))
+            .await
+            .map_err(to_session_err)?
+        {
+            SaveOutcome::Committed => {}
+            SaveOutcome::Missing => {
+                return Err(SessionError::new(SessionErrorKind::Gone, SessionNotFound));
+            }
+            SaveOutcome::Conflict => {
+                return Err(SessionError::new(
+                    SessionErrorKind::Conflict,
+                    VersionConflict,
+                ));
+            }
+        }
         // The pointer cookie's value (the session_key) doesn't change after
         // creation, so subsequent saves don't reissue it. The initial cookie
         // is emitted by `create_session`.
         Ok(vec![])
     }
 
-    pub(crate) async fn delete_session(
+    pub(crate) async fn revoke_session(
         &self,
         session: &E::SessionType,
-    ) -> Result<Vec<HeaderValue>, SessionError> {
+    ) -> Result<(), SessionError> {
         self.external
             .delete(session)
             .await
@@ -499,27 +590,23 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         if let Some((liveness, _)) = &self.liveness {
             let key = session.persisted().session_key;
             if let Err(e) = liveness.clear(key).await {
-                log::warn!("failed to clear liveness entry on delete: {e}");
+                log::warn!("failed to clear liveness entry on revocation: {e}");
                 self.record_liveness_failure(&LivenessFailure::Clear);
             }
         }
-        Ok(self.delete_headers())
+        Ok(())
     }
 
     /// Clears the browser's pointer cookie and key-identity sidecar without
     /// touching the backing store.
-    fn delete_headers(&self) -> Vec<HeaderValue> {
+    fn clear_session_cookie_headers(&self) -> Vec<HeaderValue> {
         // Clear the pointer cookie and the kid sidecar.
-        let clear_attrs = format!("{}; Max-Age=0", self.sealer.base_cookie_attrs());
-        let mut headers = Vec::new();
-        if let Ok(v) =
-            HeaderValue::from_str(&format!("{}=; {clear_attrs}", self.sealer.cookie_name))
-        {
-            headers.push(v);
+        let mut headers = Vec::with_capacity(2);
+        if let Ok(pointer) = self.sealer.build_clear_header(&self.sealer.cookie_name) {
+            headers.push(pointer);
         }
-        let kid_name = kid_cookie_name(&self.sealer.cookie_name);
-        if let Ok(v) = HeaderValue::from_str(&format!("{kid_name}=; {clear_attrs}")) {
-            headers.push(v);
+        if let Ok(kid) = self.sealer.build_kid_header(None) {
+            headers.push(kid);
         }
         headers
     }
@@ -530,8 +617,9 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     /// not keep working until the storage deadline reaps it. Best-effort:
     /// failures are logged and must not fail the login.
     async fn delete_superseded_session(&self, headers: &http::HeaderMap) {
-        let Some(old_key) = self.read_pointer_cookie(headers).await else {
-            return;
+        let old_key = match self.read_pointer_cookie(headers).await {
+            DriverLoad::Valid(key) => key,
+            DriverLoad::Absent | DriverLoad::Invalid(_) => return,
         };
         let result = match self.external.load(old_key).await {
             Ok(Some((old, _version))) => match self.external.delete(&old).await {
@@ -552,7 +640,16 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             vec![metrics::Label::new("outcome", result.as_str())],
             self.sealer.metrics_name.as_deref(),
         );
-        if let Some((liveness, _)) = &self.liveness
+        // Preserve the old liveness verdict when the authoritative record may
+        // still exist. Clearing it after a load/delete failure would turn the
+        // old record into a fail-open session and reset its idle history on the
+        // next request.
+        let record_is_gone = matches!(
+            result,
+            SupersededDeleteResult::Deleted | SupersededDeleteResult::NotFound
+        );
+        if record_is_gone
+            && let Some((liveness, _)) = &self.liveness
             && let Err(e) = liveness.clear(old_key).await
         {
             log::warn!("failed to clear superseded liveness entry: {e}");
@@ -567,19 +664,15 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
     type SessionType = E::SessionType;
     type LoadError = E::Error;
 
-    fn apply_session_policy(
-        &mut self,
-        secure: bool,
-        max_lifetime: Option<std::time::Duration>,
-        metrics_name: Option<&str>,
-    ) {
-        self.sealer.apply_secure(secure);
-        self.sealer.metrics_name = metrics_name.map(str::to_owned);
-        if let Some(cap) = max_lifetime {
-            self.sealer.clamp_max_age(cap);
-        }
+    fn apply_session_policy(&mut self, policy: &SessionPolicy) -> Result<(), crate::ConfigError> {
+        // The callback must receive the old pointer so a successful re-login
+        // can revoke the superseded server record before replacing the cookie.
+        policy.validate_callback_cookie_path(self.sealer.cookie_path())?;
+        policy.validate_logout_cookie_path(self.sealer.cookie_path())?;
+        self.sealer.apply_session_policy(policy);
         // Retained to freeze `SessionState::expire_at` into new sessions.
-        self.max_lifetime = max_lifetime;
+        self.max_lifetime = policy.max_lifetime();
+        Ok(())
     }
 
     fn session_sealer(&self) -> Arc<dyn AeadSealerUnsealer> {
@@ -587,7 +680,7 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
     }
 
     fn clear_session_cookies(&self, _headers: &http::HeaderMap) -> Vec<HeaderValue> {
-        self.delete_headers()
+        self.clear_session_cookie_headers()
     }
 
     async fn create(
@@ -596,11 +689,18 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
         default_lifetime: std::time::Duration,
         headers: &http::HeaderMap,
     ) -> Result<(E::SessionType, Vec<HeaderValue>), SessionError> {
+        let created = self.create_session(&completed, default_lifetime).await?;
+        // A failed new-session build leaves the old session untouched. Once
+        // the replacement is durable and its cookie is ready, revocation of
+        // the superseded record is best-effort and cannot fail the login.
         self.delete_superseded_session(headers).await;
-        self.create_session(&completed, default_lifetime).await
+        Ok(created)
     }
 
-    async fn load(&self, headers: &http::HeaderMap) -> Result<Option<E::SessionType>, E::Error> {
+    async fn load(
+        &self,
+        headers: &http::HeaderMap,
+    ) -> Result<DriverLoad<E::SessionType>, E::Error> {
         self.load_session(headers).await
     }
 
@@ -702,12 +802,8 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
         Ok(verdict)
     }
 
-    async fn delete(
-        &self,
-        session: &E::SessionType,
-        _headers: &http::HeaderMap,
-    ) -> Result<Vec<HeaderValue>, SessionError> {
-        self.delete_session(session).await
+    async fn revoke(&self, session: &E::SessionType) -> Result<(), SessionError> {
+        self.revoke_session(session).await
     }
 }
 
@@ -720,7 +816,10 @@ mod tests {
         cookie::encode_kid,
         core::{crypto::seal::AeadV1Sealer, platform::MaybeSendBoxFuture},
         session_state::{Session, SessionState},
-        test_support::{aes_key_with_kid, test_cipher, test_sealer, test_sealer_with_kid},
+        test_support::{
+            RevocableExternalStore, aes_key_with_kid, request_cookies, test_cipher, test_sealer,
+            test_sealer_with_kid, test_session_policy,
+        },
     };
 
     #[derive(Clone)]
@@ -764,7 +863,7 @@ mod tests {
         type Version = i32;
         type Error = Infallible;
 
-        async fn insert(&self, _: &MinimalSession) -> Result<(), Infallible> {
+        async fn insert(&self, _: &MinimalSession, _: SystemTime) -> Result<(), Infallible> {
             Ok(())
         }
 
@@ -772,14 +871,15 @@ mod tests {
             Ok(Some((self.0.clone(), 0)))
         }
 
-        async fn save(&self, _: &MinimalSession) -> Result<(), Infallible> {
-            Ok(())
+        async fn save(&self, _: &MinimalSession, _: SystemTime) -> Result<SaveOutcome, Infallible> {
+            Ok(SaveOutcome::Committed)
         }
 
         async fn compare_and_swap(
             &self,
             _: &MinimalSession,
             _: i32,
+            _: SystemTime,
         ) -> Result<SaveOutcome, Infallible> {
             Ok(SaveOutcome::Committed)
         }
@@ -815,6 +915,21 @@ mod tests {
         }
     }
 
+    struct DelayedEnricher(Duration);
+
+    impl SessionEnricher<PersistedSessionState, MinimalSession> for DelayedEnricher {
+        fn build_session<'a>(
+            &'a self,
+            seed: PersistedSessionState,
+            _completed: &'a crate::CompletedLogin,
+        ) -> MaybeSendBoxFuture<'a, Result<MinimalSession, SessionError>> {
+            Box::pin(async move {
+                tokio::time::sleep(self.0).await;
+                Ok(MinimalSession { persisted: seed })
+            })
+        }
+    }
+
     fn assert_session_driver<T: SessionDriver>(_: &T) {}
 
     #[tokio::test]
@@ -830,6 +945,62 @@ mod tests {
             .cookie_path("/".parse().unwrap())
             .build_with_enricher(MinimalEnricher);
         assert_session_driver(&store);
+    }
+
+    #[tokio::test]
+    async fn store_backed_policy_requires_callback_visibility_for_supersession() {
+        let mut store = StoreBackedSessionStore::builder()
+            .external(MinimalExternalStore(test_session()))
+            .sealer(test_sealer().await)
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/app".parse().unwrap())
+            .build();
+
+        let error = store
+            .apply_session_policy(&SessionPolicy::new(
+                true,
+                None,
+                None,
+                "/oauth/callback".parse().unwrap(),
+                None,
+            ))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::ConfigError::InvalidSessionCookiePath {
+                route: "callback",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn creation_rejects_a_session_that_expires_during_enrichment() {
+        let external = RevocableExternalStore::<MinimalSession>::default();
+        let mut store = StoreBackedSessionStore::builder()
+            .external(external.clone())
+            .sealer(test_sealer().await)
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .build_with_enricher(DelayedEnricher(Duration::from_millis(20)));
+        store
+            .apply_session_policy(&test_session_policy(Some(Duration::from_millis(1))))
+            .unwrap();
+
+        let result = store
+            .create_session(
+                &completed_with_email("a@example.com"),
+                Duration::from_hours(1),
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("an expired session must not be inserted");
+        };
+
+        assert_eq!(error.kind(), SessionErrorKind::Gone);
+        assert_eq!(external.calls().inserts, 0);
+        assert!(external.is_empty());
     }
 
     /// `last_active` and the touch deadline, as [`FakeLiveness`] records them.
@@ -1053,7 +1224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn liveness_cleared_on_delete() {
+    async fn liveness_cleared_on_revocation() {
         let session = test_session();
         let key = session.persisted.session_key;
         let liveness = FakeLiveness::default();
@@ -1061,13 +1232,10 @@ mod tests {
             liveness_store(session.clone(), liveness.clone(), LivenessConfig::default()).await;
 
         liveness.set(key, SystemTime::now());
-        store
-            .delete(&session, &http::HeaderMap::new())
-            .await
-            .unwrap();
+        store.revoke(&session).await.unwrap();
         assert!(
             liveness.get(key).is_none(),
-            "delete clears the liveness entry"
+            "revocation clears the liveness entry"
         );
     }
 
@@ -1119,6 +1287,7 @@ mod tests {
     /// intends.
     struct VersioningStore {
         stored: std::sync::Mutex<Option<(MinimalSession, i32)>>,
+        deadlines: std::sync::Mutex<Vec<SystemTime>>,
         /// When `true`, every `compare_and_swap` reports a conflict.
         always_conflict: bool,
         /// A simulated concurrent writer applied just before the first
@@ -1131,6 +1300,7 @@ mod tests {
         fn with(session: MinimalSession) -> Self {
             Self {
                 stored: std::sync::Mutex::new(Some((session, 0))),
+                deadlines: std::sync::Mutex::new(Vec::new()),
                 always_conflict: false,
                 inject_once: std::sync::Mutex::new(None),
             }
@@ -1138,6 +1308,10 @@ mod tests {
 
         fn stored_version(&self) -> i32 {
             self.stored.lock().unwrap().as_ref().unwrap().1
+        }
+
+        fn last_deadline(&self) -> SystemTime {
+            *self.deadlines.lock().unwrap().last().unwrap()
         }
     }
 
@@ -1147,23 +1321,33 @@ mod tests {
         type Version = i32;
         type Error = Infallible;
 
-        async fn insert(&self, s: &MinimalSession) -> Result<(), Infallible> {
+        async fn insert(&self, s: &MinimalSession, deadline: SystemTime) -> Result<(), Infallible> {
             *self.stored.lock().unwrap() = Some((s.clone(), 0));
+            self.deadlines.lock().unwrap().push(deadline);
             Ok(())
         }
         async fn load(&self, _: Uuid) -> Result<Option<(MinimalSession, i32)>, Infallible> {
             Ok(self.stored.lock().unwrap().clone())
         }
-        async fn save(&self, s: &MinimalSession) -> Result<(), Infallible> {
+        async fn save(
+            &self,
+            s: &MinimalSession,
+            deadline: SystemTime,
+        ) -> Result<SaveOutcome, Infallible> {
             let mut stored = self.stored.lock().unwrap();
-            let next = stored.as_ref().map_or(0, |(_, v)| v + 1);
+            let Some((_, version)) = stored.as_ref() else {
+                return Ok(SaveOutcome::Missing);
+            };
+            let next = version + 1;
             *stored = Some((s.clone(), next));
-            Ok(())
+            self.deadlines.lock().unwrap().push(deadline);
+            Ok(SaveOutcome::Committed)
         }
         async fn compare_and_swap(
             &self,
             s: &MinimalSession,
             expected: i32,
+            deadline: SystemTime,
         ) -> Result<SaveOutcome, Infallible> {
             if self.always_conflict {
                 return Ok(SaveOutcome::Conflict);
@@ -1179,9 +1363,11 @@ mod tests {
             match stored.as_ref() {
                 Some((_, version)) if *version == expected => {
                     *stored = Some((s.clone(), expected + 1));
+                    self.deadlines.lock().unwrap().push(deadline);
                     Ok(SaveOutcome::Committed)
                 }
-                _ => Ok(SaveOutcome::Conflict),
+                Some(_) => Ok(SaveOutcome::Conflict),
+                None => Ok(SaveOutcome::Missing),
             }
         }
         async fn delete(&self, _: &MinimalSession) -> Result<(), Infallible> {
@@ -1203,7 +1389,9 @@ mod tests {
     async fn create_freezes_expire_at_from_stamped_policy() {
         let cap = Duration::from_hours(8);
         let mut store = store_over(VersioningStore::with(test_session())).await;
-        store.apply_session_policy(true, Some(cap), None);
+        store
+            .apply_session_policy(&test_session_policy(Some(cap)))
+            .unwrap();
 
         // The deadline is frozen into the record at login (created_at + cap),
         // giving external stores the retention deadline for every write.
@@ -1225,9 +1413,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_external_write_receives_the_driver_derived_absolute_deadline() {
+        let now = SystemTime::now();
+        let created_at = now - Duration::from_hours(2);
+        let session = MinimalSession {
+            persisted: PersistedSessionState {
+                session_key: Uuid::now_v7(),
+                state: SessionState::builder()
+                    .token_expiry(now + Duration::from_hours(1))
+                    .created_at(created_at)
+                    .build(),
+            },
+        };
+        let mut store = store_over(VersioningStore::with(session.clone())).await;
+        let cap = Duration::from_hours(8);
+        store
+            .apply_session_policy(&test_session_policy(Some(cap)))
+            .unwrap();
+
+        store.save_session(&session).await.unwrap();
+
+        assert_eq!(store.external.last_deadline(), created_at + cap);
+    }
+
+    #[tokio::test]
+    async fn save_after_logout_cannot_resurrect_a_store_backed_session() {
+        let session = test_session();
+        let store = store_over(VersioningStore::with(session.clone())).await;
+
+        store.revoke(&session).await.unwrap();
+        let error = store.save_session(&session).await.unwrap_err();
+
+        assert_eq!(error.kind(), SessionErrorKind::Gone);
+        assert!(store.external.stored.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn create_under_delegated_lifetime_has_no_expire_at() {
         let mut store = store_over(VersioningStore::with(test_session())).await;
-        store.apply_session_policy(true, None, None);
+        store
+            .apply_session_policy(&test_session_policy(None))
+            .unwrap();
 
         // Delegated lifetime: the AS bounds the session, so there is no
         // deadline to freeze — and no record TTL for the backend to apply.
@@ -1243,80 +1469,14 @@ mod tests {
 
     // ── Superseded-record cleanup on re-login ────────────────────────────
 
-    /// Multi-record store keyed by session key, so a superseded record and
-    /// the new login's record can coexist. Shareable for inspection.
-    #[derive(Clone, Default)]
-    struct MapStore {
-        records: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, MinimalSession>>>,
-    }
-
-    #[allow(clippy::unused_async_trait_impl)]
-    impl ExternalSessionStore for MapStore {
-        type SessionType = MinimalSession;
-        type Version = i32;
-        type Error = Infallible;
-
-        async fn insert(&self, s: &MinimalSession) -> Result<(), Infallible> {
-            self.records
-                .lock()
-                .unwrap()
-                .insert(s.persisted.session_key, s.clone());
-            Ok(())
-        }
-        async fn load(&self, key: Uuid) -> Result<Option<(MinimalSession, i32)>, Infallible> {
-            Ok(self
-                .records
-                .lock()
-                .unwrap()
-                .get(&key)
-                .map(|s| (s.clone(), 0)))
-        }
-        async fn save(&self, s: &MinimalSession) -> Result<(), Infallible> {
-            self.insert(s).await
-        }
-        async fn compare_and_swap(
-            &self,
-            s: &MinimalSession,
-            _: i32,
-        ) -> Result<SaveOutcome, Infallible> {
-            self.insert(s).await?;
-            Ok(SaveOutcome::Committed)
-        }
-        async fn delete(&self, s: &MinimalSession) -> Result<(), Infallible> {
-            self.records
-                .lock()
-                .unwrap()
-                .remove(&s.persisted.session_key);
-            Ok(())
-        }
-    }
-
-    /// Extracts the sealed pointer-cookie value from `Set-Cookie` header
-    /// values and builds request headers presenting it back.
-    fn request_with_pointer(headers_out: &[HeaderValue]) -> http::HeaderMap {
-        let pointer_value = headers_out
-            .iter()
-            .find_map(|h| {
-                let s = h.to_str().ok()?;
-                let pair = s.split(';').next()?;
-                let (name, value) = pair.split_once('=')?;
-                (name.trim() == "__Host-session" && !value.is_empty()).then(|| value.to_owned())
-            })
-            .expect("pointer cookie present");
-        let mut req = http::HeaderMap::new();
-        req.insert(
-            http::header::COOKIE,
-            format!("__Host-session={pointer_value}").parse().unwrap(),
-        );
-        req
-    }
+    type MapStore = RevocableExternalStore<MinimalSession>;
 
     #[tokio::test]
     async fn create_deletes_superseded_record_and_liveness_entry() {
         let old = test_session();
         let old_key = old.persisted.session_key;
         let external = MapStore::default();
-        external.insert(&old).await.unwrap();
+        external.seed(&old);
         let liveness = FakeLiveness::default();
         liveness.set(old_key, SystemTime::now());
 
@@ -1330,7 +1490,7 @@ mod tests {
 
         // A re-login: the request still carries a valid pointer cookie for
         // the old session.
-        let req = request_with_pointer(&store.pointer_cookie_headers(old_key).await.unwrap());
+        let req = request_cookies(&store.pointer_cookie_headers(old_key).await.unwrap());
         let (new_session, _cookies) = store
             .create(
                 completed_with_email("a@example.com"),
@@ -1340,19 +1500,84 @@ mod tests {
             .await
             .unwrap();
 
-        let records = external.records.lock().unwrap();
         assert!(
-            !records.contains_key(&old_key),
+            !external.contains(old_key),
             "superseded record must be deleted, not orphaned"
         );
         assert!(
-            records.contains_key(&new_session.persisted.session_key),
+            external.contains(new_session.persisted.session_key),
             "new record inserted"
         );
-        drop(records);
         assert!(
             liveness.get(old_key).is_none(),
             "superseded liveness entry cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_insert_preserves_the_superseded_session() {
+        let old = test_session();
+        let old_key = old.persisted.session_key;
+        let external = MapStore::default();
+        external.seed(&old);
+        let store = StoreBackedSessionStore::builder()
+            .external(external.clone())
+            .sealer(test_sealer().await)
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .build();
+        let request = request_cookies(&store.pointer_cookie_headers(old_key).await.unwrap());
+        external.set_fail_inserts(true);
+
+        let result = store
+            .create(
+                completed_with_email("a@example.com"),
+                Duration::from_hours(1),
+                &request,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(external.len(), 1);
+        assert!(external.contains(old_key));
+    }
+
+    #[tokio::test]
+    async fn failed_superseded_delete_preserves_its_liveness_entry() {
+        let old = test_session();
+        let old_key = old.persisted.session_key;
+        let external = MapStore::default();
+        external.seed(&old);
+        external.set_fail_deletes(true);
+        let liveness = FakeLiveness::default();
+        let last_active = SystemTime::now() - Duration::from_hours(1);
+        liveness.set(old_key, last_active);
+        let store = StoreBackedSessionStore::builder()
+            .external(external.clone())
+            .sealer(test_sealer().await)
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .build()
+            .with_liveness(liveness.clone(), LivenessConfig::default());
+        let request = request_cookies(&store.pointer_cookie_headers(old_key).await.unwrap());
+
+        store
+            .create(
+                completed_with_email("a@example.com"),
+                Duration::from_hours(1),
+                &request,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            external.contains(old_key),
+            "the failed delete leaves the record"
+        );
+        assert_eq!(
+            liveness.get(old_key),
+            Some(last_active),
+            "the old idle history must survive while its record may still exist"
         );
     }
 
@@ -1361,7 +1586,7 @@ mod tests {
         let unrelated = test_session();
         let unrelated_key = unrelated.persisted.session_key;
         let external = MapStore::default();
-        external.insert(&unrelated).await.unwrap();
+        external.seed(&unrelated);
 
         let store = StoreBackedSessionStore::builder()
             .external(external.clone())
@@ -1380,11 +1605,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            external
-                .records
-                .lock()
-                .unwrap()
-                .contains_key(&unrelated_key),
+            external.contains(unrelated_key),
             "a login without a pointer cookie must not delete anything"
         );
     }
@@ -1638,8 +1859,38 @@ mod tests {
         let recovered = store
             .read_pointer_cookie(&req_headers)
             .await
+            .into_valid()
             .expect("decodes");
         assert_eq!(recovered, original_key);
+    }
+
+    #[tokio::test]
+    async fn pointer_cookie_uses_remaining_absolute_lifetime() {
+        let session = test_session();
+        let store = StoreBackedSessionStore::builder()
+            .external(MinimalExternalStore(session.clone()))
+            .sealer(test_sealer().await)
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .build();
+        let deadline = SystemTime::now() + Duration::from_millis(1_500);
+
+        let headers = store
+            .pointer_cookie_headers_with_deadline(session.persisted.session_key, Some(deadline))
+            .await
+            .unwrap();
+        let pointer = headers[0].to_str().unwrap();
+        let max_age = pointer
+            .split(';')
+            .find_map(|attribute| attribute.trim().strip_prefix("Max-Age="))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+
+        assert!(
+            (1..=2).contains(&max_age),
+            "remaining Max-Age was {max_age}"
+        );
     }
 
     #[tokio::test]
@@ -1710,7 +1961,10 @@ mod tests {
             .parse()
             .unwrap(),
         );
-        assert_eq!(store.read_pointer_cookie(&req).await, Some(original_key));
+        assert_eq!(
+            store.read_pointer_cookie(&req).await.into_valid(),
+            Some(original_key)
+        );
     }
 
     // ── build_with_claims ─────────────────────────────────────────────────
@@ -1754,22 +2008,27 @@ mod tests {
         type Version = i32;
         type Error = Infallible;
 
-        async fn insert(&self, s: &EnrichedStoreSession) -> Result<(), Infallible> {
+        async fn insert(&self, s: &EnrichedStoreSession, _: SystemTime) -> Result<(), Infallible> {
             *self.0.lock().unwrap() = Some(s.email.clone());
             Ok(())
         }
         async fn load(&self, _: Uuid) -> Result<Option<(EnrichedStoreSession, i32)>, Infallible> {
             Ok(None)
         }
-        async fn save(&self, _: &EnrichedStoreSession) -> Result<(), Infallible> {
-            Ok(())
+        async fn save(
+            &self,
+            _: &EnrichedStoreSession,
+            _: SystemTime,
+        ) -> Result<SaveOutcome, Infallible> {
+            Ok(SaveOutcome::Committed)
         }
         async fn compare_and_swap(
             &self,
             _: &EnrichedStoreSession,
             _: i32,
+            _: SystemTime,
         ) -> Result<SaveOutcome, Infallible> {
-            Ok(SaveOutcome::Committed)
+            Ok(SaveOutcome::Missing)
         }
         async fn delete(&self, _: &EnrichedStoreSession) -> Result<(), Infallible> {
             Ok(())
@@ -1886,7 +2145,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_clears_pointer_and_kid_sidecar() {
+    async fn termination_clears_pointer_and_kid_sidecar() {
         let session = test_session();
         let store = StoreBackedSessionStore::builder()
             .external(MinimalExternalStore(session.clone()))
@@ -1895,7 +2154,8 @@ mod tests {
             .cookie_path("/".parse().unwrap())
             .build();
 
-        let clears = store.delete_session(&session).await.unwrap();
+        store.revoke_session(&session).await.unwrap();
+        let clears = store.clear_session_cookie_headers();
         let bare = clears.iter().any(|h| {
             let s = h.to_str().unwrap();
             s.starts_with("__Host-session=;") && s.contains("Max-Age=0")
@@ -2133,7 +2393,15 @@ mod tests {
                 .cookie_name("session".parse().unwrap())
                 .cookie_path("/".parse().unwrap())
                 .build();
-            store.apply_session_policy(true, None, Some("tenant-b"));
+            store
+                .apply_session_policy(&SessionPolicy::new(
+                    true,
+                    None,
+                    Some("tenant-b"),
+                    "/".parse().unwrap(),
+                    None,
+                ))
+                .unwrap();
             store
                 .pointer_cookie_headers(session.persisted.session_key)
                 .await
@@ -2161,14 +2429,14 @@ mod tests {
             let old = test_session();
             let old_key = old.persisted.session_key;
             let external = MapStore::default();
-            external.insert(&old).await.unwrap();
+            external.seed(&old);
             let store = StoreBackedSessionStore::builder()
                 .external(external)
                 .sealer(test_sealer().await)
                 .cookie_name("session".parse().unwrap())
                 .cookie_path("/".parse().unwrap())
                 .build();
-            let req = request_with_pointer(&store.pointer_cookie_headers(old_key).await.unwrap());
+            let req = request_cookies(&store.pointer_cookie_headers(old_key).await.unwrap());
             store
                 .create(
                     completed_with_email("a@example.com"),

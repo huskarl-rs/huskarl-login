@@ -53,8 +53,8 @@ pub trait LivenessStore: MaybeSendSync {
 #[non_exhaustive]
 pub struct LivenessConfig {
     /// Kill the session after this much inactivity. Defaults to
-    /// [`DEFAULT_IDLE_TIMEOUT`]. Also the activity window for record TTLs —
-    /// see [`Session::storage_deadline`](crate::Session::storage_deadline).
+    /// [`DEFAULT_IDLE_TIMEOUT`]. Also the activity window from which the
+    /// driver derives external-store record deadlines.
     pub idle_timeout: Duration,
 
     /// Minimum interval between liveness writes for an active session. Must be

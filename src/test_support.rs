@@ -7,12 +7,16 @@
 use http::{HeaderMap, HeaderName, HeaderValue};
 use huskarl_crypto_native::aead::AesGcmKey;
 
-use crate::core::{
-    Error,
-    crypto::seal::AeadV1Sealer,
-    jwk::OctBytes,
-    platform::MaybeSendBoxFuture,
-    secrets::{Secret, SecretBytes, SecretOutput},
+pub(crate) use crate::testing::InMemoryExternalSessionStore as RevocableExternalStore;
+use crate::{
+    SessionPolicy,
+    core::{
+        Error,
+        crypto::seal::AeadV1Sealer,
+        jwk::OctBytes,
+        platform::MaybeSendBoxFuture,
+        secrets::{Secret, SecretBytes, SecretOutput},
+    },
 };
 
 /// A [`Secret`] yielding fixed bytes and no key identity.
@@ -80,6 +84,29 @@ pub(crate) fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
         );
     }
     map
+}
+
+/// Turns response `Set-Cookie` values into the `Cookie` header a browser would
+/// send back, omitting clears and stripping response-only attributes.
+pub(crate) fn request_cookies(set_cookies: &[HeaderValue]) -> HeaderMap {
+    let pairs = set_cookies
+        .iter()
+        .filter_map(|header| {
+            let pair = header.to_str().ok()?.split(';').next()?;
+            let (_, value) = pair.split_once('=')?;
+            (!value.is_empty()).then(|| pair.to_owned())
+        })
+        .collect::<Vec<_>>();
+    if pairs.is_empty() {
+        HeaderMap::new()
+    } else {
+        header_map(&[(http::header::COOKIE.as_str(), &pairs.join("; "))])
+    }
+}
+
+/// Engine session policy with the common secure, root-scoped test defaults.
+pub(crate) fn test_session_policy(max_lifetime: Option<std::time::Duration>) -> SessionPolicy {
+    SessionPolicy::new(true, max_lifetime, None, crate::RoutePath::root(), None)
 }
 
 /// Counters captured by [`with_metrics`]: `(name, sorted (label, value)

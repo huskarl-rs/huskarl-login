@@ -7,9 +7,9 @@
 // Tests legitimately unwrap/expect/panic; the denies above guard library code only.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 #![warn(clippy::pedantic)]
-#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs_huskarl_login, feature(doc_cfg))]
 
-//! Framework-neutral OAuth 2.0 and OpenID Connect login for Rust services.
+//! Framework-neutral OAuth 2.0 and `OpenID` Connect login for Rust services.
 //!
 //! `huskarl-login` contains the framework-independent policy and state machine
 //! shared by adapters such as `huskarl-axum` and `huskarl-pingora`. The central
@@ -50,7 +50,7 @@
 //! markers, allowing the crate to compile for native, `wasm32`, and WASI
 //! targets.
 
-#[cfg(any(doc, docsrs))]
+#[cfg(any(doc, doctest))]
 pub mod _docs;
 
 pub use huskarl as client;
@@ -62,6 +62,9 @@ pub mod liveness;
 pub mod metrics;
 pub mod prelude;
 pub mod session;
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(docsrs_huskarl_login, doc(cfg(feature = "test-support")))]
+pub mod testing;
 pub mod url;
 
 mod completed_login;
@@ -86,11 +89,15 @@ pub use cookie::{CookieName, InvalidCookieName};
 pub use cookie_session::{
     CookiePayload, CookieSession, CookieSessionStore, CookieSessionStoreBuilder,
 };
-pub use engine::{DefaultPersistFailurePolicy, PersistFailurePolicy, TeardownReason};
+pub use engine::{
+    DefaultPersistFailurePolicy, PersistFailurePolicy, TeardownReason, TerminateSessionOutcome,
+};
 pub use enrich::{NoEnrichment, SessionEnricher};
 pub use error_page::{DefaultErrorPage, ErrorPage, ErrorPageResponse};
 pub use liveness::{DEFAULT_IDLE_TIMEOUT, LivenessConfig, LivenessStore, LivenessVerdict};
-pub use session::{SessionDriver, SessionError, SessionErrorKind};
+pub use session::{
+    DriverLoad, InvalidSessionReason, SessionDriver, SessionError, SessionErrorKind, SessionPolicy,
+};
 pub use session_state::{Session, SessionState};
 pub use store_session::{
     ExternalSessionStore, LoadOutcome, PersistedSession, PersistedSessionState, SaveOutcome,

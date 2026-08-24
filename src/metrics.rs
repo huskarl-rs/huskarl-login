@@ -7,11 +7,11 @@
 //! | `huskarl.login.start` | `outcome`: `ok`, `error` |
 //! | `huskarl.login.complete` | `outcome`: `ok`, `already_authenticated`, `as_denied`, `invalid_request`, `state_invalid`, `token_exchange_failed`, `session_create_failed`; `error`: the normalized AS error code for `as_denied` (RFC 6749 / OIDC Core codes, else `other`), `none` otherwise |
 //! | `huskarl.session.refresh` | `outcome`: `ok`, `no_refresh_token`, `failed`, `failed_retained`, `failed_unavailable` |
-//! | `huskarl.session.teardown` | `reason`: [`TeardownReason`] values (`max_lifetime`, `idle_timeout`, …) |
+//! | `huskarl.session.teardown` | `reason`: [`TeardownReason`] values (`max_lifetime`, `idle_timeout`, …); `invalid_reason`: the [`InvalidSessionReason`] value when `reason` is `invalid_session`, `none` otherwise |
 //! | `huskarl.session.superseded_delete` | `outcome`: `deleted`, `not_found`, `load_failed`, `delete_failed` |
 //! | `huskarl.session.liveness_failure` | `op`: `read` (failed open), `touch`, `clear` |
 //! | `huskarl.session_cookie.encrypt` | `cookie`: cookie name; `kid`: active key id, `none` if the key has no identity |
-//! | `huskarl.session_cookie.decrypt` | `cookie`: cookie name; `kid`: matched key id, `unknown` (unmatched sidecar — attacker-suppliable values never become labels), `none` (no sidecar); `outcome`: `ok`, `bad_encoding`, `decrypt_failed`, `payload_invalid` |
+//! | `huskarl.session_cookie.decrypt` | `cookie`: cookie name; `outcome`: `ok`, `bad_encoding`, `decrypt_failed`, `payload_invalid` |
 //!
 //! When `metrics_name` is set on the [`LoginEngine`] builder, every counter
 //! additionally carries a `name` label with that value — it tells engine
@@ -19,6 +19,7 @@
 //! `huskarl.aead.*` uses for cipher instances).
 //!
 //! [`TeardownReason`]: crate::engine::TeardownReason
+//! [`InvalidSessionReason`]: crate::InvalidSessionReason
 //! [`LoginEngine`]: crate::engine::LoginEngine
 
 /// Increments counter `name` with `labels`, appending the instance `name`

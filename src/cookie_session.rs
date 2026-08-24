@@ -16,15 +16,19 @@ use snafu::Snafu;
 use crate::{
     completed_login::CompletedLogin,
     config::RoutePath,
-    cookie::{
-        CookieName, CookieSealer, DEFAULT_COOKIE_MAX_AGE, decode_payload, encode_payload,
-        get_kid_cookie, kid_cookie_name, unseal_with_kid_fallback,
+    cookie::{CookieName, CookieSealer, DEFAULT_COOKIE_MAX_AGE, decode_payload, encode_payload},
+    core::{
+        crypto::seal::AeadSealerUnsealer,
+        platform::{MaybeSendSync, SystemTime},
+        prelude::*,
     },
-    core::{crypto::seal::AeadSealerUnsealer, platform::MaybeSendSync, prelude::*},
     enrich::{NoEnrichment, SessionEnricher},
     metrics::DecryptResult,
-    session::{SessionDriver, SessionError, SessionErrorKind},
-    session_state::{Session, SessionState},
+    session::{
+        DriverLoad, InvalidSessionReason, SessionDriver, SessionError, SessionErrorKind,
+        SessionPolicy,
+    },
+    session_state::{Session, SessionState, bounded_time_add},
 };
 
 const CHUNK_SIZE: usize = 3800;
@@ -34,6 +38,11 @@ const CHUNK_SIZE: usize = 3800;
 /// against common 8–16 KB request-header limits (nginx and Apache default to
 /// 8 KB, Node to 16 KB in total).
 const DEFAULT_MAX_CHUNKS: usize = 2;
+
+/// Maximum request-supplied chunk slots cleared in one response beyond the
+/// configured budget. This bounds request-to-response header amplification
+/// while still removing legacy slots incrementally after `max_chunks` shrinks.
+const MAX_OBSERVED_LEGACY_CHUNK_CLEARS: usize = 16;
 
 /// [`CookieSessionStore`] refused to save a session whose sealed payload
 /// exceeds the configured chunk budget.
@@ -93,16 +102,17 @@ impl From<SessionState> for CookieSession {
 /// Stores the complete encrypted session in browser cookies.
 ///
 /// The type parameter `C` is the [`CookiePayload`] stored in the cookie,
-/// defaulting to [`CookieSession`]. Decryption failure is treated as "no
-/// session". The `Secure` attribute, the `__Host-`/`__Secure-` prefix, and the
-/// `Max-Age` clamp to the session-lifetime cap are stamped on by the engine
-/// via
+/// defaulting to [`CookieSession`]. Decryption failure is classified as an
+/// invalid presented session so the engine clears its cookies. The `Secure`
+/// attribute, the `__Host-`/`__Secure-` prefix, and the `Max-Age` clamp to the
+/// session-lifetime cap are stamped on by the engine via
 /// [`SessionDriver::apply_session_policy`],
 /// not configured here.
 ///
-/// Cookie sessions are stateless: [`delete`](SessionDriver::delete) only
-/// clears the cooperating browser's cookie (no server-side revocation, no idle
-/// timeout); a stolen copy stays valid until the
+/// Cookie sessions are stateless: [`SessionDriver::revoke`] is a no-op and
+/// [`SessionDriver::clear_session_cookies`] only clears the cooperating
+/// browser's cookie (no server-side revocation, no idle timeout); a stolen copy
+/// stays valid until the
 /// [`SessionLifetime::Bounded`](crate::SessionLifetime) cap elapses. Prefer a
 /// bounded lifetime with this store — see [the session
 /// model](crate::_docs::explanation::session_model). For revocation, use
@@ -134,7 +144,8 @@ impl<C> CookieSessionStore<C> {
         cookie_name: CookieName,
         /// Cookie `Path` scope. Defaults to `/` — which also enables the
         /// strongest `__Host-` cookie prefix; set a narrower path only
-        /// deliberately.
+        /// deliberately. It must cover the configured logout route, but need
+        /// not cover the callback route.
         #[builder(default = RoutePath::root())]
         cookie_path: RoutePath,
         /// Cookie `Max-Age`; defaults to 400 days. The engine clamps it to the
@@ -150,8 +161,10 @@ impl<C> CookieSessionStore<C> {
         /// limits, past which servers reject requests *before* any code that
         /// could clear the cookies runs, locking the client out for the
         /// cookies' lifetime. Raise this only if every proxy in front of the
-        /// app accepts larger request headers; if sessions routinely need
-        /// more than one chunk, prefer
+        /// app accepts larger request headers; every save also emits one
+        /// `Max-Age=0` clear for each unused configured slot, so a larger
+        /// budget increases response-header size even for small sessions. If
+        /// sessions routinely need more than one chunk, prefer
         /// [`StoreBackedSessionStore`](crate::StoreBackedSessionStore).
         /// Values below 1 are treated as 1.
         #[builder(default = DEFAULT_MAX_CHUNKS)]
@@ -203,30 +216,29 @@ impl<C, S: cookie_store_builder::IsComplete> CookieSessionStoreBuilder<C, S> {
 // -- Internal methods --
 
 impl<C: CookiePayload> CookieSessionStore<C> {
-    pub(crate) async fn load_session(&self, headers: &http::HeaderMap) -> Option<C> {
+    pub(crate) async fn load_session(&self, headers: &http::HeaderMap) -> DriverLoad<C> {
         let chunks = self.collect_session_chunks(headers);
-        let raw_encoded = reassemble_chunks(&chunks)?;
-
-        // A session-cookie-shaped value is present — record the outcome.
-        let kid = get_kid_cookie(headers, &self.sealer.cookie_name);
-
-        let Ok(bundle) = URL_SAFE_NO_PAD.decode(&raw_encoded) else {
-            self.sealer.record_decrypt(&DecryptResult::BadEncoding);
-            return None;
+        if chunks.is_empty() {
+            return DriverLoad::Absent;
+        }
+        let Some(raw_encoded) = reassemble_chunks(&chunks) else {
+            return DriverLoad::Invalid(InvalidSessionReason::IncompleteChunks);
         };
-        let aad = self.sealer.aad("session");
-        let Some(plaintext) =
-            unseal_with_kid_fallback(&self.sealer.cipher, kid.as_deref(), &bundle, &aad).await
-        else {
-            self.sealer.record_decrypt(&DecryptResult::DecryptFailed);
-            return None;
+
+        let plaintext = match self
+            .sealer
+            .unseal_cookie_value(headers, &raw_encoded, "session")
+            .await
+        {
+            Ok(plaintext) => plaintext,
+            Err(reason) => return DriverLoad::Invalid(reason),
         };
         if let Ok(session) = decode_payload(&plaintext) {
             self.sealer.record_decrypt(&DecryptResult::Ok);
-            Some(session)
+            DriverLoad::Valid(session)
         } else {
             self.sealer.record_decrypt(&DecryptResult::PayloadInvalid);
-            None
+            DriverLoad::Invalid(InvalidSessionReason::InvalidPayload)
         }
     }
 
@@ -313,13 +325,34 @@ impl<C: CookiePayload> CookieSessionStore<C> {
         let kid = sealed.kid;
         self.sealer.record_encrypt(kid.as_deref());
 
-        let attrs = self.sealer.cookie_attrs();
+        let now = SystemTime::now();
+        let configured_deadline = self
+            .max_lifetime
+            .map(|cap| bounded_time_add(session.created_at(), cap));
+        let deadline = match (session.expire_at(), configured_deadline) {
+            (Some(frozen), Some(configured)) => Some(frozen.min(configured)),
+            (frozen, configured) => frozen.or(configured),
+        };
+        let attrs = if let Some(deadline) = deadline {
+            let remaining = deadline
+                .duration_since(now)
+                .map_err(|_| SessionError::from(SessionErrorKind::Gone))?;
+            if remaining == Duration::ZERO {
+                return Err(SessionErrorKind::Gone.into());
+            }
+            self.sealer.cookie_attrs_with_max_age(remaining)
+        } else {
+            self.sealer.cookie_attrs()
+        };
         let mut headers = Vec::with_capacity(num_chunks + 2);
         for (i, chunk) in chunks.iter().enumerate() {
             headers.push(self.build_chunk_header(i, chunk, &attrs)?);
         }
-        self.append_clears_for_leftover_chunks(&mut headers, num_chunks, request_headers);
-        headers.push(self.sealer.build_kid_header(kid.as_deref())?);
+        self.append_chunk_clears(&mut headers, num_chunks, request_headers);
+        headers.push(
+            self.sealer
+                .build_kid_header_with_attrs(kid.as_deref(), &attrs)?,
+        );
         Ok(headers)
     }
 
@@ -334,45 +367,52 @@ impl<C: CookiePayload> CookieSessionStore<C> {
             .map_err(|e| SessionError::new(SessionErrorKind::Encoding, e))
     }
 
-    /// Appends `Max-Age=0` clears for every chunk slot the browser sent that
-    /// this save will not overwrite (indices `>= num_chunks`).
-    fn append_clears_for_leftover_chunks(
+    /// Appends clears for configured chunk slots and a bounded batch of
+    /// observed legacy slots at or above `first_index`. Clearing the full
+    /// configured tail makes saves deterministic even when responses arrive
+    /// out of order; bounding request-controlled extras prevents header
+    /// amplification. Remaining legacy slots are cleared on later requests.
+    fn append_chunk_clears(
         &self,
         headers: &mut Vec<HeaderValue>,
-        num_chunks: usize,
+        first_index: usize,
         request_headers: &http::HeaderMap,
     ) {
-        let clear_attrs = format!("{}; Max-Age=0", self.sealer.base_cookie_attrs());
-        let cookie_name = &self.sealer.cookie_name;
+        let mut indices = (first_index..self.max_chunks).collect::<std::collections::BTreeSet<_>>();
+        let mut legacy_indices = std::collections::BTreeSet::new();
         self.for_each_request_chunk_index(request_headers, |idx| {
-            if idx >= num_chunks
-                && let Ok(v) =
-                    HeaderValue::from_str(&format!("{cookie_name}.{idx}=; {clear_attrs}"))
-            {
-                headers.push(v);
+            if idx >= first_index && idx >= self.max_chunks {
+                legacy_indices.insert(idx);
             }
         });
+        indices.extend(
+            legacy_indices
+                .into_iter()
+                .take(MAX_OBSERVED_LEGACY_CHUNK_CLEARS),
+        );
+        for idx in indices {
+            let name = format!("{}.{idx}", self.sealer.cookie_name);
+            if let Ok(header) = self.sealer.build_clear_header(&name) {
+                headers.push(header);
+            }
+        }
     }
 
-    pub(crate) fn delete_headers(&self, request_headers: &http::HeaderMap) -> Vec<HeaderValue> {
-        let clear_attrs = format!("{}; Max-Age=0", self.sealer.base_cookie_attrs());
-        let cookie_name = &self.sealer.cookie_name;
+    pub(crate) fn clear_session_cookie_headers(
+        &self,
+        request_headers: &http::HeaderMap,
+    ) -> Vec<HeaderValue> {
         let mut headers = Vec::new();
         // Clear the kid sidecar unconditionally — cheap and avoids leaving a
         // stale hint that would just degrade the next request to trial-decrypt
         // against a session that no longer exists.
-        let kid_name = kid_cookie_name(cookie_name);
-        if let Ok(v) = HeaderValue::from_str(&format!("{kid_name}=; {clear_attrs}")) {
-            headers.push(v);
+        if let Ok(header) = self.sealer.build_kid_header(None) {
+            headers.push(header);
         }
-        // Clear every chunk slot the browser currently has — we don't have
-        // a fixed cap to sweep, but we don't need one: the request tells us
-        // exactly which slots exist.
-        self.for_each_request_chunk_index(request_headers, |idx| {
-            if let Ok(v) = HeaderValue::from_str(&format!("{cookie_name}.{idx}=; {clear_attrs}")) {
-                headers.push(v);
-            }
-        });
+        // Clear every configured slot even when the request route could not see
+        // the cookie, plus a bounded batch of legacy slots observed after a
+        // max_chunks change.
+        self.append_chunk_clears(&mut headers, 0, request_headers);
         headers
     }
 }
@@ -383,19 +423,15 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
     type SessionType = C;
     type LoadError = std::convert::Infallible;
 
-    fn apply_session_policy(
-        &mut self,
-        secure: bool,
-        max_lifetime: Option<Duration>,
-        metrics_name: Option<&str>,
-    ) {
-        self.sealer.apply_secure(secure);
-        self.sealer.metrics_name = metrics_name.map(str::to_owned);
-        if let Some(max) = max_lifetime {
-            self.sealer.clamp_max_age(max);
-        }
+    fn apply_session_policy(&mut self, policy: &SessionPolicy) -> Result<(), crate::ConfigError> {
+        // Callback visibility is optional for stateless sessions: the callback
+        // can set a cookie scoped elsewhere, and there is no old server record
+        // to revoke. It only loses the friendly already-authenticated fallback.
+        policy.validate_logout_cookie_path(self.sealer.cookie_path())?;
+        self.sealer.apply_session_policy(policy);
         // Retained to freeze `SessionState::expire_at` into new sessions.
-        self.max_lifetime = max_lifetime;
+        self.max_lifetime = policy.max_lifetime();
+        Ok(())
     }
 
     fn session_sealer(&self) -> Arc<dyn AeadSealerUnsealer> {
@@ -403,7 +439,7 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
     }
 
     fn clear_session_cookies(&self, headers: &http::HeaderMap) -> Vec<HeaderValue> {
-        self.delete_headers(headers)
+        self.clear_session_cookie_headers(headers)
     }
 
     async fn create(
@@ -418,7 +454,10 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
         Ok((session, cookies))
     }
 
-    async fn load(&self, headers: &http::HeaderMap) -> Result<Option<C>, std::convert::Infallible> {
+    async fn load(
+        &self,
+        headers: &http::HeaderMap,
+    ) -> Result<DriverLoad<C>, std::convert::Infallible> {
         Ok(self.load_session(headers).await)
     }
 
@@ -435,15 +474,10 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
     // `SessionDriver`, so idle timeout is not enforced and activity is not
     // recorded. The absolute lifetime bound (from `created_at`) still applies.
 
-    // Clearing chunk cookies is pure header construction with no I/O; the
-    // `async` is only here to satisfy the `SessionDriver` trait signature.
+    // Cookie sessions have no authoritative server-side state to revoke.
     #[allow(clippy::unused_async_trait_impl)]
-    async fn delete(
-        &self,
-        _session: &C,
-        headers: &http::HeaderMap,
-    ) -> Result<Vec<HeaderValue>, SessionError> {
-        Ok(self.delete_headers(headers))
+    async fn revoke(&self, _session: &C) -> Result<(), SessionError> {
+        Ok(())
     }
 }
 
@@ -469,7 +503,7 @@ fn reassemble_chunks(chunks: &std::collections::HashMap<usize, String>) -> Optio
         raw_encoded.push_str(chunk);
         i += 1;
     }
-    Some(raw_encoded)
+    (i == chunks.len()).then_some(raw_encoded)
 }
 
 #[cfg(test)]
@@ -481,11 +515,15 @@ mod tests {
 
     use super::*;
     use crate::{
+        ConfigError,
         config::InvalidRoutePath,
-        cookie::{InvalidCookieName, encode_kid},
+        cookie::{InvalidCookieName, encode_kid, get_kid_cookie, unseal_with_kid_fallback},
         core::{crypto::seal::AeadV1Sealer, platform::MaybeSendBoxFuture},
         session_state::SessionState,
-        test_support::{aes_key_with_kid, test_cipher, test_sealer, test_sealer_with_kid},
+        test_support::{
+            aes_key_with_kid, request_cookies, test_cipher, test_sealer, test_sealer_with_kid,
+            test_session_policy,
+        },
     };
 
     // ── Cipher / fixtures ─────────────────────────────────────────────────
@@ -524,24 +562,71 @@ mod tests {
         assert!(matches!(result, Err(InvalidCookieName { .. })));
     }
 
-    /// Builds a request `Cookie:` header from the `Set-Cookie` values a save
-    /// produced, stripping attributes.
-    fn request_cookies_from_set_cookies(set_cookies: &[HeaderValue]) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        let mut pairs = Vec::new();
-        for v in set_cookies {
-            let s = v.to_str().unwrap();
-            // Skip Max-Age=0 clears (empty value).
-            let pair = s.split(';').next().unwrap();
-            let (_name, value) = pair.split_once('=').unwrap();
-            if !value.is_empty() {
-                pairs.push(pair.to_owned());
+    /// Minimal browser jar for response-order tests: `Set-Cookie` replaces a
+    /// name and an empty `Max-Age=0` value removes it. All fixtures use one
+    /// origin and path; path visibility is covered separately by policy tests.
+    fn apply_to_jar(
+        jar: &mut std::collections::BTreeMap<String, String>,
+        set_cookies: &[HeaderValue],
+    ) {
+        for value in set_cookies {
+            let raw = value.to_str().unwrap();
+            let pair = raw.split(';').next().unwrap();
+            let (name, value) = pair.split_once('=').unwrap();
+            if value.is_empty() && raw.contains("Max-Age=0") {
+                jar.remove(name);
+            } else {
+                jar.insert(name.to_owned(), value.to_owned());
             }
         }
-        if !pairs.is_empty() {
-            headers.insert(http::header::COOKIE, pairs.join("; ").parse().unwrap());
+    }
+
+    fn request_from_jar(jar: &std::collections::BTreeMap<String, String>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if !jar.is_empty() {
+            let value = jar
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            headers.insert(http::header::COOKIE, value.parse().unwrap());
         }
         headers
+    }
+
+    #[tokio::test]
+    async fn session_policy_allows_callback_outside_path_but_rejects_logout() {
+        let mut store = CookieSessionStore::<CookieSession>::builder()
+            .sealer(test_sealer().await)
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/app".parse().unwrap())
+            .build();
+        store
+            .apply_session_policy(&SessionPolicy::new(
+                true,
+                None,
+                None,
+                "/callback".parse().unwrap(),
+                None,
+            ))
+            .unwrap();
+
+        let logout_error = store
+            .apply_session_policy(&SessionPolicy::new(
+                true,
+                None,
+                None,
+                "/app/callback".parse().unwrap(),
+                Some("/logout".parse().unwrap()),
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            logout_error,
+            ConfigError::InvalidSessionCookiePath {
+                route: "logout",
+                ..
+            }
+        ));
     }
 
     /// A request `Cookie:` header carrying chunk slots `.0` through `.{n-1}`.
@@ -609,7 +694,11 @@ mod tests {
         // 400-day Max-Age must come down to it so no cookie outlives the
         // session.
         let mut store = test_store().await;
-        SessionDriver::apply_session_policy(&mut store, true, Some(Duration::from_hours(8)), None);
+        SessionDriver::apply_session_policy(
+            &mut store,
+            &test_session_policy(Some(Duration::from_hours(8))),
+        )
+        .unwrap();
         let cookies = store
             .save_session(&CookieSession(test_state()), &HeaderMap::new())
             .await
@@ -622,6 +711,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_uses_remaining_absolute_lifetime_not_the_original_cap() {
+        let now = SystemTime::now();
+        let created_at = now - Duration::from_hours(2);
+        let state = SessionState::builder()
+            .token_expiry(now + Duration::from_hours(1))
+            .created_at(created_at)
+            .expire_at(created_at + Duration::from_hours(8))
+            .build();
+        let mut store = test_store().await;
+        store
+            .apply_session_policy(&test_session_policy(Some(Duration::from_hours(8))))
+            .unwrap();
+
+        let cookies = store
+            .save_session(&CookieSession(state), &HeaderMap::new())
+            .await
+            .unwrap();
+        let chunk = cookies[0].to_str().unwrap();
+        let max_age = chunk
+            .split(';')
+            .find_map(|attr| attr.trim().strip_prefix("Max-Age="))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(
+            (6 * 3600 - 1..=6 * 3600).contains(&max_age),
+            "remaining Max-Age was {max_age}"
+        );
+    }
+
+    #[tokio::test]
     async fn session_policy_keeps_shorter_configured_max_age() {
         // The clamp only ever lowers: an explicitly shorter max_age wins.
         let mut store = CookieSessionStore::<CookieSession>::builder()
@@ -630,7 +750,11 @@ mod tests {
             .cookie_path("/".parse().unwrap())
             .max_age(Duration::from_hours(1))
             .build();
-        SessionDriver::apply_session_policy(&mut store, true, Some(Duration::from_hours(8)), None);
+        SessionDriver::apply_session_policy(
+            &mut store,
+            &test_session_policy(Some(Duration::from_hours(8))),
+        )
+        .unwrap();
         let cookies = store
             .save_session(&CookieSession(test_state()), &HeaderMap::new())
             .await
@@ -655,7 +779,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_emits_no_chunk_clears_when_request_has_none() {
+    async fn save_clears_every_unused_configured_slot() {
         let store = test_store().await;
         let session = CookieSession(test_state());
         let cookies = store
@@ -675,8 +799,8 @@ mod tests {
             })
             .count();
         assert_eq!(
-            chunk_clears, 0,
-            "no chunk slots to clear without prior chunks"
+            chunk_clears, 1,
+            "the unused configured slot must be cleared even when unseen"
         );
     }
 
@@ -712,7 +836,7 @@ mod tests {
             .save_session(&session, &HeaderMap::new())
             .await
             .unwrap();
-        let req_headers = request_cookies_from_set_cookies(&set_cookies);
+        let req_headers = request_cookies(&set_cookies);
         // Sanity: the kid sidecar made it into the simulated request.
         assert_eq!(
             get_kid_cookie(&req_headers, "__Host-huskarl_session").as_deref(),
@@ -720,7 +844,7 @@ mod tests {
         );
         let loaded = store.load_session(&req_headers).await;
         assert!(
-            loaded.is_some(),
+            matches!(loaded, DriverLoad::Valid(_)),
             "session should load with kid sidecar present"
         );
     }
@@ -740,7 +864,7 @@ mod tests {
             .save_session(&session, &HeaderMap::new())
             .await
             .unwrap();
-        let mut req_headers = request_cookies_from_set_cookies(&set_cookies);
+        let mut req_headers = request_cookies(&set_cookies);
         // Overwrite the cookie header with chunks + a deliberately bad kid.
         let existing = req_headers
             .get(http::header::COOKIE)
@@ -756,7 +880,10 @@ mod tests {
             .collect();
         let combined = format!("{}; __Host-huskarl_session.kid=!!!", stripped.join("; "));
         req_headers.insert(http::header::COOKIE, combined.parse().unwrap());
-        assert!(store.load_session(&req_headers).await.is_some());
+        assert!(matches!(
+            store.load_session(&req_headers).await,
+            DriverLoad::Valid(_)
+        ));
     }
 
     // ── kid sidecar as hint, not filter ───────────────────────────────────
@@ -813,7 +940,7 @@ mod tests {
             .save_session(&CookieSession(test_state()), &HeaderMap::new())
             .await
             .unwrap();
-        let mut req = request_cookies_from_set_cookies(&set_cookies);
+        let mut req = request_cookies(&set_cookies);
         // Sanity: the save stamped the real sealing key's identity.
         assert_eq!(
             get_kid_cookie(&req, "__Host-huskarl_session").as_deref(),
@@ -821,7 +948,7 @@ mod tests {
         );
         override_kid_cookie(&mut req, &encode_kid("v1"));
         assert!(
-            store.load_session(&req).await.is_some(),
+            matches!(store.load_session(&req).await, DriverLoad::Valid(_)),
             "wrong-but-configured kid hint must fall back to trial-decrypt"
         );
     }
@@ -836,10 +963,10 @@ mod tests {
             .save_session(&CookieSession(test_state()), &HeaderMap::new())
             .await
             .unwrap();
-        let mut req = request_cookies_from_set_cookies(&set_cookies);
+        let mut req = request_cookies(&set_cookies);
         override_kid_cookie(&mut req, &encode_kid("v9"));
         assert!(
-            store.load_session(&req).await.is_some(),
+            matches!(store.load_session(&req).await, DriverLoad::Valid(_)),
             "unknown kid hint must fall back to trial-decrypt"
         );
     }
@@ -867,7 +994,10 @@ mod tests {
             .parse()
             .unwrap(),
         );
-        assert!(store.load_session(&headers).await.is_none());
+        assert!(matches!(
+            store.load_session(&headers).await,
+            DriverLoad::Invalid(InvalidSessionReason::DecryptionFailed)
+        ));
     }
 
     #[tokio::test]
@@ -1008,10 +1138,11 @@ mod tests {
             .save_session(&session, &HeaderMap::new())
             .await
             .unwrap();
-        let req_headers = request_cookies_from_set_cookies(&set_cookies);
+        let req_headers = request_cookies(&set_cookies);
         let loaded = store
             .load_session(&req_headers)
             .await
+            .into_valid()
             .expect("session loads");
 
         // SessionState serializes timestamps as unix seconds, so compare at
@@ -1038,10 +1169,11 @@ mod tests {
             .save_session(&CookieSession(state), &HeaderMap::new())
             .await
             .unwrap();
-        let req_headers = request_cookies_from_set_cookies(&set_cookies);
+        let req_headers = request_cookies(&set_cookies);
         let loaded = store
             .load_session(&req_headers)
             .await
+            .into_valid()
             .expect("session loads");
 
         let secs = |t: SystemTime| t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
@@ -1065,6 +1197,62 @@ mod tests {
         fn set_state(&mut self, s: SessionState) {
             self.state = s;
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_short_and_long_saves_never_leave_mixed_chunks() {
+        let store = CookieSessionStore::<EnrichedSession>::builder()
+            .sealer(test_sealer().await)
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .max_chunks(2)
+            .build_with_enricher(TestEnricher);
+        let short = EnrichedSession {
+            state: test_state(),
+            email: "short@example.com".to_owned(),
+        };
+        let long = EnrichedSession {
+            state: test_state(),
+            email: "x".repeat(3500),
+        };
+        // Both responses are based on the same one-chunk/empty request, like
+        // two concurrent handlers. The short response must nevertheless clear
+        // slot .1 so response ordering cannot splice two ciphertexts together.
+        let short_headers = store.save_session(&short, &HeaderMap::new()).await.unwrap();
+        let long_headers = store.save_session(&long, &HeaderMap::new()).await.unwrap();
+        let chunk_sets = |headers: &[HeaderValue]| {
+            headers
+                .iter()
+                .filter(|header| {
+                    let value = header.to_str().unwrap();
+                    value.starts_with("__Host-huskarl_session.")
+                        && !value.starts_with("__Host-huskarl_session.kid=")
+                        && !value.contains("Max-Age=0")
+                })
+                .count()
+        };
+        assert_eq!(chunk_sets(&short_headers), 1);
+        assert_eq!(chunk_sets(&long_headers), 2);
+
+        let mut jar = std::collections::BTreeMap::new();
+        apply_to_jar(&mut jar, &long_headers);
+        apply_to_jar(&mut jar, &short_headers);
+        let loaded = store
+            .load_session(&request_from_jar(&jar))
+            .await
+            .into_valid()
+            .expect("long then short leaves the complete short session");
+        assert_eq!(loaded.email, short.email);
+
+        let mut jar = std::collections::BTreeMap::new();
+        apply_to_jar(&mut jar, &short_headers);
+        apply_to_jar(&mut jar, &long_headers);
+        let loaded = store
+            .load_session(&request_from_jar(&jar))
+            .await
+            .into_valid()
+            .expect("short then long leaves the complete long session");
+        assert_eq!(loaded.email, long.email);
     }
 
     /// Stands in for an enricher that awaits its own clients while building
@@ -1107,8 +1295,12 @@ mod tests {
             .save_session(&session, &HeaderMap::new())
             .await
             .unwrap();
-        let req = request_cookies_from_set_cookies(&set_cookies);
-        let loaded = store.load_session(&req).await.expect("session loads");
+        let req = request_cookies(&set_cookies);
+        let loaded = store
+            .load_session(&req)
+            .await
+            .into_valid()
+            .expect("session loads");
         assert_eq!(loaded.email, "user@example.com");
     }
 
@@ -1189,8 +1381,12 @@ mod tests {
 
         // The mapped session round-trips through the cookie the same as any
         // other payload.
-        let req = request_cookies_from_set_cookies(&cookies);
-        let loaded = store.load_session(&req).await.expect("session loads");
+        let req = request_cookies(&cookies);
+        let loaded = store
+            .load_session(&req)
+            .await
+            .into_valid()
+            .expect("session loads");
         assert_eq!(loaded.email, "user@example.com");
     }
 
@@ -1280,8 +1476,12 @@ mod tests {
             .count();
         assert_eq!(chunk_sets, 4);
         // The large payload still round-trips.
-        let req = request_cookies_from_set_cookies(&cookies);
-        let loaded = store.load_session(&req).await.expect("session loads");
+        let req = request_cookies(&cookies);
+        let loaded = store
+            .load_session(&req)
+            .await
+            .into_valid()
+            .expect("session loads");
         assert_eq!(loaded.email.len(), 9000);
     }
 
@@ -1306,26 +1506,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_returns_none_when_no_cookies() {
+    async fn load_is_absent_when_no_cookies() {
         let store = test_store().await;
-        assert!(store.load_session(&HeaderMap::new()).await.is_none());
+        assert!(matches!(
+            store.load_session(&HeaderMap::new()).await,
+            DriverLoad::Absent
+        ));
     }
 
     #[tokio::test]
-    async fn load_returns_none_for_unrelated_cookies() {
+    async fn load_is_absent_for_unrelated_cookies() {
         let store = test_store().await;
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::COOKIE,
             "other=value; another=42".parse().unwrap(),
         );
-        assert!(store.load_session(&headers).await.is_none());
+        assert!(matches!(
+            store.load_session(&headers).await,
+            DriverLoad::Absent
+        ));
     }
 
     #[tokio::test]
-    async fn load_returns_none_when_continuation_chunk_missing() {
-        // Gap between chunks 0 and 2: reassembly stops at chunk 1's gap,
-        // producing only chunk 0's data, which then fails AEAD authentication.
+    async fn load_is_invalid_when_continuation_chunk_missing() {
+        // Gap between chunks 0 and 2 is session-shaped state that the browser
+        // must clear, not an absent session.
         let store = test_store().await;
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1334,11 +1540,14 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        assert!(store.load_session(&headers).await.is_none());
+        assert!(matches!(
+            store.load_session(&headers).await,
+            DriverLoad::Invalid(InvalidSessionReason::IncompleteChunks)
+        ));
     }
 
     #[tokio::test]
-    async fn load_returns_none_when_decryption_fails() {
+    async fn load_is_invalid_when_decryption_fails() {
         let store = test_store().await;
         let mut headers = HeaderMap::new();
         // Valid base64 but won't decrypt under the test cipher.
@@ -1346,16 +1555,19 @@ mod tests {
             http::header::COOKIE,
             "__Host-huskarl_session.0=AAAAAAAAAAAA".parse().unwrap(),
         );
-        assert!(store.load_session(&headers).await.is_none());
+        assert!(matches!(
+            store.load_session(&headers).await,
+            DriverLoad::Invalid(InvalidSessionReason::DecryptionFailed)
+        ));
     }
 
-    // ── delete ────────────────────────────────────────────────────────────
+    // ── browser clearing ──────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn delete_emits_clears_for_every_chunk_slot_the_request_sent() {
+    async fn clearing_emits_clears_for_every_chunk_slot_the_request_sent() {
         let store = test_store().await;
         let req = request_with_chunk_slots(5);
-        let clears = store.delete_headers(&req);
+        let clears = store.clear_session_cookie_headers(&req);
         // Kid sidecar + 5 chunk slots (.0 through .4).
         assert_eq!(clears.len(), 6);
         for c in &clears {
@@ -1376,15 +1588,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_emits_only_kid_clear_when_request_has_no_chunks() {
+    async fn clearing_sweeps_full_configured_budget_without_request_chunks() {
         let store = test_store().await;
-        let clears = store.delete_headers(&HeaderMap::new());
-        assert_eq!(clears.len(), 1);
+        let clears = store.clear_session_cookie_headers(&HeaderMap::new());
+        assert_eq!(clears.len(), 3);
         let kid = clears.iter().any(|c| {
             let s = c.to_str().unwrap();
             s.starts_with("__Host-huskarl_session.kid=;") && s.contains("Max-Age=0")
         });
         assert!(kid, "expected kid sidecar clear");
+        for i in 0..2 {
+            assert!(clears.iter().any(|c| {
+                c.to_str()
+                    .unwrap()
+                    .starts_with(&format!("__Host-huskarl_session.{i}=;"))
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn clearing_bounds_request_controlled_legacy_slots() {
+        let store = test_store().await;
+        let requested = MAX_OBSERVED_LEGACY_CHUNK_CLEARS + 20;
+        let req = request_with_chunk_slots(requested);
+
+        let clears = store.clear_session_cookie_headers(&req);
+
+        // Kid sidecar + the two configured slots + one bounded batch of slots
+        // beyond the configured budget.
+        assert_eq!(
+            clears.len(),
+            1 + DEFAULT_MAX_CHUNKS + MAX_OBSERVED_LEGACY_CHUNK_CLEARS
+        );
+        assert!(clears.iter().any(|header| {
+            header.to_str().unwrap().starts_with(&format!(
+                "__Host-huskarl_session.{}=;",
+                DEFAULT_MAX_CHUNKS + MAX_OBSERVED_LEGACY_CHUNK_CLEARS - 1
+            ))
+        }));
+        assert!(!clears.iter().any(|header| {
+            header.to_str().unwrap().starts_with(&format!(
+                "__Host-huskarl_session.{}=;",
+                DEFAULT_MAX_CHUNKS + MAX_OBSERVED_LEGACY_CHUNK_CLEARS
+            ))
+        }));
     }
 
     // ── parse_chunk_pair ──────────────────────────────────────────────────
@@ -1456,15 +1703,13 @@ mod tests {
     }
 
     #[test]
-    fn reassemble_stops_at_first_gap() {
-        // Chunks 0, 1 present; 2 missing; 3 present. The reader stops at 2,
-        // dropping the orphan chunk 3 (likely a stale leftover from an older
-        // larger session). AEAD on the truncated payload will then fail.
+    fn reassemble_rejects_a_gap() {
+        // A gap is presented session state, but not a coherent ciphertext.
         let mut chunks = std::collections::HashMap::new();
         chunks.insert(0, "c0".to_owned());
         chunks.insert(1, "c1".to_owned());
         chunks.insert(3, "stale".to_owned());
-        assert_eq!(reassemble_chunks(&chunks).as_deref(), Some("c0c1"));
+        assert!(reassemble_chunks(&chunks).is_none());
     }
 
     #[test]
@@ -1605,7 +1850,7 @@ mod tests {
                 .save_session(&CookieSession(test_state()), &HeaderMap::new())
                 .await
                 .unwrap();
-            let req = request_cookies_from_set_cookies(&set_cookies);
+            let req = request_cookies(&set_cookies);
             store.load_session(&req).await;
         });
         // No kid sidecar (identity-less cipher), so kid=none.

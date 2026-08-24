@@ -36,6 +36,9 @@ the token response. The post-response
 [`commit`](crate::engine::PendingPersist::commit) then acts as the retry,
 re-committing the refresh through the same merge-safe path; a commit failure
 falls to the adapter's [`PersistFailurePolicy`](crate::PersistFailurePolicy).
+The default policy maps a missing record (`Gone`, commonly a concurrent
+logout) to `401 Unauthorized` with a `Cookie` challenge; transient backend
+unavailability remains `503 Service Unavailable`.
 
 ## Returned cookies are part of the persist
 
