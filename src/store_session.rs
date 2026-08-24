@@ -1,8 +1,9 @@
-//! External-store-backed session storage.
+//! Server-held session storage.
 //!
 //! [`StoreBackedSessionStore`] keeps an encrypted pointer cookie in the browser
 //! and delegates session data to an [`ExternalSessionStore`] (Redis, a database,
-//! etc.).
+//! etc.). This enables server-side revocation, idle tracking, larger sessions,
+//! and compare-and-swap updates.
 
 use std::{sync::Arc, time::Duration};
 
@@ -31,11 +32,19 @@ use crate::{
     session_state::{Session, SessionState, bounded_time_add},
 };
 
-/// Pure-storage backend (Redis, SQL, …) for a [`StoreBackedSessionStore`]:
-/// insert, load, save, compare-and-swap, delete.
+/// Persistence backend for a [`StoreBackedSessionStore`].
 ///
-/// Session construction from a completed login is handled by the
-/// [`SessionEnricher`](crate::SessionEnricher) attached to the store, not here.
+/// Implement this trait over Redis, SQL, or another server-side store. Its
+/// responsibilities are deliberately limited to insert, load, save,
+/// compare-and-swap, delete, and record retention. Session construction is
+/// handled by the [`SessionEnricher`] attached to the driver.
+///
+/// A missing record and a version conflict are normal outcomes, represented
+/// by [`LoadOutcome`] and [`SaveOutcome`]. Reserve [`Self::Error`] for backend
+/// failures. Every successful write must change [`Self::Version`] and apply
+/// [`Session::storage_deadline`] as the record's absolute retention deadline.
+/// See [Implement an external session
+/// store](crate::_docs::how_to::external_store) for the complete contract.
 pub trait ExternalSessionStore: MaybeSendSync {
     /// The session type returned by this store. Must implement [`Session`] and
     /// [`PersistedSession`]. `Clone` because
@@ -47,13 +56,13 @@ pub trait ExternalSessionStore: MaybeSendSync {
     /// the session and handed back unchanged as `expected` to
     /// [`compare_and_swap`](Self::compare_and_swap). Compared by equality
     /// only. See the
-    /// [external store guide](crate::_docs::guide::external_store) for
+    /// [external store guide](crate::_docs::how_to::external_store) for
     /// choosing a representation.
     type Version: MaybeSendSync + 'static;
 
     /// The backend's own error type (e.g. `sqlx::Error`); transport-failure
     /// channel only. Boxed into
-    /// [`SessionErrorKind::Unavailable`](crate::SessionErrorKind::Unavailable).
+    /// [`SessionErrorKind::Unavailable`].
     type Error: std::error::Error + MaybeSendSync + 'static;
 
     /// Persist a newly created session. Called once per login, after
@@ -73,10 +82,10 @@ pub trait ExternalSessionStore: MaybeSendSync {
     /// Save a session unconditionally (last-writer-wins). Every write — this
     /// one included — must change the stored [`Version`](Self::Version).
     ///
-    /// Apply [`Session::storage_deadline`](crate::Session::storage_deadline)
+    /// Apply [`Session::storage_deadline`]
     /// as the record's absolute TTL on **every** write — backends like Redis
     /// drop a key's TTL on a plain overwrite — and never as a sliding window.
-    /// See the [external store guide](crate::_docs::guide::external_store)
+    /// See the [external store guide](crate::_docs::how_to::external_store)
     /// for the full retention contract.
     fn save(
         &self,
@@ -129,7 +138,7 @@ pub struct SessionNotFound;
 pub struct VersionConflict;
 
 /// Framework-managed session state carried by every store-backed session, and
-/// the seed passed to the [`SessionEnricher`](crate::SessionEnricher) after
+/// the seed passed to the [`SessionEnricher`] after
 /// login.
 #[non_exhaustive]
 #[derive(Clone, Serialize, Deserialize, bon::Builder)]
@@ -177,14 +186,15 @@ fn generate_session_key() -> Uuid {
 /// before giving up with [`VersionConflict`].
 const UPDATE_MAX_ATTEMPTS: u32 = 5;
 
-/// A session store that keeps an encrypted pointer cookie (the session key) in
-/// the browser and stores session data in an [`ExternalSessionStore`].
+/// Stores sessions server-side behind an encrypted browser pointer.
 ///
 /// The session is built after login by a [`SessionEnricher`] from the
 /// [`PersistedSessionState`] seed; `build()` uses [`NoEnrichment`],
 /// `build_with_enricher(…)` supplies a custom one. The engine stamps on the
 /// `Secure` attribute and `__Host-` prefix, so this store takes no `secure`
-/// setting.
+/// setting. Prefer this driver over [`CookieSessionStore`](crate::CookieSessionStore)
+/// when sessions are large or need server-side revocation, liveness tracking,
+/// or compare-and-swap updates.
 pub struct StoreBackedSessionStore<E: ExternalSessionStore> {
     external: E,
     enricher: Box<dyn SessionEnricher<PersistedSessionState, E::SessionType>>,

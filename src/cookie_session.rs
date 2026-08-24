@@ -1,6 +1,10 @@
-//! Cookie-based session storage. [`CookieSessionStore`] encrypts the session
-//! into AEAD-sealed browser cookies, chunked (`.0`, `.1`, …) to stay within
-//! browser size limits.
+//! Browser-held session storage.
+//!
+//! [`CookieSessionStore`] encrypts the complete application session into
+//! AEAD-sealed cookies, split into numbered chunks (`.0`, `.1`, …) when
+//! needed. Use [`StoreBackedSessionStore`](crate::StoreBackedSessionStore)
+//! instead when sessions are large or require server-side revocation, idle
+//! tracking, or atomic concurrent updates.
 
 use std::{sync::Arc, time::Duration};
 
@@ -86,14 +90,14 @@ impl From<SessionState> for CookieSession {
     }
 }
 
-/// A built-in session store that encrypts session data into chunked cookies.
+/// Stores the complete encrypted session in browser cookies.
 ///
 /// The type parameter `C` is the [`CookiePayload`] stored in the cookie,
 /// defaulting to [`CookieSession`]. Decryption failure is treated as "no
 /// session". The `Secure` attribute, the `__Host-`/`__Secure-` prefix, and the
 /// `Max-Age` clamp to the session-lifetime cap are stamped on by the engine
 /// via
-/// [`SessionDriver::apply_session_policy`](crate::SessionDriver::apply_session_policy),
+/// [`SessionDriver::apply_session_policy`],
 /// not configured here.
 ///
 /// Cookie sessions are stateless: [`delete`](SessionDriver::delete) only

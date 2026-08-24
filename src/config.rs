@@ -1,7 +1,11 @@
-//! Login flow configuration.
+//! Login behavior and route configuration.
 //!
 //! [`LoginConfig`] holds the settings governing the OAuth 2.0 Authorization
-//! Code Grant login middleware.
+//! Code flow after the client itself has been configured. Authorization-server
+//! endpoints, client credentials, and the redirect URI belong to
+//! [`AuthorizationCodeGrant`](crate::client::grant::authorization_code::AuthorizationCodeGrant);
+//! persistence belongs to the selected session store; server-side idle
+//! tracking belongs to [`LivenessConfig`](crate::LivenessConfig).
 
 use std::time::Duration;
 
@@ -47,8 +51,8 @@ impl ActivityPolicy {
 /// its choice in code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionLifetime {
-    /// The **authorization server** bounds the session: it lives exactly as
-    /// long as the AS keeps honoring the refresh token (re-verified on every
+    /// The **authorization server (AS)** bounds the session: it lives exactly
+    /// as long as the AS keeps honoring the refresh token (re-verified on every
     /// token refresh), and this crate imposes no cap of its own; storage
     /// stays bounded by the activity horizon
     /// ([`Session::storage_deadline`](crate::Session::storage_deadline)).
@@ -369,12 +373,13 @@ fn compute_browser_callback_path(
 pub struct LogoutConfig {
     /// Path at which the logout endpoint is mounted (e.g. `"/logout"`).
     pub path: RoutePath,
-    /// Authorization server's end-session endpoint for RP-initiated logout
-    /// (OIDC RP-Initiated Logout 1.0).
+    /// Authorization server's end-session endpoint for relying-party
+    /// initiated logout (OIDC RP-Initiated Logout 1.0).
     pub end_session_endpoint: Option<EndpointUrl>,
     /// Absolute URI to redirect to after the local session is cleared; defaults
     /// to the reconstructed base URL (the grant's `redirect_uri` origin joined
-    /// with `base_path`). Held as the exact string supplied, as the OP matches
+    /// with `base_path`). Held as the exact string supplied, as the OpenID
+    /// Provider (OP) matches
     /// it byte-for-byte (OIDC RP-Initiated Logout 1.0 §3): it (and the base-URL
     /// default, if relied on) must be registered at the authorization server, or
     /// the OP silently drops the redirect and strands the user on its logout
@@ -394,7 +399,8 @@ impl LogoutConfig {
         /// Path at which the logout endpoint is mounted (e.g. `"/logout"`).
         #[builder(into)]
         path: String,
-        /// Authorization server's end-session endpoint for RP-initiated logout.
+        /// Authorization server's end-session endpoint for relying-party
+        /// initiated logout.
         end_session_endpoint: Option<EndpointUrl>,
         /// Absolute URL to redirect to after logout, preserved exactly as
         /// supplied. Defaults to the reconstructed base URL.

@@ -1,19 +1,40 @@
-//! Extended documentation: explanation and how-to guides.
+//! Learn and use `huskarl-login`.
 //!
-//! The API items in this crate are the **reference** documentation — they say
-//! what each type and method is. These pages cover the other
-//! [Diátaxis](https://diataxis.fr) quadrants:
+//! This crate organizes its documentation using
+//! [Diátaxis](https://diataxis.fr). Choose the section that matches what you
+//! are trying to do:
 //!
-//! - **[Explanation](explanation)** — understanding-oriented background on how
-//!   the crate works and why it is shaped the way it is.
-//! - **[How-to guides](guide)** — task-oriented recipes for wiring the crate
-//!   into an application.
+//! - **[Tutorial](tutorial)** — build a minimal login engine while learning the
+//!   main pieces.
+//! - **[How-to guides](how_to)** — complete a specific integration or
+//!   deployment task.
+//! - **[Explanation](explanation)** — understand the design, trade-offs, and
+//!   security model.
+//! - **Reference** — use the crate's public modules and API items, starting
+//!   with [`crate::engine`], [`crate::LoginConfig`], or the [`crate::prelude`].
 //!
-//! This module is documentation only; it contains no runnable API and is
-//! compiled solely for `cargo doc` and `cargo test --doc`. The code blocks in
-//! these pages are real doctests and are compiled with the rest of the crate.
+//! This module contains no runtime API and is compiled only while generating
+//! documentation.
 
-/// Understanding-oriented background on how the crate works and why.
+/// Learning-oriented material for first-time users.
+///
+/// Start with [Build your first login engine](tutorial::getting_started) to
+/// connect OIDC discovery, cookie sealing, session storage, and the engine.
+pub mod tutorial {
+    #[doc = include_str!("../docs/tutorial/getting_started.md")]
+    pub mod getting_started {}
+}
+
+/// Understand the design and its trade-offs.
+///
+/// - [The session model](explanation::session_model) defines the core terms,
+///   persistence choices, request states, and lifetime policies.
+/// - [Token refresh](explanation::refresh) explains eager persistence,
+///   transient failure, and concurrent refresh.
+/// - [Server-side liveness](explanation::liveness) explains idle tracking and
+///   its fail-open design.
+/// - [Cookie security](explanation::cookie_security) explains names, AEAD
+///   binding, chunking, flow-cookie hygiene, and key rotation.
 pub mod explanation {
     #[doc = include_str!("../docs/explanation/session_model.md")]
     pub mod session_model {}
@@ -28,23 +49,26 @@ pub mod explanation {
     pub mod cookie_security {}
 }
 
-/// Task-oriented recipes for wiring the crate into an application.
-pub mod guide {
-    #[doc = include_str!("../docs/guide/getting_started.md")]
-    pub mod getting_started {}
-
-    #[doc = include_str!("../docs/guide/adapter.md")]
+/// Complete a specific integration or deployment task.
+///
+/// - [Build a framework adapter](how_to::adapter).
+/// - [Build an application session](how_to::enrichment).
+/// - [Implement an external session store](how_to::external_store).
+/// - [Prevent session responses from being cached](how_to::caching).
+/// - [Deploy refresh-token rotation safely](how_to::rotation).
+pub mod how_to {
+    #[doc = include_str!("../docs/how_to/adapter.md")]
     pub mod adapter {}
 
-    #[doc = include_str!("../docs/guide/enrichment.md")]
+    #[doc = include_str!("../docs/how_to/enrichment.md")]
     pub mod enrichment {}
 
-    #[doc = include_str!("../docs/guide/external_store.md")]
+    #[doc = include_str!("../docs/how_to/external_store.md")]
     pub mod external_store {}
 
-    #[doc = include_str!("../docs/guide/rotation.md")]
+    #[doc = include_str!("../docs/how_to/rotation.md")]
     pub mod rotation {}
 
-    #[doc = include_str!("../docs/guide/caching.md")]
+    #[doc = include_str!("../docs/how_to/caching.md")]
     pub mod caching {}
 }

@@ -1,17 +1,18 @@
-# Deploying with refresh-token rotation
+# Deploy refresh-token rotation safely
 
-If your authorization server rotates refresh tokens on each use, a multi-replica
-deployment needs two things in place so that concurrent refreshes don't log
-users out. The background is in the
+If your authorization server (AS) rotates refresh tokens on each use, a
+multi-replica deployment needs two things in place so that concurrent refreshes
+don't log users out. The background is in the
 [refresh explanation](crate::_docs::explanation::refresh); this is the checklist.
 
 ## 1. A shared refresh-token cache
 
 Concurrent requests across replicas can enter the refresh window for the same
 session at once. Give them a shared place to converge by implementing
-`huskarl_login::client::cache::TokenCache` / `RefreshTokenStore` over shared storage (the same
-Redis/database you already run). Concurrent refreshes then coordinate through it
-instead of each independently spending the refresh token and racing.
+`huskarl_login::client::cache::TokenCache` / `RefreshTokenStore` over shared
+storage (the same Redis or database you already run). Concurrent refreshes then
+coordinate through it instead of each independently spending the refresh token
+and racing.
 
 ## 2. A rotation grace period on the AS
 

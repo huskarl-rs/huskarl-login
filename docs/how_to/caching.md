@@ -1,9 +1,9 @@
-# Response caching: the adapter's contract
+# Prevent session responses from being cached
 
-A session cookie that a shared cache stores and later replays to a *different*
-user is a session-fixation hole. The engine guards its own responses, but it
-cannot guard the inner handler's — so framework adapters carry one
-responsibility.
+A shared cache that stores a session cookie can replay it to a *different*
+user, creating a session-fixation vulnerability. The engine guards its own
+responses, but it cannot guard the inner handler's — so framework adapters
+carry one responsibility.
 
 ## What the engine already guarantees
 

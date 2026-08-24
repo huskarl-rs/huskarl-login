@@ -14,7 +14,7 @@ Every deployment has an idle bound —
 mode. The default is deliberately long: it changes nothing for deployments
 with real idle requirements, while guaranteeing that storage for sessions
 nobody uses anymore is eventually reclaimed (see the
-[TTL contract](crate::_docs::guide::external_store)).
+[TTL contract](crate::_docs::how_to::external_store)).
 
 Cookie sessions, and store-backed sessions without a liveness store, report
 [`Untracked`](crate::LivenessVerdict) — there is no `last_active` to judge, so

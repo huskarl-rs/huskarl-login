@@ -1,4 +1,9 @@
-//! Sealed [`SessionDriver`] trait abstracting session persistence.
+//! Session persistence boundary used by the login engine.
+//!
+//! [`SessionDriver`] is sealed and implemented by the two built-in drivers.
+//! Applications choose a driver rather than implementing this trait directly;
+//! implement [`ExternalSessionStore`](crate::ExternalSessionStore) to add a
+//! server-side backend.
 
 use std::{fmt, sync::Arc};
 
@@ -22,7 +27,9 @@ pub type BoxedSource = Box<dyn std::error::Error + Send + Sync + 'static>;
 #[cfg(target_arch = "wasm32")]
 pub type BoxedSource = Box<dyn std::error::Error + 'static>;
 
-/// A request-time session-store failure; handle via [`kind`](Self::kind) and [`is_retryable`](Self::is_retryable).
+/// A request-time session-store failure.
+///
+/// Handle it through [`kind`](Self::kind) and [`is_retryable`](Self::is_retryable).
 #[derive(Debug)]
 pub struct SessionError {
     kind: SessionErrorKind,
@@ -34,7 +41,8 @@ pub struct SessionError {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionErrorKind {
-    /// The backing store is unreachable or failed transiently. The only [retryable](SessionError::is_retryable) kind.
+    /// The backing store is unreachable or failed transiently. This is the
+    /// only [retryable](SessionError::is_retryable) kind.
     Unavailable,
     /// A compare-and-swap retry budget was exhausted under concurrent rewrites.
     Conflict,
@@ -153,11 +161,14 @@ pub mod sealed {
     pub trait Sealed {}
 }
 
-/// Session driver trait implemented by the built-in session stores.
+/// Engine-facing persistence interface implemented by the built-in stores.
 ///
-/// Sealed: implemented only by [`CookieSessionStore`](crate::CookieSessionStore)
-/// and [`StoreBackedSessionStore`](crate::StoreBackedSessionStore) (the latter
-/// wrapping a custom [`ExternalSessionStore`](crate::ExternalSessionStore)).
+/// This trait is sealed. Choose [`CookieSessionStore`](crate::CookieSessionStore)
+/// for browser-held sessions or
+/// [`StoreBackedSessionStore`](crate::StoreBackedSessionStore) with a custom
+/// [`ExternalSessionStore`](crate::ExternalSessionStore) for server-held
+/// sessions. Framework adapters normally use [`LoginEngine`](crate::engine::LoginEngine)
+/// rather than calling driver methods directly.
 pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// The session type stored and retrieved by this driver.
     ///

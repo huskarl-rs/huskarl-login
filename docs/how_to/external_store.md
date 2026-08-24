@@ -1,7 +1,7 @@
-# Implementing an external session store
+# Implement an external session store
 
-[`StoreBackedSessionStore`](crate::StoreBackedSessionStore) delegates the actual
-session data to an [`ExternalSessionStore`](crate::ExternalSessionStore) you
+[`StoreBackedSessionStore`](crate::StoreBackedSessionStore) delegates session
+data to an [`ExternalSessionStore`](crate::ExternalSessionStore) you
 implement over your backend (Redis, SQL, DynamoDB, …). The trait is pure
 storage — insert, load, save, compare-and-swap, delete. Session _construction_
 from a login is the enricher's job, not the store's.

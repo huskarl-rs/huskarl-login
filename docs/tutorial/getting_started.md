@@ -1,6 +1,25 @@
-# Getting started: a minimal login
+# Build your first login engine
 
-A working login needs four pieces wired together:
+In this tutorial, you build the framework-neutral core of a login integration.
+By the end, you will have a [`LoginEngine`](crate::engine::LoginEngine) that
+uses OIDC discovery and stores encrypted sessions in browser cookies. Mounting
+that engine in an HTTP framework is a separate adapter step.
+
+## Before you start
+
+You need an OIDC client registration with:
+
+- client ID `my-client`;
+- callback URI `https://app.example.com/callback`; and
+- an authorization server issuer such as `https://auth.example.com`.
+
+You also need a `huskarl` HTTP client and a 256-bit AEAD key. Keep that key in
+your normal secret-management system; replacing it without retaining the old
+key invalidates existing login-state and session cookies.
+
+## How the pieces fit
+
+A minimal login has four pieces:
 
 1. an **OAuth grant** ([`AuthorizationCodeGrant`](crate::client::grant::authorization_code::AuthorizationCodeGrant),
    from `huskarl`) that drives the Authorization Code flow — its endpoints and
@@ -14,6 +33,8 @@ The client-facing origin (scheme + host) is **not** configured on the login
 side — the engine takes it from the grant's `redirect_uri`. So
 [`LoginConfig`](crate::LoginConfig) only needs the callback path and scopes; a
 front-proxy path prefix goes in `base_path`, nothing else about the URL.
+
+## Build the engine
 
 ```rust,no_run
 use std::sync::Arc;
@@ -81,14 +102,25 @@ Ok(Arc::new(engine))
 # }
 ```
 
-From here, drive `engine` from your framework's request lifecycle. That glue —
-running the engine at the right points and delivering everything it returns —
-is the subject of the [adapter guide](crate::_docs::guide::adapter); the
-reference adapters `huskarl-axum` and `huskarl-pingora` implement it for you.
+The result is an `Arc<LoginEngine<CookieSessionStore>>`. It knows how to start
+login, process the callback and logout routes, and load or refresh a session.
+It does not listen for requests itself.
 
-To populate application-specific session fields from the login, attach a
-[`SessionEnricher`](crate::SessionEnricher) — see the [enrichment
-guide](crate::_docs::guide::enrichment). To keep session data server-side
-instead of in cookies, use a
-[`StoreBackedSessionStore`](crate::StoreBackedSessionStore) — see the
-[external-store guide](crate::_docs::guide::external_store).
+## Connect it to HTTP
+
+Use a reference adapter (`huskarl-axum` or `huskarl-pingora`) when one matches
+your framework. Otherwise, follow the [adapter
+guide](crate::_docs::how_to::adapter) to drive the engine from your framework's
+request lifecycle and deliver every response and cookie it returns.
+
+## Next steps
+
+- To add application-specific fields, follow [Build an application
+  session](crate::_docs::how_to::enrichment).
+- To keep session data server-side, follow [Implement an external session
+  store](crate::_docs::how_to::external_store).
+- Before choosing a production lifetime policy, read [The session
+  model](crate::_docs::explanation::session_model).
+- Before rotating cookie keys, read [Cookie security](crate::_docs::explanation::cookie_security)
+  and [Deploy refresh-token rotation
+  safely](crate::_docs::how_to::rotation).

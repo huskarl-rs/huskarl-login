@@ -1,9 +1,13 @@
-//! [`CompletedLogin`]: the result of a successful login completion.
+//! Tokens and identity data produced by a successful login callback.
 
 use crate::client::{grant::core::TokenResponse, token::id_token::IdTokenClaims};
 
-/// The token response and validated identity claims from a completed login
-/// (claims present only for OIDC flows).
+/// Input available when building an application session after login.
+///
+/// It contains the OAuth token response and, for OpenID Connect flows, the
+/// validated subject and ID-token claims. A [`SessionEnricher`](crate::SessionEnricher)
+/// combines this value with framework-managed state; this value is not itself
+/// the persisted session.
 #[derive(bon::Builder)]
 pub struct CompletedLogin {
     token_response: TokenResponse,

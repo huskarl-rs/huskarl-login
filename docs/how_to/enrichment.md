@@ -1,14 +1,14 @@
-# Building the session: enrichment
+# Build an application session
 
-After a successful login the framework hands you a _seed_ and the
+After a successful login the session driver prepares a _seed_ and the
 [`CompletedLogin`](crate::CompletedLogin); you turn them into your session type.
-How you do that depends on whether construction needs network I/O. The three
+How you do that depends on whether construction needs network I/O. The four
 recipes below go from least to most involved. All use
 [`CookieSessionStore`](crate::CookieSessionStore); for
 [`StoreBackedSessionStore`](crate::StoreBackedSessionStore) only the seed type
 changes (to [`PersistedSessionState`](crate::PersistedSessionState)).
 
-Whatever the recipe, the session type must be `Clone` (derive it) —
+Whichever recipe you choose, the session type must be `Clone` (derive it) —
 [`PendingPersist::commit`](crate::engine::PendingPersist::commit) explains why.
 
 ## 1. No claims, no I/O — `build()`
@@ -174,13 +174,14 @@ Beyond _building_ the session, a custom session type can override two
 [`Session`](crate::Session) methods to change runtime behavior. Both default to
 the [`SessionState`](crate::SessionState) baseline.
 
-### Storing the `id_token` for RP-initiated logout
+### Storing the `id_token` for relying-party-initiated logout
 
 [`SessionState`](crate::SessionState) does not keep the raw `id_token` JWT (it
-would add ~1 KB to every cookie request). If your IdP supports RP-initiated
-logout and you want clean logout UX — no OP confirmation page — store the
-`id_token` in your type and override [`Session::id_token`](crate::Session::id_token)
-so the engine can send it as `id_token_hint`:
+would add ~1 KB to every cookie request). If your identity provider supports
+OIDC RP-Initiated Logout and you want a clean logout experience without an
+OpenID Provider confirmation page, store the `id_token` in your type and
+override [`Session::id_token`](crate::Session::id_token) so the engine can send
+it as `id_token_hint`:
 
 ```rust
 # use huskarl_login::client::token::IdToken;

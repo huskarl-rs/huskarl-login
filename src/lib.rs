@@ -9,28 +9,46 @@
 #![warn(clippy::pedantic)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-//! Framework-agnostic login core shared by `huskarl-axum` and
-//! `huskarl-pingora`: configuration, session drivers, session enrichment,
-//! cookie and URL helpers, and session store traits.
+//! Framework-neutral OAuth 2.0 and OpenID Connect login for Rust services.
 //!
-//! The OAuth flow is driven by a
-//! [`client::grant::authorization_code::AuthorizationCodeGrant`] passed to the
-//! [`engine::LoginEngine`]. A [`SessionEnricher`] builds the application's
-//! session type from a framework-prepared seed and the [`CompletedLogin`]; the
-//! session is then stored by a [`CookieSessionStore`] (sealed into AEAD
-//! browser cookies) or a [`StoreBackedSessionStore`] (persisted via an
-//! [`ExternalSessionStore`] behind a pointer cookie).
+//! `huskarl-login` contains the framework-independent policy and state machine
+//! shared by adapters such as `huskarl-axum` and `huskarl-pingora`. The central
+//! type is [`engine::LoginEngine`]. It starts and completes the Authorization
+//! Code flow, validates and refreshes sessions, and handles logout. A framework
+//! adapter is responsible for calling the engine and delivering its response
+//! and cookie outputs.
 //!
-//! Trait bounds use `huskarl_login::core::platform`'s `MaybeSend` / `MaybeSendSync`
-//! markers, so the crate also compiles for `wasm32` and WASI targets.
+//! # Mental model
 //!
-//! # Guides and explanation
+//! A successful callback produces a [`CompletedLogin`]. A [`SessionEnricher`]
+//! combines it with framework-managed state to build the application's
+//! [`Session`]. A session driver then persists that value:
 //!
-//! New here? Start with [getting started](_docs::guide::getting_started) for a
-//! minimal end-to-end wiring. For the other task-oriented how-to guides
-//! (implementing a framework adapter, enrichment, implementing an external
-//! store, refresh-token rotation) and design explanation (the session model,
-//! liveness, cookie security), see the [`_docs`] module.
+//! ```text
+//! authorization code ─▶ CompletedLogin ─┐
+//!                                      ├─▶ SessionEnricher ─▶ Session ─▶ store
+//!                     managed state ───┘
+//! ```
+//!
+//! Choose [`CookieSessionStore`] to keep the encrypted session in the browser.
+//! Choose [`StoreBackedSessionStore`] to keep only an encrypted lookup key in
+//! the browser and store the session through an [`ExternalSessionStore`].
+//!
+//! # Documentation
+//!
+//! - New to the crate? Follow the [getting-started
+//!   tutorial](_docs::tutorial::getting_started).
+//! - Integrating a framework or backend? Use the [how-to
+//!   guides](_docs::how_to).
+//! - Evaluating the design or security trade-offs? Read the
+//!   [explanations](_docs::explanation).
+//! - Looking up behavior and contracts? The public API items are the reference
+//!   documentation; [`engine`], [`LoginConfig`], and [`prelude`] are useful
+//!   entry points.
+//!
+//! Trait bounds use [`core::platform`]'s `MaybeSend` and `MaybeSendSync`
+//! markers, allowing the crate to compile for native, `wasm32`, and WASI
+//! targets.
 
 #[cfg(any(doc, docsrs))]
 pub mod _docs;

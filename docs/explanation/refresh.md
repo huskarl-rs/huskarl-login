@@ -11,7 +11,7 @@ A successful refresh is persisted *inside* `load_session`, before it returns —
 not deferred to the adapter's post-response
 [`PendingPersist::commit`](crate::engine::PendingPersist::commit) call.
 
-The reason is refresh-token rotation. When the authorization server rotates
+The reason is refresh-token rotation. When the authorization server (AS) rotates
 refresh tokens on each use, a deferred save that never runs — because the
 adapter skipped the persist phase, the connection dropped, or the handler
 panicked — would strand the rotated token and lock the session out. Persisting
@@ -100,4 +100,4 @@ When the AS rotates refresh tokens, the expected deployment shape is:
 Without both, occasional concurrent refreshes lose the race and surface as
 teardowns — most visibly with cookie sessions, where the refresh token lives in
 the cookie and the last writer wins. See the
-[rotation deployment guide](crate::_docs::guide::rotation).
+[rotation deployment guide](crate::_docs::how_to::rotation).

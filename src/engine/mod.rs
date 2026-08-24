@@ -1,6 +1,17 @@
-//! Framework-agnostic login engine. [`LoginEngine`] exposes the OAuth 2.0
-//! Authorization Code Grant as composable primitives that framework adapters
-//! compose into middleware.
+//! Framework-neutral login state machine and HTTP boundary types.
+//!
+//! [`LoginEngine`] exposes the OAuth 2.0 Authorization Code flow as operations
+//! a framework adapter can compose into middleware:
+//!
+//! 1. route callbacks and logout through
+//!    [`LoginEngine::try_handle_login_route`];
+//! 2. classify the request with [`LoginEngine::load_session`];
+//! 3. serve the application or start login with
+//!    [`LoginEngine::redirect_to_login`]; and
+//! 4. deliver every [`LoginResponse`] and [`SetCookies`] value returned.
+//!
+//! See [Build a framework adapter](crate::_docs::how_to::adapter) for the full
+//! request lifecycle.
 
 use std::sync::{Arc, LazyLock};
 
@@ -256,11 +267,12 @@ impl Drop for SetCookies {
     }
 }
 
-/// The result of [`LoginEngine::load_session`] — one variant per session
-/// state the adapter can observe.
+/// The authentication state observed by [`LoginEngine::load_session`].
 ///
-/// Not `#[non_exhaustive]`: every state must be handled, so a new variant is a
-/// compile error at each call site.
+/// Loading classifies a request; it never redirects. The adapter decides
+/// whether a missing or cleared session requires login or may continue
+/// anonymously. This enum is intentionally exhaustive: adding a state causes
+/// a compile error at every adapter that must decide how to handle it.
 #[must_use]
 pub enum LoadedSession<S> {
     /// The request carried no session cookie.
@@ -597,10 +609,15 @@ pub(super) fn login_state_aad(state: &str) -> Vec<u8> {
 
 // ── LoginEngine ───────────────────────────────────────────────────────────────
 
-/// Framework-agnostic login engine: drives the OAuth flow (start, callback,
-/// logout) and persists sessions through its [`SessionDriver`] `SD`.
+/// Drives login, callback, session loading and refresh, and logout.
 ///
-/// Build one with `LoginEngine::builder()`.
+/// `SD` selects the persistence model through a [`SessionDriver`]. The engine
+/// is HTTP-framework-neutral: an adapter calls its operations and lowers
+/// [`LoginResponse`] and [`SetCookies`] values into framework responses. Build
+/// an engine with [`LoginEngine::builder`].
+///
+/// The engine validates sessions but does not decide which application routes
+/// require authentication. That policy remains in the adapter or application.
 #[non_exhaustive]
 pub struct LoginEngine<SD> {
     /// The login configuration.
@@ -1246,7 +1263,7 @@ pub fn is_cors_preflight(method: &Method, headers: &HeaderMap) -> bool {
 /// `X-Requested-With`) with an `Accept: text/html` fallback for older clients.
 /// Frame loads (`Sec-Fetch-Dest: iframe` etc.) and speculative
 /// prefetch/prerender loads (`Sec-Purpose`) are not navigations — see
-/// [the adapter guide](crate::_docs::guide::adapter#speculative-loads-and-frames).
+/// [the adapter guide](crate::_docs::how_to::adapter#speculative-loads-and-frames).
 pub fn is_navigation_request(headers: &HeaderMap) -> bool {
     // Classic XHR signal — never a top-level navigation.
     if headers

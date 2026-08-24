@@ -13,26 +13,45 @@
 
 cargo-reedme: info-end -->
 
-Framework-agnostic login core shared by `huskarl-axum` and
-`huskarl-pingora`: configuration, session drivers, session enrichment,
-cookie and URL helpers, and session store traits.
+Framework-neutral OAuth 2.0 and OpenID Connect login for Rust services.
 
-The OAuth flow is driven by a
-[`huskarl::grant::authorization_code::AuthorizationCodeGrant`](https://docs.rs/huskarl/latest/huskarl/grant/authorization_code/grant/struct.AuthorizationCodeGrant.html) passed to the
-[`engine::LoginEngine`](https://docs.rs/huskarl-login/latest/huskarl_login/engine/struct.LoginEngine.html). A [`SessionEnricher`](https://docs.rs/huskarl-login/latest/huskarl_login/enrich/trait.SessionEnricher.html) builds the application’s
-session type from a framework-prepared seed and the [`CompletedLogin`](https://docs.rs/huskarl-login/latest/huskarl_login/completed_login/struct.CompletedLogin.html); the
-session is then stored by a [`CookieSessionStore`](https://docs.rs/huskarl-login/latest/huskarl_login/cookie_session/struct.CookieSessionStore.html) (sealed into AEAD
-browser cookies) or a [`StoreBackedSessionStore`](https://docs.rs/huskarl-login/latest/huskarl_login/store_session/struct.StoreBackedSessionStore.html) (persisted via an
-[`ExternalSessionStore`](https://docs.rs/huskarl-login/latest/huskarl_login/store_session/trait.ExternalSessionStore.html) behind a pointer cookie).
+`huskarl-login` contains the framework-independent policy and state machine
+shared by adapters such as `huskarl-axum` and `huskarl-pingora`. The central
+type is [`engine::LoginEngine`](https://docs.rs/huskarl-login/latest/huskarl_login/engine/struct.LoginEngine.html). It starts and completes the Authorization
+Code flow, validates and refreshes sessions, and handles logout. A framework
+adapter is responsible for calling the engine and delivering its response
+and cookie outputs.
 
-Trait bounds use `huskarl_login::core::platform`’s `MaybeSend` / `MaybeSendSync`
-markers, so the crate also compiles for `wasm32` and WASI targets.
+# Mental model
 
-# Guides and explanation
+A successful callback produces a [`CompletedLogin`](https://docs.rs/huskarl-login/latest/huskarl_login/completed_login/struct.CompletedLogin.html). A [`SessionEnricher`](https://docs.rs/huskarl-login/latest/huskarl_login/enrich/trait.SessionEnricher.html)
+combines it with framework-managed state to build the application’s
+[`Session`](https://docs.rs/huskarl-login/latest/huskarl_login/session_state/trait.Session.html). A session driver then persists that value:
 
-The API items here are the reference docs. For task-oriented how-to guides
-(implementing a framework adapter, enrichment, implementing an external
-store, refresh-token rotation) and design explanation (the session model,
-liveness, cookie security), see the [`_docs`](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/) module.
+```text
+authorization code ─▶ CompletedLogin ─┐
+                                     ├─▶ SessionEnricher ─▶ Session ─▶ store
+                    managed state ───┘
+```
+
+Choose [`CookieSessionStore`](https://docs.rs/huskarl-login/latest/huskarl_login/cookie_session/struct.CookieSessionStore.html) to keep the encrypted session in the browser.
+Choose [`StoreBackedSessionStore`](https://docs.rs/huskarl-login/latest/huskarl_login/store_session/struct.StoreBackedSessionStore.html) to keep only an encrypted lookup key in
+the browser and store the session through an [`ExternalSessionStore`](https://docs.rs/huskarl-login/latest/huskarl_login/store_session/trait.ExternalSessionStore.html).
+
+# Documentation
+
+- New to the crate? Follow the [getting-started
+  tutorial](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/tutorial/getting_started/).
+- Integrating a framework or backend? Use the [how-to
+  guides](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/how_to/).
+- Evaluating the design or security trade-offs? Read the
+  [explanations](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/explanation/).
+- Looking up behavior and contracts? The public API items are the reference
+  documentation; [`engine`](https://docs.rs/huskarl-login/latest/huskarl_login/engine/), [`LoginConfig`](https://docs.rs/huskarl-login/latest/huskarl_login/config/struct.LoginConfig.html), and [`prelude`](https://docs.rs/huskarl-login/latest/huskarl_login/prelude/) are useful
+  entry points.
+
+Trait bounds use [`core::platform`](https://docs.rs/huskarl_core/latest/huskarl_core/platform/)’s `MaybeSend` and `MaybeSendSync`
+markers, allowing the crate to compile for native, `wasm32`, and WASI
+targets.
 
 <!-- cargo-reedme: end -->

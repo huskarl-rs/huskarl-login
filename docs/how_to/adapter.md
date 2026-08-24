@@ -1,6 +1,6 @@
-# Implementing a framework adapter
+# Build a framework adapter
 
-The [`LoginEngine`](crate::engine::LoginEngine) is framework-neutral: it takes
+[`LoginEngine`](crate::engine::LoginEngine) is framework-neutral: it takes
 `http` types in (`HeaderMap`, `Method`, `Uri`) and hands back
 [`LoginResponse`](crate::engine::LoginResponse) values and
 [`SetCookies`](crate::engine::SetCookies) guards. An adapter is the glue that
@@ -88,7 +88,7 @@ Two contract points, both covered in depth elsewhere:
 - **`Cache-Control: no-store` goes out with the cookies.** The engine marks its own
   responses; cookies attached to the *inner handler's* response are the
   adapter's responsibility — see the
-  [response-caching guide](crate::_docs::guide::caching).
+  [response-caching guide](crate::_docs::how_to::caching).
 
 ## The request lifecycle
 

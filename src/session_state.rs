@@ -1,6 +1,8 @@
-//! Session state and lifecycle introspection: [`SessionState`] holds the
-//! token/timing fields, [`Session`] exposes them to the middleware. State is
-//! immutable. Liveness is tracked separately (see [`crate::liveness`]).
+//! Application sessions and their framework-managed token and timing state.
+//!
+//! Every application session embeds a [`SessionState`] and exposes it through
+//! [`Session`]. Server-side liveness is stored separately; see
+//! [`crate::liveness`].
 
 use serde::{Deserialize, Serialize};
 
@@ -32,10 +34,12 @@ pub(crate) fn bounded_time_add(base: SystemTime, duration: Duration) -> SystemTi
         .unwrap_or(base)
 }
 
-/// Common token and timing state shared by all session types.
+/// Framework-managed token and timing fields embedded in every session.
 ///
-/// Use [`SessionState::builder`] for tests and custom flows. The raw `id_token`
-/// JWT is not stored here — see [`Session::id_token`].
+/// Applications normally receive this value as the seed passed to a
+/// [`SessionEnricher`](crate::SessionEnricher) and preserve it inside their
+/// session type. Use [`SessionState::builder`] for tests and custom flows. The
+/// raw ID token is deliberately not stored here; see [`Session::id_token`].
 #[non_exhaustive]
 #[derive(Clone, Serialize, Deserialize, bon::Builder)]
 pub struct SessionState {
@@ -110,10 +114,14 @@ impl SessionState {
     }
 }
 
-/// Exposes session state so the middleware can enforce lifetime policies and refresh tokens.
+/// Gives the engine access to an application's session state.
 ///
-/// Implement on the session type used with the middleware; only
-/// [`state`](Self::state) and [`set_state`](Self::set_state) are required.
+/// Implement this trait for a custom application session. Embed the
+/// [`SessionState`] supplied by the session enricher, then implement only
+/// [`state`](Self::state) and [`set_state`](Self::set_state). The default
+/// methods expose its lifecycle fields and apply token refreshes. Override
+/// [`id_token`](Self::id_token) or [`apply_refresh`](Self::apply_refresh) only
+/// when the custom session stores additional related data.
 pub trait Session {
     /// Returns a shared reference to the embedded [`SessionState`].
     fn state(&self) -> &SessionState;
@@ -167,7 +175,7 @@ pub trait Session {
     /// `max(now, token_expiry) + idle_timeout`. External stores apply this as
     /// the record TTL on every write, with the
     /// [`idle_timeout`](crate::LivenessConfig::idle_timeout) they configured —
-    /// see the [external store guide](crate::_docs::guide::external_store).
+    /// see the [external store guide](crate::_docs::how_to::external_store).
     fn storage_deadline(&self, now: SystemTime, idle_timeout: Duration) -> SystemTime {
         let horizon = bounded_time_add(self.token_expiry().max(now), idle_timeout);
         self.expire_at().map_or(horizon, |e| e.min(horizon))

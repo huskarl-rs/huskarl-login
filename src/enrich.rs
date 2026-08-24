@@ -1,6 +1,6 @@
 //! Session construction from a completed login.
 //!
-//! A [`SessionEnricher`] turns a framework-prepared seed plus the
+//! A [`SessionEnricher`] turns a framework-managed seed plus the
 //! [`CompletedLogin`] into the application's session type. The seed is
 //! [`SessionState`](crate::SessionState) for
 //! [`CookieSessionStore`](crate::CookieSessionStore) and
@@ -14,15 +14,16 @@ use crate::{
     session::SessionError,
 };
 
-/// Asynchronously builds the session type from framework-prepared seed data
-/// and the completed login.
+/// Builds an application session from framework-managed state and a completed
+/// login.
 ///
-/// An enricher is a value passed to a session store builder's
+/// An enricher is passed to a session store builder's
 /// `build_with_enricher` finisher, so it can own clients (an OIDC `UserInfo`
 /// client, a database pool) and await them while building the session. `Seed`
 /// is [`SessionState`](crate::SessionState) for cookie sessions or
 /// [`PersistedSessionState`](crate::PersistedSessionState) for store-backed
-/// sessions; embed it in the session you return.
+/// sessions. Preserve the seed in the session you return so the engine can
+/// continue to enforce token and lifetime policy.
 ///
 /// The trait is dyn-capable (`Box<dyn SessionEnricher<Seed, S>>`); write the
 /// body as `Box::pin(async move { ... })`. A failed enrichment fails session
@@ -30,7 +31,7 @@ use crate::{
 /// a few ID token claims — pass a synchronous closure to the builder's
 /// `build_with_claims` finisher instead of implementing this trait.
 pub trait SessionEnricher<Seed, S>: MaybeSendSync {
-    /// Build the session from the framework-prepared `seed` and the completed
+    /// Build the session from the framework-managed `seed` and the completed
     /// login.
     ///
     /// # Errors
