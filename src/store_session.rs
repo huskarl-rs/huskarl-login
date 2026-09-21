@@ -683,6 +683,13 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
         self.clear_session_cookie_headers()
     }
 
+    fn strip_session_credentials(&self, headers: &mut http::HeaderMap) {
+        let kid_name = crate::cookie::kid_cookie_name(&self.sealer.cookie_name);
+        crate::cookie::strip_cookies(headers, |name| {
+            name == self.sealer.cookie_name || name == kid_name
+        });
+    }
+
     async fn create(
         &self,
         completed: crate::CompletedLogin,
@@ -900,6 +907,26 @@ mod tests {
                     .build(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn credential_stripping_removes_pointer_and_kid_but_preserves_app_cookies() {
+        let store = StoreBackedSessionStore::builder()
+            .external(MinimalExternalStore(test_session()))
+            .sealer(test_sealer().await)
+            .cookie_name("huskarl_session".parse().unwrap())
+            .build();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            "__Host-huskarl_session=pointer; theme=dark; __Host-huskarl_session.kid=key"
+                .parse()
+                .unwrap(),
+        );
+
+        store.strip_session_credentials(&mut headers);
+
+        assert_eq!(headers.get(http::header::COOKIE).unwrap(), "theme=dark");
     }
 
     /// Builds `MinimalSession` from the `PersistedSessionState` seed.

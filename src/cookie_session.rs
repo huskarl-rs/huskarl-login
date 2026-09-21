@@ -442,6 +442,13 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
         self.clear_session_cookie_headers(headers)
     }
 
+    fn strip_session_credentials(&self, headers: &mut http::HeaderMap) {
+        let kid_name = crate::cookie::kid_cookie_name(&self.sealer.cookie_name);
+        crate::cookie::strip_cookies(headers, |name| {
+            name == kid_name || self.parse_chunk_index(name).is_some()
+        });
+    }
+
     async fn create(
         &self,
         completed: CompletedLogin,
@@ -542,6 +549,22 @@ mod tests {
             .cookie_name("huskarl_session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build()
+    }
+
+    #[tokio::test]
+    async fn credential_stripping_removes_chunks_and_kid_but_preserves_app_cookies() {
+        let store = test_store().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            "__Host-huskarl_session.0=first; theme=dark; __Host-huskarl_session.3=legacy; __Host-huskarl_session.kid=key"
+                .parse()
+                .unwrap(),
+        );
+
+        store.strip_session_credentials(&mut headers);
+
+        assert_eq!(headers.get(http::header::COOKIE).unwrap(), "theme=dark");
     }
 
     #[test]

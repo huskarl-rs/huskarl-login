@@ -350,8 +350,8 @@ in-flight state is carried on the per-request context:
   stashed on the context and the request proceeds upstream.
 - The *response-header filter* is the persist phase: append the owed cookies
   to the upstream's `&mut ResponseHeader` (the response is the upstream's —
-  the adapter can only append, converting the `Vec<HeaderValue>` shape as
-  noted in [the session model](crate::_docs::explanation::session_model)) and
+  the adapter can only append, consuming the [`SetCookies`](crate::engine::SetCookies)
+  guard at that point) and
   commit the pending persist. The upstream body is already committed, so a
   `PersistFailurePolicy` replacement response degrades to failing the request
   with the replacement's *status*.
@@ -360,6 +360,12 @@ in-flight state is carried on the per-request context:
   commit the owed persist so the store is right, and
   [`discard`](crate::engine::SetCookies::discard) the returned cookies — the
   response is already gone, which is exactly the case `discard` exists for.
+
+Before sending the upstream request, a reverse-proxy adapter should call
+[`LoginEngine::strip_session_credentials`](crate::engine::LoginEngine::strip_session_credentials)
+on its outgoing headers. The engine preserves unrelated application cookies
+while the session driver removes its own pointer, chunk, and key-id cookies;
+the proxy therefore does not need to know the driver's cookie layout.
 
 The engine's design assumes adapters like this exist: refreshes are persisted
 *eagerly* inside `load_session` precisely so that an adapter with no reliable

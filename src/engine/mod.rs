@@ -811,6 +811,16 @@ where
         &self.session_store
     }
 
+    /// Removes this engine's session credentials from request cookies while
+    /// preserving unrelated application cookies.
+    ///
+    /// Reverse-proxy adapters should call this on the request headers they send
+    /// upstream. Cookie names and layouts remain an implementation detail of
+    /// the session driver, including chunk cookies and key-id sidecars.
+    pub fn strip_session_credentials(&self, headers: &mut HeaderMap) {
+        self.session_store.strip_session_credentials(headers);
+    }
+
     /// If `uri`'s path is the configured callback or logout path, returns the
     /// corresponding response; otherwise `None` (the adapter falls through).
     ///

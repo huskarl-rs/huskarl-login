@@ -489,6 +489,50 @@ pub fn get_cookie<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a st
     None
 }
 
+/// Removes request cookies selected by `should_strip`, preserving unrelated
+/// cookies. If any `Cookie` header is not visible ASCII, all cookie headers are
+/// removed rather than risking forwarding a credential the caller could not
+/// inspect.
+pub(crate) fn strip_cookies(
+    headers: &mut http::HeaderMap,
+    mut should_strip: impl FnMut(&str) -> bool,
+) {
+    if !headers.contains_key(header::COOKIE) {
+        return;
+    }
+
+    let mut retained = Vec::new();
+    let mut malformed = false;
+    for value in headers.get_all(header::COOKIE) {
+        let Ok(text) = value.to_str() else {
+            malformed = true;
+            break;
+        };
+        for pair in text
+            .split(';')
+            .map(str::trim)
+            .filter(|pair| !pair.is_empty())
+        {
+            let name = pair
+                .split_once('=')
+                .map_or(pair, |(name, _value)| name)
+                .trim();
+            if !should_strip(name) {
+                retained.push(pair.to_owned());
+            }
+        }
+    }
+
+    headers.remove(header::COOKIE);
+    if malformed || retained.is_empty() {
+        return;
+    }
+
+    if let Ok(value) = HeaderValue::from_str(&retained.join("; ")) {
+        headers.insert(header::COOKIE, value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -531,6 +575,36 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert(header::COOKIE, " foo = bar ".parse().unwrap());
         assert_eq!(get_cookie(&headers, "foo"), Some("bar"));
+    }
+
+    #[test]
+    fn strip_cookies_removes_selected_and_preserves_unrelated_pairs() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            header::COOKIE,
+            "session.0=secret; theme=dark".parse().unwrap(),
+        );
+        headers.append(
+            header::COOKIE,
+            "session.kid=key; locale=da".parse().unwrap(),
+        );
+
+        strip_cookies(&mut headers, |name| name.starts_with("session."));
+
+        assert_eq!(
+            headers.get(header::COOKIE).unwrap(),
+            "theme=dark; locale=da"
+        );
+    }
+
+    #[test]
+    fn strip_cookies_removes_cookie_header_when_nothing_remains() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(header::COOKIE, "session=value".parse().unwrap());
+
+        strip_cookies(&mut headers, |name| name == "session");
+
+        assert!(!headers.contains_key(header::COOKIE));
     }
 
     #[test]

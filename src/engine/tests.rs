@@ -404,6 +404,8 @@ impl SessionDriver for MockSessionStore {
         vec![HeaderValue::from_static("mock-session=; Max-Age=0")]
     }
 
+    fn strip_session_credentials(&self, _headers: &mut HeaderMap) {}
+
     async fn create(
         &self,
         completed: CompletedLogin,
@@ -505,6 +507,8 @@ impl SessionDriver for ErrorSessionStore {
     fn clear_session_cookies(&self, _: &HeaderMap) -> Vec<HeaderValue> {
         vec![HeaderValue::from_static("mock-session=; Max-Age=0")]
     }
+
+    fn strip_session_credentials(&self, _headers: &mut HeaderMap) {}
 
     async fn create(
         &self,

@@ -422,6 +422,15 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// backing record is deleted or expires.
     fn clear_session_cookies(&self, headers: &http::HeaderMap) -> Vec<HeaderValue>;
 
+    /// Removes this driver's browser credentials from request `Cookie`
+    /// headers while preserving unrelated application cookies.
+    ///
+    /// Reverse proxies call this before forwarding a request upstream so the
+    /// replayable session credential remains at the authentication boundary.
+    /// Implementations own the exact cookie-name knowledge, including chunked
+    /// cookies and key-id sidecars.
+    fn strip_session_credentials(&self, headers: &mut http::HeaderMap);
+
     /// Revoke a session's authoritative state.
     ///
     /// Browser clearing is deliberately separate through
