@@ -518,10 +518,27 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         if deadline.is_some_and(|deadline| deadline <= now) {
             return Err(SessionErrorKind::Gone.into());
         }
+        let retention_deadline = self.write_deadline(&session, now);
         self.external
-            .insert(&session, self.write_deadline(&session, now))
+            .insert(&session, retention_deadline)
             .await
             .map_err(to_session_err)?;
+        // Login is the session's first activity. Seed liveness immediately so
+        // precise idle tracking starts at creation rather than at the first
+        // qualifying request after the callback. This remains best-effort like
+        // later activity touches: the record deadline is the fail-open bound.
+        if let Some((liveness, _)) = &self.liveness
+            && let Err(e) = liveness
+                .touch(
+                    session.persisted().session_key,
+                    now,
+                    Some(retention_deadline),
+                )
+                .await
+        {
+            log::warn!("failed to initialize session liveness (best-effort): {e}");
+            self.record_liveness_failure(&LivenessFailure::Touch);
+        }
         Ok((session, cookies))
     }
 
@@ -1410,6 +1427,50 @@ mod tests {
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build()
+    }
+
+    #[tokio::test]
+    async fn create_initializes_liveness_with_the_record_deadline() {
+        let liveness = FakeLiveness::default();
+        let store = store_over(VersioningStore::with(test_session()))
+            .await
+            .with_liveness(liveness.clone(), LivenessConfig::default());
+
+        let (session, _cookies) = store
+            .create_session(
+                &completed_with_email("a@example.com"),
+                Duration::from_hours(1),
+            )
+            .await
+            .unwrap();
+        let key = session.persisted().session_key;
+
+        assert!(
+            liveness.get(key).is_some(),
+            "login must establish the initial last_active timestamp"
+        );
+        assert_eq!(
+            liveness.deadline(key),
+            Some(store.external.last_deadline()),
+            "the liveness entry and session record must share a deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_initial_liveness_touch_does_not_fail_login() {
+        let store = store_over(VersioningStore::with(test_session()))
+            .await
+            .with_liveness(FailingLiveness, LivenessConfig::default());
+
+        let result = store
+            .create_session(
+                &completed_with_email("a@example.com"),
+                Duration::from_hours(1),
+            )
+            .await;
+
+        assert!(result.is_ok(), "liveness initialization must fail open");
+        assert!(store.external.stored.lock().unwrap().is_some());
     }
 
     #[tokio::test]

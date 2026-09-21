@@ -8,6 +8,11 @@ session. A [`StoreBackedSessionStore`](crate::StoreBackedSessionStore) with a
 compares against [`idle_timeout`](crate::LivenessConfig), and tears the session
 down on an [`Expired`](crate::LivenessVerdict) verdict.
 
+Login initializes `last_active` when the session record is created, so the idle
+clock starts at login rather than at the first request after the callback. Like
+later activity writes, this initial touch is best-effort: a failure leaves the
+record's storage deadline as the fail-open bound.
+
 Every deployment has an idle bound —
 [`idle_timeout`](crate::LivenessConfig::idle_timeout) defaults to 30 days
 ([`DEFAULT_IDLE_TIMEOUT`](crate::DEFAULT_IDLE_TIMEOUT)); there is no unbounded
@@ -31,8 +36,8 @@ not log every user out.
 
 ## Hot/cold write split
 
-Reading liveness happens on every request; writing it does not. Activity writes
-are:
+Reading liveness happens on every request. Login contributes one initial write;
+subsequent activity writes are:
 
 - **throttled** — coalesced to one write per
   [`touch_min_interval`](crate::LivenessConfig), so steady traffic is a trickle

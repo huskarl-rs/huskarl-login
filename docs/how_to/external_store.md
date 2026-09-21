@@ -98,7 +98,9 @@ serve — and refresh — an idle-expired session.
   `DELETE FROM sessions WHERE deadline < now()`.
 - **Liveness entries** reap the same way: the deadline handed to
   [`touch`](crate::LivenessStore::touch) never falls before the record's, so
-  applying it as the entry's TTL is likewise safe.
+  applying it as the entry's TTL is likewise safe. The driver initializes the
+  entry at login, after the record insert succeeds, using that same deadline;
+  this touch is best-effort so a liveness outage does not fail login.
 
 A complete in-memory implementation:
 
