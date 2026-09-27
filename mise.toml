@@ -6,3 +6,23 @@ env = { RUSTDOCFLAGS = "--cfg docsrs_huskarl_login" }
 [tasks.test-docs]
 description = "Run doctests, including the `_docs` pages"
 run = "cargo test --doc"
+
+[tasks."model:tools"]
+description = "Download the pinned TLC model checker"
+hide = true
+run = '''
+set -eu
+mkdir -p target/formal
+jar=target/formal/tla2tools-1.7.4.jar
+if [ ! -f "$jar" ]; then
+  curl --fail --location --retry 3 \
+    https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar \
+    --output "$jar.part"
+  mv "$jar.part" "$jar"
+fi
+'''
+
+[tasks.model]
+description = "Check the session lifecycle model with TLC (requires Docker and Python 3.9+)"
+depends = ["model:tools"]
+run = "python3 formal/check.py --docker --jar target/formal/tla2tools-1.7.4.jar --output target/formal/results"
