@@ -405,6 +405,58 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         ))
     }
 
+    /// Commit against the refresh generation observed before exchange. CAS
+    /// protects each load/check/write; unrelated application writes can retry.
+    async fn commit_refresh(
+        &self,
+        key: Uuid,
+        response: &TokenResponse,
+        expected_revision: u64,
+        lifetime: Duration,
+    ) -> Result<E::SessionType, SessionError> {
+        for _ in 0..UPDATE_MAX_ATTEMPTS {
+            let Some((mut fresh, version)) =
+                self.external.load(key).await.map_err(to_session_err)?
+            else {
+                return Err(SessionError::new(SessionErrorKind::Gone, SessionNotFound));
+            };
+            if fresh.state().refresh_revision != expected_revision {
+                // Another refresh won, including a prior attempt whose write
+                // succeeded but whose acknowledgement was lost. Do not write.
+                return Ok(fresh);
+            }
+            let next_revision = expected_revision.checked_add(1).ok_or_else(|| {
+                SessionError::from(SessionErrorKind::Store)
+                    .with_context("session refresh revision exhausted")
+            })?;
+            fresh.apply_refresh(response, lifetime);
+            // Stamp after custom apply_refresh implementations as well.
+            let mut state = fresh.state().clone();
+            state.refresh_revision = next_revision;
+            fresh.set_state(state);
+            match self
+                .external
+                .compare_and_swap(
+                    &fresh,
+                    version,
+                    self.write_deadline(&fresh, SystemTime::now()),
+                )
+                .await
+                .map_err(to_session_err)?
+            {
+                SaveOutcome::Committed => return Ok(fresh),
+                SaveOutcome::Conflict => {}
+                SaveOutcome::Missing => {
+                    return Err(SessionError::new(SessionErrorKind::Gone, SessionNotFound));
+                }
+            }
+        }
+        Err(SessionError::new(
+            SessionErrorKind::Conflict,
+            VersionConflict,
+        ))
+    }
+
     /// Encrypt the pointer cookie (the UUID's 16 raw bytes) and emit it
     /// alongside the kid sidecar (a `Max-Age=0` clear when there is no identity).
     /// When `deadline` is present, both cookies use its remaining lifetime.
@@ -740,20 +792,18 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
         &self,
         session: &mut E::SessionType,
         token_response: &TokenResponse,
+        expected_refresh_revision: u64,
         default_lifetime: std::time::Duration,
         _headers: &http::HeaderMap,
     ) -> Result<Vec<HeaderValue>, SessionError> {
-        // Commit through the CAS loop rather than saving this request's
-        // snapshot wholesale: an [`update`](Self::update) committed since this
-        // request loaded must survive the refresh. Replaying `apply_refresh`
-        // against the freshly-loaded session touches exactly what the refresh
-        // response justifies (plus any custom `Session::apply_refresh`
-        // override) and nothing else.
         let key = session.persisted().session_key;
         match self
-            .update(key, |fresh| {
-                fresh.apply_refresh(token_response, default_lifetime);
-            })
+            .commit_refresh(
+                key,
+                token_response,
+                expected_refresh_revision,
+                default_lifetime,
+            )
             .await
         {
             Ok(committed) => {
@@ -764,8 +814,9 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
             }
             Err(e) => {
                 // Keep the trait contract: on error the refresh is applied in
-                // memory (the request can still serve the new tokens) and the
-                // persist is owed.
+                // memory (the request can still serve the new tokens). The
+                // write may have committed before its acknowledgement failed;
+                // retries must retain the original expected revision.
                 session.apply_refresh(token_response, default_lifetime);
                 Err(e)
             }
@@ -1334,6 +1385,8 @@ mod tests {
         deadlines: std::sync::Mutex<Vec<SystemTime>>,
         /// When `true`, every `compare_and_swap` reports a conflict.
         always_conflict: bool,
+        /// Commit once, then report an error instead of acknowledging it.
+        lose_ack_once: std::sync::Mutex<bool>,
         /// A simulated concurrent writer applied just before the first
         /// `compare_and_swap` (advancing the stored version), to force one
         /// conflict-then-retry.
@@ -1346,6 +1399,7 @@ mod tests {
                 stored: std::sync::Mutex::new(Some((session, 0))),
                 deadlines: std::sync::Mutex::new(Vec::new()),
                 always_conflict: false,
+                lose_ack_once: std::sync::Mutex::new(false),
                 inject_once: std::sync::Mutex::new(None),
             }
         }
@@ -1363,21 +1417,25 @@ mod tests {
     impl ExternalSessionStore for VersioningStore {
         type SessionType = MinimalSession;
         type Version = i32;
-        type Error = Infallible;
+        type Error = std::io::Error;
 
-        async fn insert(&self, s: &MinimalSession, deadline: SystemTime) -> Result<(), Infallible> {
+        async fn insert(
+            &self,
+            s: &MinimalSession,
+            deadline: SystemTime,
+        ) -> Result<(), std::io::Error> {
             *self.stored.lock().unwrap() = Some((s.clone(), 0));
             self.deadlines.lock().unwrap().push(deadline);
             Ok(())
         }
-        async fn load(&self, _: Uuid) -> Result<Option<(MinimalSession, i32)>, Infallible> {
+        async fn load(&self, _: Uuid) -> Result<Option<(MinimalSession, i32)>, std::io::Error> {
             Ok(self.stored.lock().unwrap().clone())
         }
         async fn save(
             &self,
             s: &MinimalSession,
             deadline: SystemTime,
-        ) -> Result<SaveOutcome, Infallible> {
+        ) -> Result<SaveOutcome, std::io::Error> {
             let mut stored = self.stored.lock().unwrap();
             let Some((_, version)) = stored.as_ref() else {
                 return Ok(SaveOutcome::Missing);
@@ -1392,7 +1450,7 @@ mod tests {
             s: &MinimalSession,
             expected: i32,
             deadline: SystemTime,
-        ) -> Result<SaveOutcome, Infallible> {
+        ) -> Result<SaveOutcome, std::io::Error> {
             if self.always_conflict {
                 return Ok(SaveOutcome::Conflict);
             }
@@ -1408,13 +1466,16 @@ mod tests {
                 Some((_, version)) if *version == expected => {
                     *stored = Some((s.clone(), expected + 1));
                     self.deadlines.lock().unwrap().push(deadline);
+                    if std::mem::take(&mut *self.lose_ack_once.lock().unwrap()) {
+                        return Err(std::io::Error::other("lost commit acknowledgement"));
+                    }
                     Ok(SaveOutcome::Committed)
                 }
                 Some(_) => Ok(SaveOutcome::Conflict),
                 None => Ok(SaveOutcome::Missing),
             }
         }
-        async fn delete(&self, _: &MinimalSession) -> Result<(), Infallible> {
+        async fn delete(&self, _: &MinimalSession) -> Result<(), std::io::Error> {
             *self.stored.lock().unwrap() = None;
             Ok(())
         }
@@ -1806,6 +1867,56 @@ mod tests {
 
     // ── apply_refresh_and_save (engine refresh persist) ───────────────────
 
+    #[tokio::test]
+    async fn delayed_refresh_save_preserves_newer_generation() {
+        // Regression for the TLA+ three-request counterexample. A and B receive the SAME coordinated response
+        // for token 0; B's save is delayed until C has installed token 2.
+        // Sequential calls explicitly schedule the interleaving without sleeps.
+        use crate::test_support::rotating_token_response;
+
+        let now = SystemTime::now();
+        let lifetime = Duration::from_hours(1);
+        let headers = http::HeaderMap::new();
+        let initial = rotating_token_response("token-0", now);
+        let first = rotating_token_response("token-1", now);
+        let second = rotating_token_response("token-2", now + lifetime);
+        let mut session = test_session();
+        session.apply_refresh(&initial, lifetime);
+        let key = session.persisted().session_key;
+        let store = store_over(VersioningStore::with(session)).await;
+
+        let (mut a, _) = store.external.load(key).await.unwrap().unwrap();
+        let (mut b, _) = store.external.load(key).await.unwrap().unwrap();
+        assert_eq!(a.refresh_token(), initial.refresh_token());
+        assert_eq!(b.refresh_token(), initial.refresh_token());
+
+        store
+            .apply_refresh_and_save(&mut a, &first, 0, lifetime, &headers)
+            .await
+            .unwrap();
+        let (mut c, _) = store.external.load(key).await.unwrap().unwrap();
+        assert_eq!(c.refresh_token(), first.refresh_token());
+        store
+            .apply_refresh_and_save(&mut c, &second, 1, lifetime, &headers)
+            .await
+            .unwrap();
+        let (newer, version) = store.external.load(key).await.unwrap().unwrap();
+        assert_eq!(newer.refresh_token(), second.refresh_token());
+        assert_eq!(version, 2);
+
+        // B must adopt the current session without another write.
+        store
+            .apply_refresh_and_save(&mut b, &first, 0, lifetime, &headers)
+            .await
+            .unwrap();
+        let (retained, version) = store.external.load(key).await.unwrap().unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(retained.refresh_token(), second.refresh_token());
+        assert_eq!(b.refresh_token(), second.refresh_token());
+        assert_eq!(retained.token_expiry(), newer.token_expiry());
+        assert_eq!(b.state().refresh_revision, 2);
+    }
+
     /// A refresh-style token response with no `expires_in`, so the new expiry
     /// comes from the `default_lifetime` handed to `apply_refresh`.
     fn refresh_token_response() -> TokenResponse {
@@ -1839,6 +1950,7 @@ mod tests {
             .apply_refresh_and_save(
                 &mut snapshot,
                 &refresh_token_response(),
+                0,
                 lifetime,
                 &http::HeaderMap::new(),
             )
@@ -1877,6 +1989,7 @@ mod tests {
             .apply_refresh_and_save(
                 &mut snapshot,
                 &refresh_token_response(),
+                0,
                 Duration::from_hours(2),
                 &http::HeaderMap::new(),
             )
@@ -1887,6 +2000,151 @@ mod tests {
             snapshot.state().token_expiry > std::time::SystemTime::now() + Duration::from_mins(90),
             "the in-memory session must carry the refreshed tokens"
         );
+    }
+
+    #[rstest::rstest]
+    #[case::retry_after_failure(false)]
+    #[case::lost_acknowledgement(true)]
+    #[tokio::test]
+    async fn refresh_retry_adopts_newer_session(#[case] committed: bool) {
+        use crate::test_support::rotating_token_response;
+
+        let now = SystemTime::now();
+        let lifetime = Duration::from_hours(1);
+        let headers = http::HeaderMap::new();
+        let first = rotating_token_response("token-1", now);
+        let second = rotating_token_response("token-2", now + lifetime);
+        let mut pending = test_session();
+        let mut store = store_over(VersioningStore::with(pending.clone())).await;
+        store.external.always_conflict = !committed;
+        *store.external.lose_ack_once.lock().unwrap() = committed;
+        let result = store
+            .apply_refresh_and_save(&mut pending, &first, 0, lifetime, &headers)
+            .await;
+        assert_eq!(
+            result.unwrap_err().kind(),
+            if committed {
+                SessionErrorKind::Unavailable
+            } else {
+                SessionErrorKind::Conflict
+            }
+        );
+        // A committed write whose acknowledgement is lost leaves
+        // durable revision 1. A failed call leaves only in-memory tokens.
+        store.external.always_conflict = false;
+        let key = pending.persisted().session_key;
+        let (mut newer, _) = store.external.load(key).await.unwrap().unwrap();
+        let revision = newer.state().refresh_revision;
+        store
+            .apply_refresh_and_save(&mut newer, &second, revision, lifetime, &headers)
+            .await
+            .unwrap();
+        let version = store.external.stored_version();
+        store
+            .apply_refresh_and_save(&mut pending, &first, 0, lifetime, &headers)
+            .await
+            .unwrap();
+        assert_eq!(pending.refresh_token(), second.refresh_token());
+        assert_eq!(pending.state().refresh_revision, revision + 1);
+        assert_eq!(store.external.stored_version(), version);
+    }
+
+    #[tokio::test]
+    async fn refresh_revision_survives_non_rotating_tokens_and_duplicate_retry() {
+        let mut snapshot = test_session();
+        let store = store_over(VersioningStore::with(snapshot.clone())).await;
+        let response = refresh_token_response(); // no replacement refresh token
+        let headers = http::HeaderMap::new();
+        store
+            .apply_refresh_and_save(
+                &mut snapshot,
+                &response,
+                0,
+                Duration::from_hours(1),
+                &headers,
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.state().refresh_revision, 1);
+        let expiry = snapshot.token_expiry();
+        // Same precondition after a lost acknowledgement: no second write or
+        // reapplication, even when token equality cannot distinguish refreshes.
+        store
+            .apply_refresh_and_save(
+                &mut snapshot,
+                &response,
+                0,
+                Duration::from_hours(2),
+                &headers,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.external.stored_version(), 1);
+        assert_eq!(snapshot.token_expiry(), expiry);
+    }
+
+    #[tokio::test]
+    async fn refresh_rechecks_revision_after_cas_conflict() {
+        let mut snapshot = test_session();
+        let mut external = VersioningStore::with(snapshot.clone());
+        *external.inject_once.get_mut().unwrap() = Some(|s| {
+            s.persisted.state.refresh_revision = 1;
+            s.persisted.state.sid = Some("winning-refresh".to_owned());
+        });
+        let store = store_over(external).await;
+        let old_expiry = snapshot.token_expiry();
+        store
+            .apply_refresh_and_save(
+                &mut snapshot,
+                &refresh_token_response(),
+                0,
+                Duration::from_hours(2),
+                &http::HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.external.stored_version(), 1);
+        assert_eq!(snapshot.state().refresh_revision, 1);
+        assert_eq!(snapshot.sid(), Some("winning-refresh"));
+        assert_eq!(snapshot.token_expiry(), old_expiry);
+    }
+
+    #[tokio::test]
+    async fn refresh_revision_never_wraps() {
+        let mut snapshot = test_session();
+        snapshot.persisted.state.refresh_revision = u64::MAX;
+        let store = store_over(VersioningStore::with(snapshot.clone())).await;
+        let error = store
+            .apply_refresh_and_save(
+                &mut snapshot,
+                &refresh_token_response(),
+                u64::MAX,
+                Duration::from_hours(1),
+                &http::HeaderMap::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), SessionErrorKind::Store);
+        assert_eq!(store.external.stored_version(), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_refresh_cannot_resurrect_deleted_session() {
+        let mut snapshot = test_session();
+        let store = store_over(VersioningStore::with(snapshot.clone())).await;
+        store.external.delete(&snapshot).await.unwrap();
+        let error = store
+            .apply_refresh_and_save(
+                &mut snapshot,
+                &refresh_token_response(),
+                0,
+                Duration::from_hours(1),
+                &http::HeaderMap::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), SessionErrorKind::Gone);
+        assert!(store.external.stored.lock().unwrap().is_none());
     }
 
     #[tokio::test]

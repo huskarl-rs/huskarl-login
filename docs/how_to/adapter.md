@@ -241,7 +241,8 @@ handle is still alive. The arm is also the easiest to leave untested, since it
 only arises when an eager persist fails — which is why
 [`PendingPersist::new`](crate::engine::PendingPersist::new) is public: adapter
 tests can fabricate the deferred-persist path without arranging a failing
-store.
+store. Supply its third argument, the expected refresh revision from before
+the exchange; the retry must retain that value even when in-memory state changes.
 
 ## Speculative loads and frames
 

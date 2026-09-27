@@ -49,6 +49,13 @@ pub struct SessionState {
     /// Refresh token issued alongside the access token, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<RefreshToken>,
+    /// Store-backed refresh generation. Only a successful conditional refresh
+    /// commit advances this value; application updates must preserve it.
+    /// Older serialized sessions start at zero. This is not the backend's CAS
+    /// version and does not order cookie delivery in the browser.
+    #[serde(default)]
+    #[builder(default)]
+    pub refresh_revision: u64,
     /// Subject identifier from the ID token, for logout revocation lookup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub: Option<String>,
@@ -89,6 +96,7 @@ impl SessionState {
         Self {
             token_expiry,
             refresh_token: token_response.refresh_token().cloned(),
+            refresh_revision: 0,
             sub,
             sid,
             created_at: now,
@@ -198,6 +206,17 @@ mod tests {
 
     const HOUR: Duration = Duration::from_hours(1);
     const DAY: Duration = Duration::from_hours(24);
+
+    #[test]
+    fn refresh_revision_defaults_for_legacy_sessions_and_roundtrips() {
+        let legacy = serde_json::json!({"token_expiry": 3600, "created_at": 0, "expire_at": null});
+        let mut state: SessionState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(state.refresh_revision, 0);
+        state.refresh_revision = 7;
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let decoded: SessionState = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.refresh_revision, 7);
+    }
 
     struct S(SessionState);
 

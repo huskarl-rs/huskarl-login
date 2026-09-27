@@ -17,22 +17,24 @@ adapter skipped the persist phase, the connection dropped, or the handler
 panicked — would strand the rotated token and lock the session out. Persisting
 eagerly closes that window.
 
-The persist is *merge-safe*: the engine hands the token response to the
-session driver, which applies it as a replayable mutation rather than writing
-back the request-scoped snapshot wholesale. For store-backed sessions the
-mutation is committed through the same compare-and-swap loop as
-[`StoreBackedSessionStore::update`](crate::StoreBackedSessionStore::update),
-so an application update committed by a concurrent request between this
-request's load and the refresh is merged, never silently overwritten — and the
-request continues with the merged session. Cookie sessions keep the plain
-write; the browser cookie jar is inherently last-writer-wins.
+The store-backed persist uses compare-and-swap to merge with the latest record.
+An unrelated application update survives the refresh. A separate
+[`SessionState::refresh_revision`](crate::SessionState::refresh_revision) fences
+refresh results: the engine captures it before exchange, and a successful
+refresh commit increments it. If it has changed, the driver discards the delayed
+response and returns the current stored session without another write. This
+also handles providers that do not rotate their refresh token. The revision is
+independent of the backend version, which changes on application writes too.
+
+Cookie sessions retain their ordinary write behavior. Their revision cannot
+prevent an older `Set-Cookie` response from overwriting a newer browser cookie.
 
 On success the session is returned as
 [`Active`](crate::engine::LoadedSession::Active) with the re-sealed session
 cookies in `set_cookies`. If the eager persist *fails*, the session is returned
 as [`ActivePending`](crate::engine::LoadedSession::ActivePending), carrying a
 [`PendingPersist`](crate::engine::PendingPersist) that pairs the session with
-the token response. The post-response
+the token response and the original expected refresh revision. The post-response
 [`commit`](crate::engine::PendingPersist::commit) then acts as the retry,
 re-committing the refresh through the same merge-safe path; a commit failure
 falls to the adapter's [`PersistFailurePolicy`](crate::PersistFailurePolicy).
@@ -84,23 +86,39 @@ outcome to the retained-session paths above.
 
 ## Concurrent refresh
 
-Two in-flight requests — or two replicas in a distributed deployment — can enter
-the refresh window for the same session at once and each exchange the refresh
-token independently. The race window is the read → exchange → save-back
-sequence; because the save-back is eager (above), it is roughly the
-token-exchange round trip plus the store write, and does **not** include the
-inner handler's latency.
+Two in-flight requests or replicas can exchange the same refresh token
+independently. The engine calls `RefreshGrant::exchange` directly; the
+`huskarl::cache::TokenCache` and `RefreshTokenStore` abstractions are not wired
+into this path. Implementing one does not coordinate engine refreshes.
 
-When the AS rotates refresh tokens, the expected deployment shape is:
+The store-backed revision check prevents a delayed result overwriting a
+committed refresh, but it does not serialize token-endpoint requests or prevent
+provider-side reuse detection. It also cannot guarantee that the first result
+committed remains usable if another exchange invalidates it at the provider.
+Exchange coordination would require an explicit integration around this path,
+shared across replicas, and an appropriate provider policy.
 
-- a **shared refresh-token cache** across replicas (implement
-  `huskarl_login::client::cache::TokenCache` / `RefreshTokenStore` over shared storage) so
-  concurrent refreshes converge on the rotated token instead of racing, and
-- an AS configured with a **rotation grace period**, so reuse of the
-  just-rotated token inside the race window is honored rather than treated as
-  token theft (which would revoke the whole token family and log the user out).
-
-Without both, occasional concurrent refreshes lose the race and surface as
-teardowns — most visibly with cookie sessions, where the refresh token lives in
-the cookie and the last writer wins. See the
+Cookie sessions additionally depend on browser delivery order. Even identical
+responses for one input token can be delivered after a later generation has
+been installed. A provider grace period may tolerate bounded delays, but cannot
+provide a guarantee against arbitrary response delay. Keeping authoritative
+refresh state server-side could allow stale cookies to recover, at the cost of
+making refresh handling stateful. See the
 [rotation deployment guide](crate::_docs::how_to::rotation).
+
+## Revision persistence and upgrades
+
+Older serialized sessions default their refresh revision to zero. Application
+updates must preserve it. Whole-session saves still use the backend's
+unconditional write and can bypass the refresh guard; prefer
+`StoreBackedSessionStore::update` for application mutations.
+
+Pre-fix binaries also bypass the check. This is a compatibility caveat for
+upgrades from those binaries, not subsequent deployments of compliant writers.
+
+Direct callers of `SessionDriver::apply_refresh_and_save` and adapter tests
+using `PendingPersist::new` must now supply the revision observed before the
+exchange, including on retries. Do not reconstruct it from the already-refreshed
+in-memory session. A lost write acknowledgement can mean the original commit
+succeeded: the retry observes the advanced revision and adopts stored state
+without applying the response again.

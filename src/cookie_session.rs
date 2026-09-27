@@ -1203,6 +1203,82 @@ mod tests {
         assert_eq!(loaded.state().expire_at.map(secs), Some(secs(deadline)));
     }
 
+    #[tokio::test]
+    async fn delayed_refresh_delivery_reproduces_token_regression() {
+        // Characterize the same three-request trace as the store test, with
+        // real encrypted cookies and reordered browser delivery. A and B use
+        // the same response for token 0, so duplicate exchanges are not needed.
+        use crate::test_support::rotating_token_response;
+
+        let store = test_store().await;
+        let now = SystemTime::now();
+        let lifetime = Duration::from_hours(1);
+        let initial = rotating_token_response("token-0", now);
+        let first = rotating_token_response("token-1", now);
+        let second = rotating_token_response("token-2", now + lifetime);
+        let mut session = CookieSession(test_state());
+        session.apply_refresh(&initial, lifetime);
+        let mut jar = std::collections::BTreeMap::new();
+        let initial_cookies = store
+            .save_session(&session, &HeaderMap::new())
+            .await
+            .unwrap();
+        apply_to_jar(&mut jar, &initial_cookies);
+
+        let original_headers = request_from_jar(&jar);
+        let mut a = store
+            .load_session(&original_headers)
+            .await
+            .into_valid()
+            .unwrap();
+        let mut b = store
+            .load_session(&original_headers)
+            .await
+            .into_valid()
+            .unwrap();
+        assert_eq!(a.refresh_token(), initial.refresh_token());
+        assert_eq!(b.refresh_token(), initial.refresh_token());
+        let cookies_a = store
+            .apply_refresh_and_save(&mut a, &first, 0, lifetime, &original_headers)
+            .await
+            .unwrap();
+        let delayed_cookies_b = store
+            .apply_refresh_and_save(&mut b, &first, 0, lifetime, &original_headers)
+            .await
+            .unwrap();
+        apply_to_jar(&mut jar, &cookies_a);
+
+        let newer_headers = request_from_jar(&jar);
+        let mut c = store
+            .load_session(&newer_headers)
+            .await
+            .into_valid()
+            .unwrap();
+        assert_eq!(c.refresh_token(), first.refresh_token());
+        let cookies_c = store
+            .apply_refresh_and_save(&mut c, &second, 0, lifetime, &newer_headers)
+            .await
+            .unwrap();
+        apply_to_jar(&mut jar, &cookies_c);
+        let newer = store
+            .load_session(&request_from_jar(&jar))
+            .await
+            .into_valid()
+            .unwrap();
+        assert_eq!(newer.refresh_token(), second.refresh_token());
+
+        // Both saves have already succeeded. Delivering B's older response
+        // last restores token 1, which still decrypts as a valid session.
+        apply_to_jar(&mut jar, &delayed_cookies_b);
+        let regressed = store
+            .load_session(&request_from_jar(&jar))
+            .await
+            .into_valid()
+            .unwrap();
+        assert_eq!(regressed.refresh_token(), first.refresh_token());
+        assert!(regressed.token_expiry() < newer.token_expiry());
+    }
+
     // ── SessionEnricher / CookiePayload ───────────────────────────────────
 
     /// An enrichment-built session type: `email` is required, so there is no

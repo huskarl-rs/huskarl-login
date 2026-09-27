@@ -377,10 +377,14 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// compare-and-swap, so a concurrent
     /// [`update`](crate::StoreBackedSessionStore::update) is merged rather than
     /// silently overwritten; on success `session` is replaced with the
-    /// committed (merged) session.
+    /// committed (merged) session. `expected_refresh_revision` is captured
+    /// before the token exchange and must be reused for any deferred retry.
+    /// The store-backed driver discards the response if another refresh has
+    /// advanced the revision, returning the current stored session instead.
     ///
-    /// On error the refresh has been applied to `session` in memory but not
-    /// persisted — the save is owed (see
+    /// On error the refresh has been applied to `session` in memory; persistence
+    /// may have failed or its acknowledgement may have been lost. Retry with
+    /// the original expected revision (see
     /// [`LoadedSession::ActivePending`](crate::engine::LoadedSession::ActivePending)).
     ///
     /// [`StoreBackedSessionStore`]: crate::StoreBackedSessionStore
@@ -388,6 +392,7 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
         &self,
         session: &mut Self::SessionType,
         token_response: &TokenResponse,
+        _expected_refresh_revision: u64,
         default_lifetime: std::time::Duration,
         headers: &http::HeaderMap,
     ) -> impl Future<Output = Result<Vec<HeaderValue>, SessionError>> + MaybeSend {

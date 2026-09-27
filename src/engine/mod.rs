@@ -407,6 +407,9 @@ pub struct PendingPersist<S> {
     /// and `Some` until [`commit`](Self::commit) or [`abandon`](Self::abandon)
     /// consumes it — `Drop` reports a still-armed guard.
     token_response: Option<Box<TokenResponse>>,
+    /// Revision observed before exchange, retained even if the eager write
+    /// committed but its acknowledgement was lost.
+    expected_refresh_revision: u64,
     /// Test-only observer incremented when the guard fires, so tests can
     /// assert drop detection deterministically — same rationale as
     /// [`SetCookies::drop_probe`].
@@ -419,10 +422,13 @@ impl<S> PendingPersist<S> {
     /// owed. [`LoginEngine::load_session`] constructs these; the constructor
     /// is public so adapter tests can fabricate the deferred-persist path
     /// without arranging a failing store.
-    pub fn new(session: S, token_response: TokenResponse) -> Self {
+    /// `expected_refresh_revision` must be the revision from before exchange,
+    /// not one inferred from the already-refreshed session.
+    pub fn new(session: S, token_response: TokenResponse, expected_refresh_revision: u64) -> Self {
         Self {
             session: Arc::new(session),
             token_response: Some(Box::new(token_response)),
+            expected_refresh_revision,
             #[cfg(test)]
             drop_probe: None,
         }
@@ -497,6 +503,7 @@ impl<S> PendingPersist<S> {
             .apply_refresh_and_save(
                 session,
                 &token_response,
+                self.expected_refresh_revision,
                 engine.config.default_token_lifetime,
                 request_headers,
             )
@@ -1026,6 +1033,7 @@ where
         mut session: SD::SessionType,
         headers: &HeaderMap,
     ) -> LoadedSession<SD::SessionType> {
+        let expected_refresh_revision = session.state().refresh_revision;
         let Some(rt) = session.refresh_token().cloned() else {
             let clears = self.terminate_best_effort(&session, headers).await;
             self.record_refresh(&RefreshResult::NoRefreshToken);
@@ -1050,6 +1058,7 @@ where
                     .apply_refresh_and_save(
                         &mut session,
                         &token_response,
+                        expected_refresh_revision,
                         self.config.default_token_lifetime,
                         headers,
                     )
@@ -1080,7 +1089,11 @@ where
                             error_chain(&e)
                         );
                         LoadedSession::ActivePending {
-                            pending: PendingPersist::new(session, token_response),
+                            pending: PendingPersist::new(
+                                session,
+                                token_response,
+                                expected_refresh_revision,
+                            ),
                         }
                     }
                 }

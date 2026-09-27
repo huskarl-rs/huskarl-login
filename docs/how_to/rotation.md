@@ -1,39 +1,51 @@
 # Deploy refresh-token rotation safely
 
-If your authorization server (AS) rotates refresh tokens on each use, a
-multi-replica deployment needs two things in place so that concurrent refreshes
-don't log users out. The background is in the
-[refresh explanation](crate::_docs::explanation::refresh); this is the checklist.
+There are two distinct concurrency boundaries: exchanging tokens at the
+provider and persisting/delivering the resulting session. The store-backed
+refresh revision protects the latter's database write, not the former.
 
-## 1. A shared refresh-token cache
+## Check the actual refresh path
 
-Concurrent requests across replicas can enter the refresh window for the same
-session at once. Give them a shared place to converge by implementing
-`huskarl_login::client::cache::TokenCache` / `RefreshTokenStore` over shared
-storage (the same Redis or database you already run). Concurrent refreshes then
-coordinate through it instead of each independently spending the refresh token
-and racing.
+`LoginEngine` calls `RefreshGrant::exchange` directly. The client's `TokenCache`
+and `RefreshTokenStore` abstractions are **not integrated into this path**;
+implementing a shared cache alone does not coordinate login-engine refreshes.
+There is currently no built-in refresh coordinator configuration on the engine.
 
-## 2. A rotation grace period on the AS
+If your provider requires serialized refresh exchanges, deployment needs an
+explicit coordination integration covering this path across replicas. Even
+with coordination, browser cookie delivery may occur out of order.
 
-Configure the authorization server with a short **rotation grace period** so
-that reuse of a just-rotated refresh token inside the race window is honored
-rather than treated as token theft. Without it, the AS sees the second request
-replay the old token and revokes the entire token family — logging the user out.
+## Verify provider behavior
 
-## What happens without them
+Check how the authorization server handles concurrent reuse of a refresh token:
+which responses remain usable, whether reuse revokes a token family, and whether
+it offers a grace period. A grace period can tolerate bounded races; it is not
+a guarantee against arbitrary request or response delays.
 
-The race window is small — the engine persists a refresh eagerly, so it is
-roughly the token-exchange round trip plus the store write, not the request's
-full handler latency. But occasional collisions still occur, and they surface as
-session teardowns. This is most visible with
-[`CookieSessionStore`](crate::CookieSessionStore), where the refresh token lives
-in the browser cookie and the last writer simply wins; a store-backed deployment
-with the shared cache above narrows the window further.
+The store-backed revision guard keeps an older result from overwriting a
+committed refresh, including during a deferred persistence retry. It does not
+stop an independent exchange from invalidating credentials at the provider.
 
-## Tuning the window
+## Cookie-session limitations
 
-[`token_refresh_margin`](crate::LoginConfig) controls how early before expiry a
-refresh fires. A larger margin refreshes sooner (more headroom against a slow
-AS) at the cost of refreshing more often; it does not change the rotation
-requirements above.
+Cookie refresh persistence only prepares `Set-Cookie`; delivery completes the
+write. An old response can arrive after a newer refresh or logout and replace
+browser state. This cannot be prevented by a revision inside a cookie of the
+same name, because the browser does not compare revisions.
+
+Stateless deployments must accept this ordering limitation and choose provider
+behavior accordingly. An authoritative shared refresh record can support
+recovery from stale cookies, but makes refresh handling stateful and requires
+an integration beyond the current cookie driver.
+
+## Tuning and rollout
+
+[`token_refresh_margin`](crate::LoginConfig) changes when refresh begins. It
+does not fix exchange or response-order races. Eager persistence shortens the
+normal store write window, but deferred retries and delayed cookie delivery
+can extend it beyond the token-exchange round trip.
+
+Store-backed refresh commits are guarded by their original revision, but
+whole-session saves and direct backend writes can bypass that check. Prefer
+`StoreBackedSessionStore::update` for application mutations. See the
+[refresh explanation](crate::_docs::explanation::refresh).

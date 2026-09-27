@@ -19,6 +19,22 @@ use crate::{
     },
 };
 
+/// A successful rotation response with a controlled token and issuance time.
+pub(crate) fn rotating_token_response(
+    token: &str,
+    issued_at: std::time::SystemTime,
+) -> crate::client::grant::core::TokenResponse {
+    use crate::core::secrets::SecretString;
+
+    crate::client::grant::core::RawTokenResponse::builder()
+        .access_token(SecretString::new("rotated-access-token"))
+        .refresh_token(SecretString::new(token))
+        .token_type("Bearer")
+        .build()
+        .into_token_response(None, issued_at)
+        .unwrap()
+}
+
 /// A [`Secret`] yielding fixed bytes and no key identity.
 #[derive(Clone)]
 struct TestSecret(SecretBytes);

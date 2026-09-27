@@ -266,6 +266,7 @@ impl AeadUnsealer for NoopSealer {
 struct MockSessionStore {
     session: Mutex<Option<MockSession>>,
     save_called: Mutex<bool>,
+    refresh_revisions: Mutex<Vec<u64>>,
     revoke_called: Mutex<bool>,
     fail_save: bool,
     gone_on_save: bool,
@@ -299,6 +300,7 @@ impl MockSessionStore {
         Self {
             session: Mutex::new(Some(s)),
             save_called: Mutex::new(false),
+            refresh_revisions: Mutex::new(Vec::new()),
             revoke_called: Mutex::new(false),
             fail_save: false,
             gone_on_save: false,
@@ -340,6 +342,7 @@ impl MockSessionStore {
         Self {
             session: Mutex::new(None),
             save_called: Mutex::new(false),
+            refresh_revisions: Mutex::new(Vec::new()),
             revoke_called: Mutex::new(false),
             fail_save: false,
             gone_on_save: false,
@@ -433,6 +436,22 @@ impl SessionDriver for MockSessionStore {
             .take()
             .map_or(crate::DriverLoad::Absent, crate::DriverLoad::Valid))
     }
+    async fn apply_refresh_and_save(
+        &self,
+        session: &mut MockSession,
+        response: &crate::client::grant::core::TokenResponse,
+        expected_refresh_revision: u64,
+        lifetime: Duration,
+        headers: &HeaderMap,
+    ) -> Result<Vec<HeaderValue>, SessionError> {
+        self.refresh_revisions
+            .lock()
+            .unwrap()
+            .push(expected_refresh_revision);
+        session.apply_refresh(response, lifetime);
+        self.save(session, headers).await
+    }
+
     async fn save(&self, _: &MockSession, _: &HeaderMap) -> Result<Vec<HeaderValue>, SessionError> {
         if self.fail_save {
             return Err(SessionError::new(
@@ -1638,7 +1657,8 @@ async fn commit_retries_the_deferred_refresh_save() {
     // The `PendingPersist` carries the refresh response so the post-response
     // commit can re-apply it (through the merge-safe path) once the store
     // recovers.
-    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    let mut session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    session.state.refresh_revision = 7;
     let mut e = LoginEngine::builder()
         .config(default_config())
         .grant(test_grant(TokenHttp).await)
@@ -1647,7 +1667,9 @@ async fn commit_retries_the_deferred_refresh_save() {
         .build()
         .unwrap();
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    let pending = expect_pending(loaded);
+    let mut pending = expect_pending(loaded);
+    assert_eq!(pending.expected_refresh_revision, 7);
+    Arc::make_mut(&mut pending.session).state.refresh_revision = 8;
     // A serving handle taken during the request survives the commit.
     let session = pending.session_arc();
 
@@ -1655,6 +1677,10 @@ async fn commit_retries_the_deferred_refresh_save() {
     e.session_store.fail_save = false;
     let set_cookies = pending.commit(&e, &HeaderMap::new()).await.unwrap();
     assert!(e.session_store.save_called());
+    assert_eq!(
+        *e.session_store.refresh_revisions.lock().unwrap(),
+        vec![7, 7]
+    );
     assert_eq!(
         set_cookies.into_headers(),
         vec![HeaderValue::from_static(MOCK_SAVE_COOKIE)]
@@ -1767,7 +1793,7 @@ async fn commit_calls_store_save() {
     let (session, _) = expect_active(loaded);
     // The public constructor: what adapter tests use to fabricate the
     // deferred-persist path without arranging a failing store.
-    let pending = PendingPersist::new(session, token_response_fixture());
+    let pending = PendingPersist::new(session, token_response_fixture(), 0);
     let set_cookies = pending.commit(&e, &api_headers()).await.unwrap();
     assert!(e.session_store.save_called());
     assert!(!set_cookies.into_headers().is_empty());
@@ -1781,7 +1807,7 @@ fn pending_persist_drop_guard_detects_a_dropped_persist() {
     };
 
     let probe = Arc::new(AtomicUsize::new(0));
-    let dropped = PendingPersist::new(valid_session(), token_response_fixture())
+    let dropped = PendingPersist::new(valid_session(), token_response_fixture(), 0)
         .with_drop_probe(Arc::clone(&probe));
     drop(dropped);
     assert_eq!(
@@ -1803,7 +1829,7 @@ async fn pending_persist_drop_guard_stays_silent_for_defused_guards() {
     // `commit` defuses the guard (consuming the returned cookies keeps the
     // `SetCookies` guard quiet too — this test is about the persist guard).
     let e = engine(MockSessionStore::with_session(valid_session())).await;
-    let committed = PendingPersist::new(valid_session(), token_response_fixture())
+    let committed = PendingPersist::new(valid_session(), token_response_fixture(), 0)
         .with_drop_probe(Arc::clone(&probe));
     let _cookies = committed
         .commit(&e, &api_headers())
@@ -1812,7 +1838,7 @@ async fn pending_persist_drop_guard_stays_silent_for_defused_guards() {
         .into_headers();
 
     // So does `abandon`, the explicit non-commit verb.
-    let abandoned = PendingPersist::new(valid_session(), token_response_fixture())
+    let abandoned = PendingPersist::new(valid_session(), token_response_fixture(), 0)
         .with_drop_probe(Arc::clone(&probe));
     abandoned.abandon();
 
@@ -1820,7 +1846,7 @@ async fn pending_persist_drop_guard_stays_silent_for_defused_guards() {
     // persist is collateral of the panic, not a separate bug to report.
     let unwind_probe = Arc::clone(&probe);
     let result = std::panic::catch_unwind(move || {
-        let _armed = PendingPersist::new(valid_session(), token_response_fixture())
+        let _armed = PendingPersist::new(valid_session(), token_response_fixture(), 0)
             .with_drop_probe(unwind_probe);
         panic!("handler panic");
     });
