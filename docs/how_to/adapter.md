@@ -290,8 +290,9 @@ Beyond the lifecycle above, expose the engine's explicit persistence methods
 to the application in whatever shape fits the framework:
 
 - [`save_session`](crate::engine::LoginEngine::save_session) after the
-  application mutated its session. It is a whole-session, last-writer-wins
-  write; for store-backed sessions mutated concurrently, prefer
+  application mutated its session. Store-backed saves reject mismatched refresh
+  revisions, tokens, or expiry; application fields and cookie delivery remain
+  last-writer-wins. For store-backed sessions mutated concurrently, prefer
   [`StoreBackedSessionStore::update`](crate::StoreBackedSessionStore::update),
   which merges via compare-and-swap and returns no cookies to deliver.
 - [`terminate_session`](crate::engine::LoginEngine::terminate_session) to end a

@@ -1269,13 +1269,17 @@ where
         TerminateSessionOutcome { clears, revocation }
     }
 
-    /// Explicitly and unconditionally saves a session (e.g. after the
+    /// Explicitly saves a session (e.g. after the
     /// application mutated it), returning [`SetCookies`]; unlike the deferred
     /// [`PendingPersist::commit`]. See [`PendingPersist::commit`] for
     /// `request_headers`.
     ///
-    /// This is a whole-session, last-writer-wins write: it overwrites changes
-    /// committed concurrently by other requests. For store-backed sessions
+    /// Store-backed saves require matching refresh revision, token, and expiry
+    /// (at serialized whole-second precision), preserving the stored expiry
+    /// and committing via CAS. Mismatches return [`SessionErrorKind::Conflict`].
+    /// Within
+    /// that generation, application fields remain last-writer-wins. Cookie
+    /// saves remain last-writer-wins in the browser. For store-backed sessions
     /// that may be mutated concurrently, prefer
     /// [`StoreBackedSessionStore::update`](crate::StoreBackedSessionStore::update),
     /// which merges via compare-and-swap.

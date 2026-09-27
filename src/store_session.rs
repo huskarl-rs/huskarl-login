@@ -35,7 +35,7 @@ use crate::{
 /// Persistence backend for a [`StoreBackedSessionStore`].
 ///
 /// Implement this trait over Redis, SQL, or another server-side store. Its
-/// responsibilities are deliberately limited to insert, load, save,
+/// responsibilities are deliberately limited to insert, load,
 /// compare-and-swap, delete, and record retention. Session construction is
 /// handled by the [`SessionEnricher`] attached to the driver.
 ///
@@ -66,7 +66,8 @@ pub trait ExternalSessionStore: MaybeSendSync {
     type Error: std::error::Error + MaybeSendSync + 'static;
 
     /// Persist a newly created session. Called once per login, after
-    /// enrichment. The retention contract on [`save`](Self::save) applies.
+    /// enrichment. Apply `deadline` as the record's absolute TTL; the retention
+    /// contract on [`compare_and_swap`](Self::compare_and_swap) applies.
     fn insert(
         &self,
         session: &Self::SessionType,
@@ -80,28 +81,18 @@ pub trait ExternalSessionStore: MaybeSendSync {
         session_key: Uuid,
     ) -> impl Future<Output = Result<LoadOutcome<Self>, Self::Error>> + MaybeSend;
 
-    /// Save a session unconditionally (last-writer-wins) **only if its record
-    /// still exists**. Return [`SaveOutcome::Missing`] rather than inserting a
-    /// record: this prevents an in-flight save from resurrecting a session
-    /// deleted by logout. Every committed write must change the stored
-    /// [`Version`](Self::Version).
-    ///
-    /// Apply the supplied `deadline` as the record's absolute TTL on **every**
-    /// write — backends like Redis drop a key's TTL on a plain overwrite — and
-    /// never convert it to a sliding duration.
-    /// See the [external store guide](crate::_docs::how_to::external_store)
-    /// for the full retention contract.
-    fn save(
-        &self,
-        session: &Self::SessionType,
-        deadline: SystemTime,
-    ) -> impl Future<Output = Result<SaveOutcome, Self::Error>> + MaybeSend;
-
     /// Save `session` only if the stored [`Version`](Self::Version) still
     /// equals `expected`, changing it on success. Return
     /// [`SaveOutcome::Conflict`] for a version mismatch or
     /// [`SaveOutcome::Missing`] when the record does not exist, without
-    /// writing. The retention contract on [`save`](Self::save) applies.
+    /// writing. Never insert a missing record: this prevents an in-flight
+    /// write from resurrecting a session deleted by logout.
+    ///
+    /// Apply the supplied `deadline` as the record's absolute TTL on **every**
+    /// successful write — backends like Redis drop a key's TTL on a plain
+    /// overwrite — and never convert it to a sliding duration.
+    /// See the [external store guide](crate::_docs::how_to::external_store)
+    /// for the full retention contract.
     fn compare_and_swap(
         &self,
         session: &Self::SessionType,
@@ -124,7 +115,7 @@ pub type LoadOutcome<E> = Option<(
     <E as ExternalSessionStore>::Version,
 )>;
 
-/// Outcome of an [`ExternalSessionStore`] save or compare-and-swap write.
+/// Outcome of an [`ExternalSessionStore::compare_and_swap`] write.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveOutcome {
@@ -623,27 +614,47 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         &self,
         session: &E::SessionType,
     ) -> Result<Vec<HeaderValue>, SessionError> {
-        match self
-            .external
-            .save(session, self.write_deadline(session, SystemTime::now()))
-            .await
-            .map_err(to_session_err)?
-        {
-            SaveOutcome::Committed => {}
-            SaveOutcome::Missing => {
+        let key = session.persisted().session_key;
+        for _ in 0..UPDATE_MAX_ATTEMPTS {
+            let Some((current, version)) = self.external.load(key).await.map_err(to_session_err)?
+            else {
                 return Err(SessionError::new(SessionErrorKind::Gone, SessionNotFound));
-            }
-            SaveOutcome::Conflict => {
+            };
+            if !session.state().matches_persisted_refresh(current.state()) {
                 return Err(SessionError::new(
                     SessionErrorKind::Conflict,
                     VersionConflict,
                 ));
             }
+            // Whole-session saves may replace application fields, but may
+            // not publish a pending refresh under its old revision. Preserve
+            // stored expiry exactly after the wire-precision comparison.
+            let mut candidate = session.clone();
+            let mut state = candidate.state().clone();
+            state.token_expiry = current.state().token_expiry;
+            candidate.set_state(state);
+            match self
+                .external
+                .compare_and_swap(
+                    &candidate,
+                    version,
+                    self.write_deadline(&candidate, SystemTime::now()),
+                )
+                .await
+                .map_err(to_session_err)?
+            {
+                // The session key is unchanged, so no new pointer cookie.
+                SaveOutcome::Committed => return Ok(vec![]),
+                SaveOutcome::Conflict => {}
+                SaveOutcome::Missing => {
+                    return Err(SessionError::new(SessionErrorKind::Gone, SessionNotFound));
+                }
+            }
         }
-        // The pointer cookie's value (the session_key) doesn't change after
-        // creation, so subsequent saves don't reissue it. The initial cookie
-        // is emitted by `create_session`.
-        Ok(vec![])
+        Err(SessionError::new(
+            SessionErrorKind::Conflict,
+            VersionConflict,
+        ))
     }
 
     pub(crate) async fn revoke_session(
@@ -944,10 +955,6 @@ mod tests {
 
         async fn load(&self, _: Uuid) -> Result<Option<(MinimalSession, i32)>, Infallible> {
             Ok(Some((self.0.clone(), 0)))
-        }
-
-        async fn save(&self, _: &MinimalSession, _: SystemTime) -> Result<SaveOutcome, Infallible> {
-            Ok(SaveOutcome::Committed)
         }
 
         async fn compare_and_swap(
@@ -1431,20 +1438,6 @@ mod tests {
         async fn load(&self, _: Uuid) -> Result<Option<(MinimalSession, i32)>, std::io::Error> {
             Ok(self.stored.lock().unwrap().clone())
         }
-        async fn save(
-            &self,
-            s: &MinimalSession,
-            deadline: SystemTime,
-        ) -> Result<SaveOutcome, std::io::Error> {
-            let mut stored = self.stored.lock().unwrap();
-            let Some((_, version)) = stored.as_ref() else {
-                return Ok(SaveOutcome::Missing);
-            };
-            let next = version + 1;
-            *stored = Some((s.clone(), next));
-            self.deadlines.lock().unwrap().push(deadline);
-            Ok(SaveOutcome::Committed)
-        }
         async fn compare_and_swap(
             &self,
             s: &MinimalSession,
@@ -1595,6 +1588,274 @@ mod tests {
 
         assert_eq!(error.kind(), SessionErrorKind::Gone);
         assert!(store.external.stored.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn whole_session_save_rejects_stale_refresh_revision() {
+        let stale = test_session();
+        let mut refreshed = stale.clone();
+        let store = store_over(VersioningStore::with(stale.clone())).await;
+        let response = crate::test_support::rotating_token_response("new-token", SystemTime::now());
+        store
+            .apply_refresh_and_save(
+                &mut refreshed,
+                &response,
+                0,
+                Duration::from_hours(2),
+                &http::HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let error = store.save_session(&stale).await.unwrap_err();
+        assert_eq!(error.kind(), SessionErrorKind::Conflict);
+        let (stored, version) = store
+            .external
+            .load(stale.persisted().session_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(stored.state().refresh_revision, 1);
+        assert_eq!(stored.refresh_token(), response.refresh_token());
+        assert_eq!(stored.token_expiry(), refreshed.token_expiry());
+    }
+
+    #[tokio::test]
+    async fn pending_whole_save_rejects_uncommitted_refresh() {
+        // The AS is uncoordinated: two exchanges of token 0 produce distinct
+        // results. Whole-saving B must not publish its pending tokens under
+        // the old revision before A commits.
+        use crate::test_support::rotating_token_response;
+
+        let now = SystemTime::now();
+        let lifetime = Duration::from_hours(1);
+        let headers = http::HeaderMap::new();
+        let mut a = test_session();
+        let mut b = a.clone();
+        let mut store = store_over(VersioningStore::with(a.clone())).await;
+        let first = rotating_token_response("token-1", now);
+        let second = rotating_token_response("token-2", now + lifetime);
+        store.external.always_conflict = true;
+        let error = store
+            .apply_refresh_and_save(&mut b, &second, 0, lifetime, &headers)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), SessionErrorKind::Conflict);
+        assert_eq!(b.state().refresh_revision, 0);
+        assert_eq!(b.refresh_token(), second.refresh_token());
+
+        store.external.always_conflict = false;
+        let error = store.save_session(&b).await.unwrap_err();
+        assert_eq!(error.kind(), SessionErrorKind::Conflict);
+        let (stored, version) = store
+            .external
+            .load(b.persisted().session_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(version, 0);
+        assert_eq!(stored.state().refresh_revision, 0);
+        assert_eq!(stored.refresh_token(), a.refresh_token());
+
+        store
+            .apply_refresh_and_save(&mut a, &first, 0, lifetime, &headers)
+            .await
+            .unwrap();
+        // B's deferred commit then adopts A's now-committed generation.
+        store
+            .apply_refresh_and_save(&mut b, &second, 0, lifetime, &headers)
+            .await
+            .unwrap();
+        assert_eq!(b.state().refresh_revision, 1);
+        assert_eq!(b.refresh_token(), first.refresh_token());
+        assert_eq!(b.token_expiry(), a.token_expiry());
+        assert_eq!(store.external.stored_version(), 1);
+    }
+
+    #[tokio::test]
+    async fn whole_session_save_rechecks_revision_after_cas_conflict() {
+        let snapshot = test_session();
+        let mut external = VersioningStore::with(snapshot.clone());
+        *external.inject_once.get_mut().unwrap() = Some(|s| {
+            s.persisted.state.refresh_revision = 1;
+            s.persisted.state.sid = Some("concurrent-refresh".to_owned());
+        });
+        let store = store_over(external).await;
+        let error = store.save_session(&snapshot).await.unwrap_err();
+        assert_eq!(error.kind(), SessionErrorKind::Conflict);
+        let (stored, version) = store
+            .external
+            .load(snapshot.persisted().session_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(stored.state().refresh_revision, 1);
+        assert_eq!(stored.sid(), Some("concurrent-refresh"));
+    }
+
+    #[rstest::rstest]
+    #[case::rotated_token_only(true)]
+    #[case::expiry_only_without_rotation(false)]
+    #[tokio::test]
+    async fn pending_whole_save_checks_token_and_expiry(#[case] rotates: bool) {
+        use crate::test_support::rotating_token_response;
+
+        let now = SystemTime::now();
+        let lifetime = Duration::from_hours(1);
+        let initial = rotating_token_response("initial", now);
+        let mut pending = test_session();
+        pending.apply_refresh(&initial, lifetime);
+        let original = pending.clone();
+        let mut store = store_over(VersioningStore::with(original.clone())).await;
+        let response = if rotates {
+            rotating_token_response("rotated", now)
+        } else {
+            refresh_token_response() // expires_in and replacement token absent
+        };
+        let lifetime = if rotates {
+            lifetime
+        } else {
+            Duration::from_hours(2)
+        };
+        store.external.always_conflict = true;
+        store
+            .apply_refresh_and_save(
+                &mut pending,
+                &response,
+                0,
+                lifetime,
+                &http::HeaderMap::new(),
+            )
+            .await
+            .unwrap_err();
+        if rotates {
+            assert_eq!(pending.token_expiry(), original.token_expiry());
+        } else {
+            assert_eq!(pending.refresh_token(), original.refresh_token());
+        }
+        store.external.always_conflict = false;
+        assert_eq!(
+            store.save_session(&pending).await.unwrap_err().kind(),
+            SessionErrorKind::Conflict
+        );
+        assert_eq!(store.external.stored_version(), 0);
+
+        // The pending retry remains the supported path and commits normally.
+        store
+            .apply_refresh_and_save(
+                &mut pending,
+                &response,
+                0,
+                lifetime,
+                &http::HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.state().refresh_revision, 1);
+        assert!(store.save_session(&pending).await.unwrap().is_empty());
+        assert_eq!(store.external.stored_version(), 2);
+    }
+
+    #[rstest::rstest]
+    #[case::stored_precision_is_seconds(true)]
+    #[case::caller_precision_is_seconds(false)]
+    #[tokio::test]
+    async fn whole_session_save_accepts_serialized_expiry_precision(
+        #[case] stored_roundtripped: bool,
+    ) {
+        let mut precise = test_session();
+        let seconds = precise
+            .token_expiry()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        precise.persisted.state.token_expiry =
+            SystemTime::UNIX_EPOCH + Duration::from_secs(seconds) + Duration::from_millis(123);
+        precise.persisted.state.refresh_revision = 1;
+        let mut roundtripped = precise.clone();
+        roundtripped.persisted.state =
+            serde_json::from_slice(&serde_json::to_vec(precise.state()).unwrap()).unwrap();
+        let (stored, mut caller) = if stored_roundtripped {
+            (roundtripped, precise)
+        } else {
+            (precise, roundtripped)
+        };
+        let authoritative_expiry = stored.token_expiry();
+        let store = store_over(VersioningStore::with(stored)).await;
+        caller.persisted.state.sid = Some("application-update".to_owned());
+        store.save_session(&caller).await.unwrap();
+        let (saved, _) = store
+            .external
+            .load(caller.persisted().session_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.token_expiry(), authoritative_expiry);
+        assert_eq!(saved.sid(), Some("application-update"));
+    }
+
+    #[tokio::test]
+    async fn whole_session_save_rechecks_refresh_fields_after_cas_conflict() {
+        let snapshot = test_session();
+        let mut external = VersioningStore::with(snapshot.clone());
+        *external.inject_once.get_mut().unwrap() = Some(|session| {
+            session.persisted.state.token_expiry += Duration::from_hours(1);
+        });
+        let store = store_over(external).await;
+        assert_eq!(
+            store.save_session(&snapshot).await.unwrap_err().kind(),
+            SessionErrorKind::Conflict
+        );
+        let (saved, version) = store
+            .external
+            .load(snapshot.persisted().session_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(
+            saved.token_expiry(),
+            snapshot.token_expiry() + Duration::from_hours(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn whole_session_save_retries_unrelated_cas_conflict() {
+        let mut snapshot = test_session();
+        snapshot.persisted.state.refresh_revision = 4;
+        let mut external = VersioningStore::with(snapshot.clone());
+        *external.inject_once.get_mut().unwrap() = Some(|s| {
+            s.persisted.state.sid = Some("concurrent-app-update".to_owned());
+        });
+        let store = store_over(external).await;
+        snapshot.persisted.state.sid = Some("whole-session-write".to_owned());
+        assert!(store.save_session(&snapshot).await.unwrap().is_empty());
+        let (stored, version) = store
+            .external
+            .load(snapshot.persisted().session_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(stored.state().refresh_revision, 4);
+        // Whole-session saves still replace application fields within the
+        // same refresh generation; use update for merge-safe mutations.
+        assert_eq!(stored.sid(), Some("whole-session-write"));
+    }
+
+    #[tokio::test]
+    async fn whole_session_save_bounds_cas_retries() {
+        let snapshot = test_session();
+        let external = VersioningStore {
+            always_conflict: true,
+            ..VersioningStore::with(snapshot.clone())
+        };
+        let store = store_over(external).await;
+        let error = store.save_session(&snapshot).await.unwrap_err();
+        assert_eq!(error.kind(), SessionErrorKind::Conflict);
+        assert_eq!(store.external.stored_version(), 0);
     }
 
     #[tokio::test]
@@ -2360,13 +2621,6 @@ mod tests {
         }
         async fn load(&self, _: Uuid) -> Result<Option<(EnrichedStoreSession, i32)>, Infallible> {
             Ok(None)
-        }
-        async fn save(
-            &self,
-            _: &EnrichedStoreSession,
-            _: SystemTime,
-        ) -> Result<SaveOutcome, Infallible> {
-            Ok(SaveOutcome::Committed)
         }
         async fn compare_and_swap(
             &self,

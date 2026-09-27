@@ -132,7 +132,7 @@ jar has no compare-and-set operation, so an older in-flight response arriving
 after logout can install its valid session ciphertext again. The crate can
 make every multi-chunk save internally coherent, but it cannot revoke that
 ciphertext without server state. Use the store-backed driver when logout must
-win globally: its update-only save contract cannot recreate a deleted record,
+win globally: its update-only compare-and-swap contract cannot recreate a deleted record,
 so even a restored pointer remains unauthenticated and is cleared on the next
 request.
 

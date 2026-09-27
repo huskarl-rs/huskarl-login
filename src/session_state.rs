@@ -75,6 +75,22 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    /// Compare the refresh fields a whole-session save is not allowed to
+    /// change. Expiry uses the same whole-second precision as `unix_secs`;
+    /// a freshly committed session may retain finer precision than storage.
+    pub(crate) fn matches_persisted_refresh(&self, stored: &Self) -> bool {
+        let seconds = |time: SystemTime| {
+            time.duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_secs())
+        };
+        let expiry = seconds(self.token_expiry);
+        self.refresh_revision == stored.refresh_revision
+            && self.refresh_token == stored.refresh_token
+            && expiry.is_some()
+            && expiry == seconds(stored.token_expiry)
+    }
+
     /// Creates a `SessionState` from a completed login. `max_lifetime` is the
     /// [`SessionLifetime::Bounded`](crate::SessionLifetime) cap stamped onto
     /// the session store, freezing [`expire_at`](Self::expire_at) at login.
@@ -178,6 +194,10 @@ pub trait Session {
     }
 
     /// Apply tokens from a refresh response via [`SessionState::refreshed`].
+    /// Custom overrides should change only fields determined by the refresh
+    /// token and whole-second expiry, or the application must commit pending
+    /// refreshes before whole-session saves, since the save guard does not
+    /// compare custom fields.
     fn apply_refresh(&mut self, token_response: &TokenResponse, default_lifetime: Duration) {
         let new_state = self.state().refreshed(token_response, default_lifetime);
         self.set_state(new_state);

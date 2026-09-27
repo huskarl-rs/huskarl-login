@@ -108,13 +108,20 @@ making refresh handling stateful. See the
 
 ## Revision persistence and upgrades
 
-Older serialized sessions default their refresh revision to zero. Application
-updates must preserve it. Whole-session saves still use the backend's
-unconditional write and can bypass the refresh guard; prefer
-`StoreBackedSessionStore::update` for application mutations.
+Older serialized sessions default their refresh revision to zero. Store-backed
+whole-session saves load the current record and compare the refresh revision,
+refresh token, and expiry. A mismatch returns `Conflict`; a match commits via
+CAS. A CAS conflict reloads and repeats all three checks. This prevents publishing
+a pending refresh under its old revision as well as overwriting a committed
+refresh. Expiry is compared at its serialized whole-second precision and the
+stored value is preserved. Pending refreshes must use `PendingPersist::commit`.
+Application fields still use last-writer-wins semantics within the same refresh
+generation; prefer `StoreBackedSessionStore::update` for application mutations.
 
-Pre-fix binaries also bypass the check. This is a compatibility caveat for
-upgrades from those binaries, not subsequent deployments of compliant writers.
+Application updates must preserve the refresh fields and revision. Direct writes
+through the low-level backend API bypass the driver's checks. Pre-fix binaries
+also bypass these checks; this compatibility caveat applies when upgrading from
+those binaries, not to every subsequent deployment of compliant writers.
 
 Direct callers of `SessionDriver::apply_refresh_and_save` and adapter tests
 using `PendingPersist::new` must now supply the revision observed before the

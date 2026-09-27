@@ -3,7 +3,7 @@
 [`StoreBackedSessionStore`](crate::StoreBackedSessionStore) delegates session
 data to an [`ExternalSessionStore`](crate::ExternalSessionStore) you
 implement over your backend (Redis, SQL, DynamoDB, …). The trait is pure
-storage — insert, load, save, compare-and-swap, delete. Session _construction_
+storage — insert, load, compare-and-swap, delete. Session _construction_
 from a login is the enricher's job, not the store's.
 
 If you are converting from [`CookieSessionStore`](crate::CookieSessionStore),
@@ -31,15 +31,11 @@ the trait methods instead:
 
 - [`load`](crate::ExternalSessionStore::load) returns the stored version with
   the session, and the framework hands it back verbatim as `expected`.
-- [`save`](crate::ExternalSessionStore::save) is last-writer-wins; every write
-  must change the stored version, so an in-flight compare-and-swap cannot
-  succeed against overwritten state. It is update-only: if logout already
-  deleted the row, return [`SaveOutcome::Missing`](crate::SaveOutcome) instead
-  of recreating it.
 - [`compare_and_swap`](crate::ExternalSessionStore::compare_and_swap) writes
   only if the stored version still equals `expected`, changing it on success
   and returning [`SaveOutcome::Conflict`](crate::SaveOutcome) on a version
   mismatch or [`SaveOutcome::Missing`](crate::SaveOutcome) if the row is gone.
+  Never insert a missing row: logout must not be undone by an in-flight write.
 
 Version is compared by **equality only**, so any per-write-unique value works:
 an integer column you `+ 1` on write, a database row version (e.g. Postgres
@@ -47,7 +43,7 @@ an integer column you `+ 1` on write, a database row version (e.g. Postgres
 
 ## TTL contract
 
-Every insert, save, and compare-and-swap receives an absolute `deadline` from
+Every insert and compare-and-swap receives an absolute `deadline` from
 the driver. It is the sooner of the effective absolute session cap and the
 activity horizon `max(now, token_expiry) + idle_timeout`; the driver also keeps
 that idle horizon in lockstep with the [`LivenessConfig`](crate::LivenessConfig)
@@ -165,21 +161,6 @@ impl ExternalSessionStore for InMemoryStore {
             .map(|(session, version, _)| (session.clone(), *version)))
     }
 
-    async fn save(
-        &self,
-        session: &MySession,
-        deadline: SystemTime,
-    ) -> Result<SaveOutcome, Infallible> {
-        let key = session.persisted().session_key;
-        let mut rows = self.rows.lock().unwrap();
-        let Some((_, version, _)) = rows.get(&key) else {
-            return Ok(SaveOutcome::Missing);
-        };
-        let next = version + 1;
-        rows.insert(key, (session.clone(), next, deadline));
-        Ok(SaveOutcome::Committed)
-    }
-
     async fn compare_and_swap(
         &self,
         session: &MySession,
@@ -253,3 +234,27 @@ passed. For precise per-request enforcement, attach a
 [`LivenessStore`](crate::LivenessStore) with
 [`with_liveness`](crate::StoreBackedSessionStore::with_liveness). See the
 [liveness explanation](crate::_docs::explanation::liveness).
+
+## Whole-session saves
+
+The built-in driver uses load/check/compare-and-swap for whole-session saves.
+A successful uncontended save makes two backend calls: a load and a CAS.
+Each CAS conflict repeats both calls, up to the driver's retry budget; account
+for that round trip and read cost when loads are expensive.
+A mismatch in refresh revision, refresh token, or token expiry returns
+`SessionErrorKind::Conflict` without writing; a backend CAS conflict reloads
+and repeats these checks. Expiry is compared at the serialized whole-second
+precision and the stored expiry is retained, so serialization round-trips cannot
+cause false conflicts or move the stored expiry. Matching refresh state permits
+replacing application
+fields, so use `update` for merge-safe application mutations. The backend trait
+has no unconditional save operation; refresh-revision checks
+remain the driver's responsibility.
+
+A session from `ActivePending` may have the right revision but different
+tokens or expiry. Whole-saving that changed refresh state is rejected with
+`Conflict`; use `PendingPersist::commit` to persist it and advance the revision.
+If refresh state is already identical, the whole save cannot change it.
+Use `update` for merge-safe application mutations. Custom session fields remain
+application-managed; applications must not modify refresh fields through
+`update` or bypass the driver with direct backend writes.

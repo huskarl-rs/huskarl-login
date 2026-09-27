@@ -25,8 +25,6 @@ pub struct ExternalSessionStoreCalls {
     pub inserts: usize,
     /// Calls to [`ExternalSessionStore::load`].
     pub loads: usize,
-    /// Calls to [`ExternalSessionStore::save`].
-    pub saves: usize,
     /// Calls to [`ExternalSessionStore::compare_and_swap`].
     pub compare_and_swaps: usize,
     /// Calls to [`ExternalSessionStore::delete`].
@@ -49,8 +47,8 @@ impl<S> Default for StoreState<S> {
 
 /// Cloneable in-memory [`ExternalSessionStore`] for adapter and integration tests.
 ///
-/// Records are versioned with monotonically increasing `u64` values. Saves are
-/// update-only, compare-and-swap observes the supplied version, and deletion is
+/// Records are versioned with monotonically increasing `u64` values.
+/// Compare-and-swap is update-only and observes the supplied version; deletion is
 /// idempotent, matching the production store contract.
 #[derive(Clone)]
 pub struct InMemoryExternalSessionStore<S> {
@@ -157,18 +155,6 @@ where
         let mut state = self.state();
         state.calls.loads += 1;
         Ok(state.records.get(&session_key).cloned())
-    }
-
-    async fn save(&self, session: &S, _: SystemTime) -> Result<SaveOutcome, Self::Error> {
-        let mut state = self.state();
-        state.calls.saves += 1;
-        let Some((stored, version)) = state.records.get_mut(&session.persisted().session_key)
-        else {
-            return Ok(SaveOutcome::Missing);
-        };
-        *stored = session.clone();
-        *version += 1;
-        Ok(SaveOutcome::Committed)
     }
 
     async fn compare_and_swap(

@@ -45,7 +45,8 @@ does not fix exchange or response-order races. Eager persistence shortens the
 normal store write window, but deferred retries and delayed cookie delivery
 can extend it beyond the token-exchange round trip.
 
-Store-backed refresh commits are guarded by their original revision, but
-whole-session saves and direct backend writes can bypass that check. Prefer
-`StoreBackedSessionStore::update` for application mutations. See the
-[refresh explanation](crate::_docs::explanation::refresh).
+Store-backed whole-session saves reject mismatched refresh revisions, tokens,
+or expiry, including uncommitted refresh state from `ActivePending`. Application
+updates must preserve refresh fields; prefer `StoreBackedSessionStore::update`
+for merge-safe mutations. Direct backend writes and pre-fix binaries bypass the
+driver checks. See the [refresh explanation](crate::_docs::explanation::refresh).

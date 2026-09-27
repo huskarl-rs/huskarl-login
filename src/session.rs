@@ -355,11 +355,20 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// (re-encrypted cookies plus `Max-Age=0` clears for now-unused chunks; none
     /// for store-backed sessions whose pointer cookie is unchanged).
     ///
-    /// This is an unconditional whole-session write (last-writer-wins). The
+    /// This is a whole-session write. The store-backed driver checks the
+    /// refresh revision, refresh token, and expiry against stored state and
+    /// commits through CAS, rejecting mismatches with
+    /// [`SessionErrorKind::Conflict`]. Expiry is compared at serialized
+    /// whole-second precision and the stored value is preserved. Application
+    /// fields remain
+    /// last-writer-wins within a refresh generation. The
     /// engine's refresh persist goes through
     /// [`apply_refresh_and_save`](Self::apply_refresh_and_save) instead, so it
     /// never overwrites a concurrent
     /// [`update`](crate::StoreBackedSessionStore::update).
+    /// A changed refresh token or expiry from `ActivePending` is rejected even
+    /// if the revision matches. Use
+    /// [`PendingPersist::commit`](crate::engine::PendingPersist::commit).
     fn save(
         &self,
         session: &Self::SessionType,
