@@ -1,0 +1,38 @@
+name: Documentation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  docs:
+    name: Examples and API reference
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: huskarl-login
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: huskarl-login
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: huskarl-rs/huskarl
+          path: huskarl
+          persist-credentials: false
+      - run: rustup toolchain install stable nightly --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: huskarl-login -> target
+      - run: cargo +stable test --doc
+      - run: cargo +nightly doc --no-deps
+        env:
+          RUSTDOCFLAGS: --cfg docsrs_huskarl_login -D warnings

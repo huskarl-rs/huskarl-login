@@ -61,7 +61,11 @@ pub mod explanation {
 /// - [Implement an external session store](how_to::external_store).
 /// - [Prevent session responses from being cached](how_to::caching).
 /// - [Deploy refresh-token rotation safely](how_to::rotation).
+/// - [Troubleshoot browser login](how_to::troubleshooting).
 pub mod how_to {
+    #[doc = include_str!("../docs/how_to/troubleshooting.md")]
+    pub mod troubleshooting {}
+
     #[doc = include_str!("../docs/how_to/adapter.md")]
     pub mod adapter {}
 

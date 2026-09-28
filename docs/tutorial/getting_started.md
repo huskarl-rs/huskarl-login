@@ -55,7 +55,7 @@ Replace `src/main.rs` with:
 ```rust,no_run
 use std::{env, sync::Arc, time::Duration};
 
-use huskarl_crypto_native::aead::AesGcmKey;
+use huskarl_crypto_native::{NativeVerifierPlatform, aead::AesGcmKey};
 use huskarl_login::client::grant::authorization_code::AuthorizationCodeGrant;
 use huskarl_login::core::{
     client_auth::NoAuth,
@@ -90,6 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .client_auth(NoAuth)
         .http_client(http_client.clone())
         .redirect_uri("http://localhost:3000/callback")
+        .jws_verifier_platform(Arc::new(NativeVerifierPlatform))
         .jws_verifier_factory(JwksSource::builder().http_client(http_client).build())
         .build()
         .await?;
@@ -149,8 +150,11 @@ HTTP adapter calls the engine.
 
 ## Next steps
 
-- Connect the engine using `huskarl-axum` or `huskarl-pingora`, or follow
-  [Build a framework adapter](crate::_docs::how_to::adapter).
+- Continue with [Sign in to an Axum application](https://docs.rs/huskarl-axum/latest/huskarl_axum/login/tutorial/)
+  for a browser login walkthrough. For other frameworks, use `huskarl-pingora`
+  or follow [Build a framework adapter](crate::_docs::how_to::adapter).
+- Diagnose unexpected responses with
+  [Troubleshoot browser login](crate::_docs::how_to::troubleshooting).
 - Add profile fields with [Build an application session](crate::_docs::how_to::enrichment).
 - Keep session data server-side with
   [Implement an external session store](crate::_docs::how_to::external_store).
