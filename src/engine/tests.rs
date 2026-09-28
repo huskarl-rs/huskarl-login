@@ -674,9 +674,11 @@ async fn engine_recomputes_browser_paths_after_config_mutation() {
         .cookie_name("session".parse().unwrap())
         .cookie_path("/app".parse().unwrap())
         .build();
+    let mut grant = test_grant(FailingHttp::new(false).0).await;
+    grant.redirect_uri = "https://app.example.com/app/callback".to_owned();
     let result = LoginEngine::builder()
         .config(config)
-        .grant(test_grant(FailingHttp::new(false).0).await)
+        .grant(grant)
         .session_store(store)
         .build();
 
@@ -3121,4 +3123,150 @@ fn set_cookies_drop_guard_stays_silent_for_consumed_and_empty_guards() {
     assert!(result.is_err());
 
     assert_eq!(probe.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn engine_rejects_callback_and_mapping_disagreement() {
+    let mut config = default_config();
+    config.callback_path = "/wrong".parse().unwrap();
+    assert!(matches!(
+        LoginEngine::builder()
+            .config(config)
+            .grant(test_grant(FailingHttp::new(false).0).await)
+            .session_store(MockSessionStore::empty())
+            .build(),
+        Err(crate::ConfigError::InvalidRedirectUri { .. })
+    ));
+    let config = LoginConfig::builder()
+        .callback_path("/callback")
+        .scope(vec![])
+        .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
+        .url_mapping(
+            crate::core::url_mapping::PublicUrlMapping::new("https://other.example", "/").unwrap(),
+        )
+        .build()
+        .unwrap();
+    assert!(matches!(
+        LoginEngine::builder()
+            .config(config)
+            .grant(test_grant(FailingHttp::new(false).0).await)
+            .session_store(MockSessionStore::empty())
+            .build(),
+        Err(crate::ConfigError::InvalidRedirectUri { .. })
+    ));
+}
+
+#[tokio::test]
+async fn engine_mapping_derives_callback_and_resolves_public_overrides_once() {
+    let mapping =
+        crate::core::url_mapping::PublicUrlMapping::new("https://app.example.com/gateway", "/edge")
+            .unwrap();
+    let redirect: http::Uri = "https://app.example.com/gateway/app/callback"
+        .parse()
+        .unwrap();
+    let callback = crate::url::callback_path(&mapping, &redirect, None).unwrap();
+    let config = LoginConfig::builder()
+        .callback_path(callback.as_str())
+        .scope(vec![])
+        .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
+        .url_mapping(mapping)
+        .build()
+        .unwrap();
+    let mut grant = test_grant(FailingHttp::new(false).0).await;
+    grant.redirect_uri = redirect.to_string();
+    let engine = LoginEngine::builder()
+        .config(config)
+        .grant(grant)
+        .session_store(MockSessionStore::empty())
+        .build()
+        .unwrap();
+    assert_eq!(engine.config().callback_path.as_str(), "/edge/app/callback");
+    assert_eq!(
+        engine.config().browser_callback_path.as_str(),
+        "/gateway/app/callback"
+    );
+    assert_eq!(
+        engine
+            .incoming_uri(
+                &"https://app.example.com/gateway/app/dashboard?q=a%20b"
+                    .parse()
+                    .unwrap()
+            )
+            .unwrap(),
+        "/edge/app/dashboard?q=a%20b"
+    );
+    assert!(
+        engine
+            .incoming_uri(
+                &"https://other.example/gateway/app/dashboard"
+                    .parse()
+                    .unwrap()
+            )
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn engine_mapping_preserves_exact_prefix_callback_and_cookie_paths() {
+    for suffix in ["", "/"] {
+        let mapping = crate::core::url_mapping::PublicUrlMapping::new(
+            "https://app.example.com/gateway",
+            "/edge",
+        )
+        .unwrap();
+        let redirect: http::Uri = format!("https://app.example.com/gateway{suffix}")
+            .parse()
+            .unwrap();
+        let callback = crate::url::callback_path(&mapping, &redirect, None).unwrap();
+        let config = LoginConfig::builder()
+            .callback_path(callback.as_str())
+            .scope(vec![])
+            .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
+            .logout(
+                crate::LogoutConfig::builder()
+                    .path(callback.as_str())
+                    .build()
+                    .unwrap(),
+            )
+            .url_mapping(mapping)
+            .build()
+            .unwrap();
+        assert_eq!(config.browser_callback_path.as_str(), redirect.path());
+        assert_eq!(
+            config.browser_logout_path.as_ref().unwrap().as_str(),
+            redirect.path()
+        );
+        let mut grant = test_grant(FailingHttp::new(false).0).await;
+        grant.redirect_uri = redirect.to_string();
+        let engine = LoginEngine::builder()
+            .config(config)
+            .grant(grant)
+            .session_store(MockSessionStore::empty())
+            .build()
+            .unwrap();
+        assert_eq!(
+            engine.config().browser_callback_path.as_str(),
+            redirect.path()
+        );
+        assert_eq!(
+            engine
+                .config()
+                .browser_logout_path
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            redirect.path()
+        );
+        let incoming = engine.incoming_uri(&redirect).unwrap();
+        assert_eq!(incoming.path(), callback.as_str());
+        assert_eq!(
+            crate::url::original_url(
+                &engine.base_url,
+                engine.config.strip_prefix.as_ref(),
+                &incoming
+            )
+            .unwrap(),
+            redirect.to_string()
+        );
+    }
 }

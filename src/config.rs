@@ -316,17 +316,6 @@ impl PartialEq<&str> for RoutePath {
     }
 }
 
-/// Joins the path component of `base_url` with `segment`, inserting exactly
-/// one `/` between them.
-pub(crate) fn join_base_path(base_url: &http::Uri, segment: &str) -> String {
-    let base_path = base_url.path().trim_end_matches('/');
-    if segment.starts_with('/') {
-        format!("{base_path}{segment}")
-    } else {
-        format!("{base_path}/{segment}")
-    }
-}
-
 /// Validates the lifetime/interval settings against each other.
 fn validate_durations(
     session_lifetime: SessionLifetime,
@@ -388,19 +377,23 @@ fn browser_path(
 ) -> Result<RoutePath, ConfigError> {
     let route_path = route_path.as_str();
     let stripped_route = match strip_prefix {
+        // An exact non-root prefix maps to the public base without adding a
+        // slash, just as PublicUrlMapping does.
+        Some(prefix) if !prefix.as_str().ends_with('/') && prefix.as_str() == route_path => "",
         Some(prefix) => prefix.strip_from(route_path).unwrap_or(route_path),
         None => route_path,
     };
     let browser_path = match base_path {
         Some(base) => {
             let base = base.as_str().trim_end_matches('/');
-            if stripped_route.starts_with('/') {
-                format!("{base}{stripped_route}")
-            } else {
-                format!("{base}/{stripped_route}")
-            }
+            format!("{base}{stripped_route}")
         }
         None => stripped_route.to_owned(),
+    };
+    let browser_path = if browser_path.is_empty() {
+        "/".to_owned()
+    } else {
+        browser_path
     };
     RoutePath::new(browser_path).map_err(|e| ConfigError::InvalidBasePath {
         path: base_path.map_or_else(String::new, |path| path.as_str().to_owned()),
@@ -468,6 +461,9 @@ impl LogoutConfig {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct LoginConfig {
+    /// Validated deployment mapping, when configured through the new API.
+    /// Its origin must agree with the grant and its prefixes with these fields.
+    pub url_mapping: Option<crate::core::url_mapping::PublicUrlMapping>,
     /// Path at which the callback endpoint is mounted (e.g. `"/callback"`).
     pub callback_path: RoutePath,
     /// OAuth 2.0 scopes to request (e.g. `bon::vec!["openid"]`).
@@ -521,6 +517,17 @@ impl LoginConfig {
     /// derives cookie policy to ensure stale derived fields cannot bypass route
     /// visibility checks.
     pub(crate) fn validate_and_recompute(&mut self) -> Result<(), ConfigError> {
+        if let Some(mapping) = &self.url_mapping {
+            let (base, ingress) = mapping_paths(mapping);
+            if self.base_path.as_ref().map(RoutePath::as_str) != base.as_deref()
+                || self.strip_prefix.as_ref().map(RoutePath::as_str) != ingress.as_deref()
+            {
+                return Err(ConfigError::InvalidBasePath {
+                    path: mapping.public_base().path().to_owned(),
+                    reason: "mutable prefix fields disagree with url_mapping",
+                });
+            }
+        }
         validate_durations(
             self.session_lifetime,
             self.token_refresh_margin,
@@ -610,6 +617,9 @@ impl LoginConfig {
         /// `redirect_uri` at engine build. Omit when mounted at the origin root.
         #[builder(into)]
         base_path: Option<String>,
+        /// Validated public/ingress mapping; cannot be combined with legacy
+        /// `base_path` or `strip_prefix`. Derive the callback with `url::callback_path`.
+        url_mapping: Option<crate::core::url_mapping::PublicUrlMapping>,
         /// Front-proxy path prefix to strip before reconstructing the URL.
         #[builder(into)]
         strip_prefix: Option<String>,
@@ -623,6 +633,17 @@ impl LoginConfig {
         )]
         login_cookie_prefix: String,
     ) -> Result<Self, ConfigError> {
+        let (base_path, strip_prefix) = if let Some(mapping) = &url_mapping {
+            if base_path.is_some() || strip_prefix.is_some() {
+                return Err(ConfigError::InvalidBasePath {
+                    path: mapping.public_base().path().to_owned(),
+                    reason: "url_mapping cannot be combined with base_path or strip_prefix",
+                });
+            }
+            mapping_paths(mapping)
+        } else {
+            (base_path, strip_prefix)
+        };
         let callback_path = RoutePath::validated(callback_path, |path, reason| {
             ConfigError::InvalidCallbackPath { path, reason }
         })?;
@@ -694,6 +715,7 @@ impl LoginConfig {
             .transpose()?;
 
         Ok(Self {
+            url_mapping,
             callback_path,
             scope,
             session_lifetime,
@@ -709,6 +731,17 @@ impl LoginConfig {
             browser_logout_path,
         })
     }
+}
+
+fn mapping_paths(
+    mapping: &crate::core::url_mapping::PublicUrlMapping,
+) -> (Option<String>, Option<String>) {
+    let base = mapping.public_base().path().trim_end_matches('/');
+    let prefix = mapping.incoming_prefix();
+    (
+        (!base.is_empty()).then(|| base.to_owned()),
+        (prefix != "/").then(|| prefix.to_owned()),
+    )
 }
 
 #[cfg(test)]

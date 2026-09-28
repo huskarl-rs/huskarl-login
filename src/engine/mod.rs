@@ -761,6 +761,21 @@ where
                 url: grant.redirect_uri.clone(),
                 reason: "origin is not a valid base URL",
             })?;
+        if let Some(mapping) = &config.url_mapping
+            && (mapping.public_base().scheme() != redirect.scheme()
+                || mapping.public_base().authority() != redirect.authority())
+        {
+            return Err(ConfigError::InvalidRedirectUri {
+                url: grant.redirect_uri.clone(),
+                reason: "redirect origin disagrees with url_mapping",
+            });
+        }
+        if config.browser_callback_path.as_str() != redirect.path() {
+            return Err(ConfigError::InvalidRedirectUri {
+                url: grant.redirect_uri.clone(),
+                reason: "public callback path does not match the mapped callback_path",
+            });
+        }
         let secure = scheme == "https";
 
         // Single source of truth for cookie security and session lifetime:
@@ -856,6 +871,26 @@ where
             return Some(self.handle_logout(logout, headers).await);
         }
         None
+    }
+
+    /// Converts a trusted, already resolved public URL to the engine's ingress
+    /// coordinates. Used by adapters with an explicit public URL override;
+    /// rejects another origin or a path outside the configured public prefix.
+    ///
+    /// # Errors
+    /// Rejects another origin or a URL outside the configured public mapping.
+    pub fn incoming_uri(
+        &self,
+        public: &Uri,
+    ) -> Result<Uri, crate::core::url_mapping::MappingError> {
+        crate::core::url_mapping::PublicUrlMapping::new(
+            &self.base_url.to_string(),
+            self.config
+                .strip_prefix
+                .as_ref()
+                .map_or("/", crate::config::RoutePath::as_str),
+        )?
+        .incoming_uri(public)
     }
 
     /// Builds a `405 Method Not Allowed` response with an `Allow` header.

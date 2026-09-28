@@ -832,7 +832,9 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "huskarl"
-version = "0.11.1"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb7831cad778324887413c53a98d910773e008de7fce26d35265524dff50dc5e"
 dependencies = [
  "arc-swap",
  "base64",
@@ -856,7 +858,9 @@ dependencies = [
 
 [[package]]
 name = "huskarl-core"
-version = "0.10.1"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6eb00409acf4c9e2ba0c10b9d367f6524956593c3ceda6747f121b16f5ee8c61"
 dependencies = [
  "arc-swap",
  "base64",
@@ -885,7 +889,9 @@ dependencies = [
 
 [[package]]
 name = "huskarl-crypto-native"
-version = "0.11.0"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69eb06ed9c742d545926d7ef9efaed46bcd6c3c05cc9bd3638ba4b3e9744a92c"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -918,6 +924,7 @@ dependencies = [
  "hex",
  "http",
  "huskarl",
+ "huskarl-core",
  "huskarl-crypto-native",
  "huskarl-reqwest",
  "log",
@@ -938,6 +945,8 @@ dependencies = [
 [[package]]
 name = "huskarl-macros"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ece49dc41e6e2397089c305e427174b7b66e6080a5b0451c90b335efae642a90"
 dependencies = [
  "darling",
  "proc-macro-crate",
@@ -948,7 +957,9 @@ dependencies = [
 
 [[package]]
 name = "huskarl-reqwest"
-version = "0.9.0"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12ab945dd11dd829cb760a6851f0d2c68e3ece7ca7542c59d8903e964de24eb7"
 dependencies = [
  "bon",
  "bytes",
@@ -2336,9 +2347,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
-version = "0.26.5"
+version = "0.26.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0c85f2c3ef0b1cd58b36682f4b17aaa995f0e5db534d85692b4903abce21f67"
+checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
  "rustls",
  "tokio",

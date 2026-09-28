@@ -62,7 +62,7 @@ use crate::{
 ///
 /// Version is compared by **equality only**, so any per-write-unique value works:
 /// an integer column you `+ 1` on write, a database row version (e.g. Postgres
-/// `xmin`), an ETag, a fresh UUID per write.
+/// `xmin`), an `ETag`, a fresh UUID per write.
 ///
 /// ## TTL contract
 ///

@@ -4,6 +4,48 @@ use serde::Serialize;
 
 use crate::config::RoutePath;
 
+/// Derives an ingress callback path from the grant's public redirect URI.
+/// If supplied, an explicit path must map back to that same public path.
+/// Query parameters belong to the redirect URI, not the route path.
+///
+/// # Errors
+/// Rejects unsafe paths, URLs outside the mapping, and inconsistent explicit overrides.
+pub fn callback_path(
+    mapping: &crate::core::url_mapping::PublicUrlMapping,
+    redirect_uri: &http::Uri,
+    explicit: Option<&str>,
+) -> Result<RoutePath, crate::config::ConfigError> {
+    let incoming = mapping.incoming_uri(redirect_uri).map_err(|_| {
+        crate::config::ConfigError::InvalidRedirectUri {
+            url: redirect_uri.to_string(),
+            reason: "callback URL lies outside the configured public mapping",
+        }
+    })?;
+    let path = explicit.unwrap_or(incoming.path());
+    let parsed =
+        path.parse::<http::Uri>()
+            .map_err(|_| crate::config::ConfigError::InvalidCallbackPath {
+                path: path.to_owned(),
+                reason: "invalid callback path",
+            })?;
+    let mapped = mapping.public_url(&parsed).map_err(|_| {
+        crate::config::ConfigError::InvalidCallbackPath {
+            path: path.to_owned(),
+            reason: "callback path lies outside the incoming prefix",
+        }
+    })?;
+    if mapped.path() != redirect_uri.path() {
+        return Err(crate::config::ConfigError::InvalidCallbackPath {
+            path: path.to_owned(),
+            reason: "callback path does not map to the public redirect URI",
+        });
+    }
+    RoutePath::new(path.to_owned()).map_err(|_| crate::config::ConfigError::InvalidCallbackPath {
+        path: path.to_owned(),
+        reason: "invalid callback path",
+    })
+}
+
 /// Reconstructs the client-facing URL to redirect back to after login.
 ///
 /// `base` is the reconstructed base URL (the grant's `redirect_uri` origin
@@ -15,36 +57,29 @@ pub fn original_url(
     strip_prefix: Option<&RoutePath>,
     req_uri: &http::Uri,
 ) -> Option<String> {
-    let req_path = req_uri.path();
-    let stripped = match strip_prefix {
-        Some(prefix) => {
-            if let Some(s) = prefix.strip_from(req_path) {
-                s
-            } else {
-                log::error!(
-                    "strip_prefix {prefix:?} did not match request path {req_path:?}; \
-                 check your LoginConfig.strip_prefix setting",
-                );
-                return None;
-            }
+    // Legacy prefixes may end in a slash. Strip those with their original
+    // boundary semantics before handing the suffix to the stricter mapping.
+    let stripped_uri;
+    let (strip_prefix, req_uri) = match strip_prefix {
+        Some(prefix) if prefix.as_str().ends_with('/') => {
+            let path = prefix.strip_from(req_uri.path())?;
+            let path_and_query = match req_uri.query() {
+                Some(query) => format!("{path}?{query}"),
+                None => path.to_owned(),
+            };
+            stripped_uri = path_and_query.parse::<http::Uri>().ok()?;
+            (None, &stripped_uri)
         }
-        None => req_path,
+        _ => (strip_prefix, req_uri),
     };
-
-    let new_path = crate::config::join_base_path(base, stripped);
-
-    // `base_url` is an `EndpointUrl`, so scheme and authority are guaranteed
-    // present by construction; the `else` is unreachable in practice.
-    let (Some(scheme), Some(authority)) = (
-        base.scheme_str(),
-        base.authority().map(http::uri::Authority::as_str),
-    ) else {
-        return None;
-    };
-    Some(match req_uri.query() {
-        Some(q) => format!("{scheme}://{authority}{new_path}?{q}"),
-        None => format!("{scheme}://{authority}{new_path}"),
-    })
+    crate::core::url_mapping::PublicUrlMapping::new(
+        &base.to_string(),
+        strip_prefix.map_or("/", RoutePath::as_str),
+    )
+    .ok()?
+    .public_url(req_uri)
+    .ok()
+    .map(|uri| uri.to_string())
 }
 
 /// Builds the end-session URL, appending `id_token_hint`, `client_id`, and
@@ -300,6 +335,69 @@ mod tests {
                 &uri
             ),
             Some("https://app.example.com/base/page".into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_trailing_slash_prefix_preserves_return_url() {
+        let config = crate::LoginConfig::builder()
+            .callback_path("/edge/callback")
+            .strip_prefix("/edge/")
+            .scope(vec![])
+            .session_lifetime(crate::SessionLifetime::DelegatedToAuthorizationServer)
+            .build()
+            .unwrap();
+        let base = "https://app.example/gateway".parse().unwrap();
+        for (request, expected) in [
+            (
+                "/edge/dashboard?q=a%20b",
+                Some("https://app.example/gateway/dashboard?q=a%20b"),
+            ),
+            ("/edge/", Some("https://app.example/gateway/")),
+            ("/edge/?", Some("https://app.example/gateway/?")),
+            ("/edge", None),
+            ("/edgeX/dashboard", None),
+        ] {
+            assert_eq!(
+                original_url(
+                    &base,
+                    config.strip_prefix.as_ref(),
+                    &request.parse().unwrap()
+                )
+                .as_deref(),
+                expected,
+                "{request}"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_derivation_and_explicit_override_agree() {
+        let mapping =
+            crate::core::url_mapping::PublicUrlMapping::new("https://app.example/gateway", "/edge")
+                .unwrap();
+        let redirect = "https://app.example/gateway/app/callback?tenant=one"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            callback_path(&mapping, &redirect, None).unwrap().as_str(),
+            "/edge/app/callback"
+        );
+        assert!(callback_path(&mapping, &redirect, Some("/edge/app/callback")).is_ok());
+        assert!(callback_path(&mapping, &redirect, Some("/app/callback")).is_err());
+        assert!(callback_path(&mapping, &redirect, Some("/edge/other")).is_err());
+        assert!(
+            callback_path(
+                &mapping,
+                &"https://evil.example/gateway/app/callback".parse().unwrap(),
+                None
+            )
+            .is_err()
         );
     }
 }
