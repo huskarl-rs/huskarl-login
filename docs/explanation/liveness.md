@@ -13,13 +13,13 @@ clock starts at login rather than at the first request after the callback. Like
 later activity writes, this initial touch is best-effort: a failure leaves the
 record's storage deadline as the fail-open bound.
 
-Every deployment has an idle bound —
+Every store-backed deployment has a storage idle bound —
 [`idle_timeout`](crate::LivenessConfig::idle_timeout) defaults to 30 days
 ([`DEFAULT_IDLE_TIMEOUT`](crate::DEFAULT_IDLE_TIMEOUT)); there is no unbounded
 mode. The default is deliberately long: it changes nothing for deployments
 with real idle requirements, while guaranteeing that storage for sessions
 nobody uses anymore is eventually reclaimed (see the
-[TTL contract](crate::_docs::how_to::external_store)).
+[TTL contract](crate::ExternalSessionStore#ttl-contract)).
 
 Cookie sessions, and store-backed sessions without a liveness store, report
 [`Untracked`](crate::LivenessVerdict) — there is no `last_active` to judge, so

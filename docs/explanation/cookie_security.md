@@ -70,7 +70,47 @@ cookie while preserving other tabs' pending flows. The echoed `state` is
 untrusted callback input: it is retained only when syntactically valid, and a
 clear is emitted only when the derived cookie name is present on the request.
 
-## Key rotation
+## Browser state and logout
+
+The driver first distinguishes three observations; the engine then owns the
+transition exposed to adapters:
+
+| Driver observation | Engine state | Browser effect |
+|--------------------|--------------|----------------|
+| No session-shaped cookie | `Missing` | None |
+| Malformed chunks, bad encoding or seal, invalid payload, or a dangling store pointer | `Cleared { reason: InvalidSession }` | Clear all session cookie slots |
+| Valid session | `Active`, `ActivePending`, `Cleared`, or `RefreshUnavailable`, according to lifetime, liveness, and refresh | Deliver every cookie action carried by that state |
+
+Several construction-time and response-time rules keep those transitions
+stable:
+
+- Every session-cookie `Path` must cover the browser-facing logout route so
+  logout can load the session before clearing it. A store-backed cookie must
+  also cover the callback: successful re-login needs the old pointer there to
+  revoke the superseded record. Stateless cookie sessions may use a narrower
+  path than the callback; they only give up the friendly
+  already-authenticated fallback on stale callback navigations.
+- A cookie-session save writes its complete used chunk prefix and clears every
+  unused configured slot. Therefore two concurrent responses cannot leave a
+  ciphertext assembled from different saves, regardless of arrival order.
+- Browser clearing is constructed before server-side revocation. A backend
+  failure can leave copied store pointers usable, but cannot keep the current
+  browser logged in; explicit deletion returns both outcomes together in
+  [`TerminateSessionOutcome`](crate::TerminateSessionOutcome).
+- Logout is a `POST` whose `Origin` must exactly match the public application
+  origin. Cookie `SameSite` policy alone does not stop a sibling same-site
+  origin from submitting a request.
+
+A stateless cookie session still has one fundamental browser race: the cookie
+jar has no compare-and-set operation, so an older in-flight response arriving
+after logout can install its valid session ciphertext again. The crate can
+make every multi-chunk save internally coherent, but it cannot revoke that
+ciphertext without server state. Use the store-backed driver when logout must
+win globally: its update-only compare-and-swap contract cannot recreate a deleted record,
+so even a restored pointer remains unauthenticated and is cleared on the next
+request.
+
+## Cookie encryption-key rotation
 
 Sealing uses one active key; unsealing accepts several. The cipher can carry a
 key identity (`kid`), emitted in a sidecar cookie next to the sealed value. On

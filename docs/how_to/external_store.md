@@ -13,7 +13,7 @@ old pointer to revoke the record superseded by re-login, so engine construction
 rejects that configuration. The cookie path must also cover any configured
 logout route for both drivers.
 
-## The session type
+## 1. Define the session type
 
 Your session type embeds a [`PersistedSessionState`](crate::PersistedSessionState)
 (the framework-managed key and token state) and exposes it via
@@ -22,56 +22,22 @@ Your session type embeds a [`PersistedSessionState`](crate::PersistedSessionStat
 Implement `From<PersistedSessionState>` if you want the plain `build()`
 finisher.
 
-## Versioning contract
+## 2. Implement atomic version checks
 
-Each record is stored alongside a version — the
-[`Version`](crate::ExternalSessionStore::Version) associated type — that the
-store owns entirely. It never appears in the session type; it travels through
-the trait methods instead:
+Choose a version value that changes on every write. Return it from `load` and
+make `compare_and_swap` check and replace it atomically. Return `Conflict` for
+a changed version and `Missing` for a deleted record; never recreate a missing
+record during an update. Follow the
+[versioning contract](crate::ExternalSessionStore#versioning-contract).
 
-- [`load`](crate::ExternalSessionStore::load) returns the stored version with
-  the session, and the framework hands it back verbatim as `expected`.
-- [`compare_and_swap`](crate::ExternalSessionStore::compare_and_swap) writes
-  only if the stored version still equals `expected`, changing it on success
-  and returning [`SaveOutcome::Conflict`](crate::SaveOutcome) on a version
-  mismatch or [`SaveOutcome::Missing`](crate::SaveOutcome) if the row is gone.
-  Never insert a missing row: logout must not be undone by an in-flight write.
+## 3. Apply the supplied storage deadline
 
-Version is compared by **equality only**, so any per-write-unique value works:
-an integer column you `+ 1` on write, a database row version (e.g. Postgres
-`xmin`), an ETag, a fresh UUID per write.
+Store the supplied `deadline` on every insert and successful compare-and-swap.
+Use an absolute backend TTL, or persist a deadline column for a sweeper.
+Account for clock skew and rounding as specified by the
+[TTL contract](crate::ExternalSessionStore#ttl-contract).
 
-## TTL contract
-
-Every insert and compare-and-swap receives an absolute `deadline` from
-the driver. It is the sooner of the effective absolute session cap and the
-activity horizon `max(now, token_expiry) + idle_timeout`; the driver also keeps
-that idle horizon in lockstep with the [`LivenessConfig`](crate::LivenessConfig)
-attached through
-[`with_liveness`](crate::StoreBackedSessionStore::with_liveness). Apply the
-supplied deadline as the record's absolute TTL on **every** successful write,
-erring late:
-
-- The deadline is measured on the application's clock, so a backend expiring
-  exactly at it by its own clock can already be early — deleting early logs a
-  user out, while a late delete costs storage and stretches the idle bound by
-  at most the skew. Add a margin; rounding up is free.
-- Re-apply the TTL on **every** write — backends like Redis drop a key's TTL
-  on a plain overwrite.
-- Never use a sliding window: one shorter than the remaining deadline deletes
-  an idle-but-valid record out from under its user.
-- On backends whose TTLs are relative (Cassandra, etcd leases), compute
-  `deadline − now` at write time and clamp up to a small positive value rather
-  than deleting.
-
-The horizon renews with every write: an active session refreshes its tokens
-(roughly once per access-token lifetime), each refresh writes the record, and
-the deadline moves out. A session nobody uses stops being written, so its
-record — refresh token included — expires even under a
-[delegated](crate::SessionLifetime::DelegatedToAuthorizationServer) lifetime,
-where `expire_at` is `None`.
-
-## Detecting and deleting stale sessions
+## 4. Reap expired records
 
 The framework deletes what it can reach: logout deletes the session, and a new
 login that still presents the old pointer cookie deletes the record it names.
@@ -98,7 +64,11 @@ serve — and refresh — an idle-expired session.
   entry at login, after the record insert succeeds, using that same deadline;
   this touch is best-effort so a liveness outage does not fail login.
 
-A complete in-memory implementation:
+## 5. Wire the backend into the driver
+
+This in-memory example demonstrates the trait methods and builder. It records
+deadlines but does not enforce them; add the expiry handling from step 4 before
+using this pattern in a deployment.
 
 ```rust
 use std::collections::HashMap;
@@ -197,7 +167,7 @@ fn attach(cipher: impl AeadCipher + 'static) -> StoreBackedSessionStore<InMemory
 }
 ```
 
-## Atomic updates outside the login flow
+## Update application fields
 
 To mutate a stored session safely under concurrency, use
 [`update`](crate::StoreBackedSessionStore::update). It loads, applies your
@@ -225,36 +195,35 @@ It errors with [`Gone`](crate::SessionErrorKind) if the key is absent,
 [`Conflict`](crate::SessionErrorKind) if the retry budget is exhausted, or
 [`Unavailable`](crate::SessionErrorKind) on a store error.
 
-## Idle-timeout tracking
+## Add idle-timeout tracking
 
 Every deployment has an idle bound
 ([`idle_timeout`](crate::LivenessConfig::idle_timeout), default 30 days); the
-TTL contract above enforces it coarsely by reaping records whose horizon has
+[TTL contract](crate::ExternalSessionStore#ttl-contract) enforces it coarsely by reaping records whose horizon has
 passed. For precise per-request enforcement, attach a
 [`LivenessStore`](crate::LivenessStore) with
 [`with_liveness`](crate::StoreBackedSessionStore::with_liveness). See the
 [liveness explanation](crate::_docs::explanation::liveness).
 
-## Whole-session saves
+## Save a whole session only when replacement is intended
 
-The built-in driver uses load/check/compare-and-swap for whole-session saves.
-A successful uncontended save makes two backend calls: a load and a CAS.
-Each CAS conflict repeats both calls, up to the driver's retry budget; account
-for that round trip and read cost when loads are expensive.
-A mismatch in refresh revision, refresh token, or token expiry returns
-`SessionErrorKind::Conflict` without writing; a backend CAS conflict reloads
-and repeats these checks. Expiry is compared at the serialized whole-second
-precision and the stored expiry is retained, so serialization round-trips cannot
-cause false conflicts or move the stored expiry. Matching refresh state permits
-replacing application
-fields, so use `update` for merge-safe application mutations. The backend trait
-has no unconditional save operation; refresh-revision checks
-remain the driver's responsibility.
+Prefer `StoreBackedSessionStore::update` for application field changes: it
+merges your change into the current record. A whole-session save replaces
+application fields and can reject stale refresh state with `Conflict`; see
+[`SessionDriver::save`](crate::SessionDriver::save) for the checks and costs.
 
-A session from `ActivePending` may have the right revision but different
-tokens or expiry. Whole-saving that changed refresh state is rejected with
-`Conflict`; use `PendingPersist::commit` to persist it and advance the revision.
-If refresh state is already identical, the whole save cannot change it.
-Use `update` for merge-safe application mutations. Custom session fields remain
-application-managed; applications must not modify refresh fields through
-`update` or bypass the driver with direct backend writes.
+Use [`PendingPersist::commit`](crate::engine::PendingPersist::commit) for a
+pending refresh. Preserve refresh fields in application updates and route
+writes through the driver so its concurrency checks run.
+
+## Verify the backend
+
+Before connecting a real backend, check these outcomes:
+
+- Two writes with the same expected version: only one commits.
+- A write after deletion: returns `Missing` and leaves the record absent.
+- A successful overwrite: retains the supplied storage deadline.
+- An expired record: is removed by your TTL or cleanup mechanism.
+
+These checks exercise the backend's atomicity and retention behavior; the
+in-memory example alone does not establish those properties for your database.

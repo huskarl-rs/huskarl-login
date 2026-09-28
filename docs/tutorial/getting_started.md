@@ -1,126 +1,162 @@
 # Build your first login engine
 
-In this tutorial, you build the framework-neutral core of a login integration.
-By the end, you will have a [`LoginEngine`](crate::engine::LoginEngine) that
-uses OIDC discovery and stores encrypted sessions in browser cookies. Mounting
-that engine in an HTTP framework is a separate adapter step.
+Build and run a small program that discovers an OIDC provider and constructs a
+[`LoginEngine`](crate::engine::LoginEngine) with encrypted cookie sessions.
+When it succeeds, it prints `Login engine ready` and exits. Connecting this
+engine to HTTP routes is the next step after this tutorial.
 
-## Before you start
+## 1. Prepare a client registration
 
-You need an OIDC client registration with:
+You need Rust 1.92 or later, OpenSSL for generating a development key, and
+access to an OIDC provider. Register a **public client** that supports the
+Authorization Code flow with PKCE and requires no client secret. This example
+uses `NoAuth`; a registration that requires client authentication needs a
+different grant configuration.
 
-- client ID `my-client`;
-- callback URI `https://app.example.com/callback`; and
-- an authorization server issuer such as `https://auth.example.com`.
+Register `http://localhost:3000/callback` as the redirect URI. Note your issuer
+URL and client ID. The provider must be reachable from your machine and permit
+that redirect URI. The program below performs discovery but does not start an
+HTTP server or complete a browser login.
 
-You also need a `huskarl` HTTP client and a 256-bit AEAD key. Keep that key in
-your normal secret-management system; replacing it without retaining the old
-key invalidates existing login-state and session cookies.
+## 2. Create the project
 
-## How the pieces fit
-
-A minimal login has four pieces:
-
-1. an **OAuth grant** ([`AuthorizationCodeGrant`](crate::client::grant::authorization_code::AuthorizationCodeGrant),
-   from `huskarl`) that drives the Authorization Code flow — its endpoints and
-   signing keys come from OIDC discovery, and it holds the client id and the
-   **`redirect_uri`**;
-2. a **sealer** — your AEAD key wrapped for cookie sealing;
-3. a **session store** that seals sessions into cookies; and
-4. the [`LoginEngine`](crate::engine::LoginEngine) that ties them together.
-
-The client-facing origin (scheme + host) is **not** configured on the login
-side — the engine takes it from the grant's `redirect_uri`. So
-[`LoginConfig`](crate::LoginConfig) only needs the callback path and scopes; a
-front-proxy path prefix goes in `base_path`, nothing else about the URL.
-
-## Build the engine
-
-```rust,no_run
-use std::sync::Arc;
-
-use huskarl_login::client::grant::authorization_code::AuthorizationCodeGrant;
-use huskarl_login::core::client_auth::NoAuth;
-use huskarl_login::core::crypto::seal::AeadV1Sealer;
-use huskarl_login::core::jwk::JwksSource;
-use huskarl_login::core::server_metadata::AuthorizationServerMetadata;
-use huskarl_login::engine::LoginEngine;
-use huskarl_login::{CookieSessionStore, LoginConfig, SessionLifetime};
-# use huskarl_crypto_native::aead::AesGcmKey;
-# use huskarl_login::core::http::HttpClient;
-
-// `http_client` is any `HttpClient` (e.g. `huskarl-reqwest`'s `ReqwestClient`);
-// `key` is your AEAD key — an `AesGcmKey` built from a 32-byte secret.
-# async fn wire(
-#     http_client: impl HttpClient + Clone + 'static,
-#     key: AesGcmKey,
-# ) -> Result<Arc<LoginEngine<CookieSessionStore>>, Box<dyn std::error::Error>> {
-// 1. Discover the authorization server's endpoints and keys from its issuer,
-//    then build the grant that drives the OAuth flow.
-let metadata = AuthorizationServerMetadata::oidc_fetch()
-    .http_client(&http_client)
-    .issuer("https://auth.example.com")
-    .call()
-    .await?;
-//    `builder_from_metadata` fails when the metadata omits an endpoint the
-//    grant needs, naming the absent field in the error.
-let grant = AuthorizationCodeGrant::builder_from_metadata(&metadata)?
-    .client_id("my-client")
-    .client_auth(NoAuth)
-    .http_client(http_client.clone())
-    .redirect_uri("https://app.example.com/callback")
-    .jws_verifier_factory(JwksSource::builder().http_client(http_client).build())
-    .build()
-    .await?;
-
-// 2. + 3. Seal sessions into browser cookies. Wrap the AEAD key in the v1
-//    sealer — or pass a KMS/Vault-backed `AeadSealerUnsealer` instead.
-//    `CookieSession` is the default session type, so no type parameter here.
-let store = CookieSessionStore::builder()
-    .sealer(AeadV1Sealer::new(key))
-    .cookie_name("session".parse()?)
-    .build();
-
-// 4a. Login config: only the callback mount path and requested scopes. The
-//     origin comes from the grant's `redirect_uri`; add `.base_path("/app")`
-//     only when a front proxy mounts the app under a path prefix.
-let config = LoginConfig::builder()
-    .callback_path("/callback")
-    .scope(vec!["openid".to_owned()])
-    .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
-    .build()?;
-
-// 4b. The engine. It reconstructs the base URL from the grant's redirect_uri,
-//     and defaults the login-state cookie's sealer to the store's.
-let engine = LoginEngine::builder()
-    .config(config)
-    .grant(grant)
-    .session_store(store)
-    .build()?;
-
-Ok(Arc::new(engine))
-# }
+```sh
+cargo new login-demo
+cd login-demo
 ```
 
-The result is an `Arc<LoginEngine<CookieSessionStore>>`. It knows how to start
-login, process the callback and logout routes, and load or refresh a session.
-It does not listen for requests itself.
+Add these dependencies to the generated `Cargo.toml`:
 
-## Connect it to HTTP
+```toml
+[dependencies]
+huskarl-login = "0.3"
+huskarl-crypto-native = "0.11"
+huskarl-reqwest = { version = "0.9", features = ["rustls-tls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
 
-Use a reference adapter (`huskarl-axum` or `huskarl-pingora`) when one matches
-your framework. Otherwise, follow the [adapter
-guide](crate::_docs::how_to::adapter) to drive the engine from your framework's
-request lifecycle and deliver every response and cookie it returns.
+Set the following environment variables in the same terminal. Replace the
+issuer and client ID with your registration's values:
+
+```sh
+export OIDC_ISSUER='https://your-provider.example.com'
+export OIDC_CLIENT_ID='your-client-id'
+export LOGIN_COOKIE_KEY="$(openssl rand -base64 32)"
+```
+
+`LOGIN_COOKIE_KEY` contains a random 256-bit AES key. Generate it once for this
+exercise. In a deployed service, load a stable key from your secret-management
+system; generating a new key on every start invalidates existing cookies.
+
+## 3. Build the engine
+
+Replace `src/main.rs` with:
+
+```rust,no_run
+use std::{env, sync::Arc, time::Duration};
+
+use huskarl_crypto_native::aead::AesGcmKey;
+use huskarl_login::client::grant::authorization_code::AuthorizationCodeGrant;
+use huskarl_login::core::{
+    client_auth::NoAuth,
+    crypto::seal::AeadV1Sealer,
+    jwk::{JwksSource, OctBytes},
+    secrets::{EnvVarSecret, encodings::Base64Encoding},
+    server_metadata::AuthorizationServerMetadata,
+};
+use huskarl_login::engine::LoginEngine;
+use huskarl_login::prelude::*;
+use huskarl_login::{CookieSessionStore, LoginConfig, SessionLifetime};
+use huskarl_reqwest::ReqwestClient;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let issuer = env::var("OIDC_ISSUER")?;
+    let client_id = env::var("OIDC_CLIENT_ID")?;
+    let http_client = ReqwestClient::builder().build().await?;
+    let key_source = EnvVarSecret::new("LOGIN_COOKIE_KEY", &Base64Encoding)?;
+    let key = AesGcmKey::from_secret(
+        key_source.mapped(OctBytes::new("A256GCM")),
+    ).await?;
+
+    // Discover the provider's endpoints and configure the OAuth grant.
+    let metadata = AuthorizationServerMetadata::oidc_fetch()
+        .http_client(&http_client)
+        .issuer(&issuer)
+        .call()
+        .await?;
+    let grant = AuthorizationCodeGrant::builder_from_metadata(&metadata)?
+        .client_id(client_id)
+        .client_auth(NoAuth)
+        .http_client(http_client.clone())
+        .redirect_uri("http://localhost:3000/callback")
+        .jws_verifier_factory(JwksSource::builder().http_client(http_client).build())
+        .build()
+        .await?;
+
+    // Encrypt sessions with the key loaded above.
+    let store: CookieSessionStore = CookieSessionStore::builder()
+        .sealer(AeadV1Sealer::new(key))
+        .cookie_name("session".parse()?)
+        .build();
+
+    // Give this example an eight-hour absolute session lifetime.
+    let config = LoginConfig::builder()
+        .callback_path("/callback")
+        .scope(vec!["openid".to_owned()])
+        .session_lifetime(SessionLifetime::Bounded(Duration::from_secs(8 * 60 * 60)))
+        .build()?;
+
+    let engine = LoginEngine::builder()
+        .config(config)
+        .grant(grant)
+        .session_store(store)
+        .build()?;
+    let _engine = Arc::new(engine);
+
+    println!("Login engine ready");
+    Ok(())
+}
+```
+
+The grant holds the public redirect URI. `LoginConfig` supplies its callback
+path, requested scopes, and session lifetime. The engine derives the public
+origin from that redirect URI and uses the session store's key for login-state
+cookies too. The local HTTP URI produces cookies suitable for this exercise;
+use an HTTPS redirect URI for a deployed service.
+
+## 4. Run and check the result
+
+```sh
+cargo run
+```
+
+After compilation and provider discovery, expect:
+
+```text
+Login engine ready
+```
+
+If a variable is missing, set it in the terminal running `cargo run`. If key
+loading fails, check that `LOGIN_COOKIE_KEY` decodes to 32 bytes. If discovery
+fails, verify the issuer URL and network access. Missing required provider
+metadata is reported by `builder_from_metadata` with the absent field's name.
+
+You have now constructed a shared engine that can start login, process
+callbacks, and load or refresh sessions. The success message checks discovery
+and construction; client registration and browser login are exercised when an
+HTTP adapter calls the engine.
 
 ## Next steps
 
-- To add application-specific fields, follow [Build an application
-  session](crate::_docs::how_to::enrichment).
-- To keep session data server-side, follow [Implement an external session
-  store](crate::_docs::how_to::external_store).
-- Before choosing a production lifetime policy, read [The session
-  model](crate::_docs::explanation::session_model).
-- Before rotating cookie keys, read [Cookie security](crate::_docs::explanation::cookie_security)
-  and [Deploy refresh-token rotation
-  safely](crate::_docs::how_to::rotation).
+- Connect the engine using `huskarl-axum` or `huskarl-pingora`, or follow
+  [Build a framework adapter](crate::_docs::how_to::adapter).
+- Add profile fields with [Build an application session](crate::_docs::how_to::enrichment).
+- Keep session data server-side with
+  [Implement an external session store](crate::_docs::how_to::external_store).
+- Choose deployment lifetimes using
+  [Session lifetime policy](crate::_docs::explanation::session_lifetime).
+- Understand cookie encryption-key rotation in
+  [Cookie security](crate::_docs::explanation::cookie_security).
+- Separately, check provider refresh-token rotation using
+  [Deploy refresh-token rotation safely](crate::_docs::how_to::rotation).

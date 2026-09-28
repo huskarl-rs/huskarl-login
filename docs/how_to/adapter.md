@@ -16,12 +16,12 @@ An adapter owns three things:
 2. a [`PersistFailurePolicy`](crate::PersistFailurePolicy) (the provided
    [`DefaultPersistFailurePolicy`](crate::DefaultPersistFailurePolicy) unless
    the application overrides it), and
-3. two small lowering helpers, written once — the subject of the next two
+3. two small response helpers, written once — the subject of the next two
    sections.
 
-## Lowering `LoginResponse`
+## Convert `LoginResponse` into a framework response
 
-Lower with [`into_parts`](crate::engine::LoginResponse::into_parts), which
+Convert with [`into_parts`](crate::engine::LoginResponse::into_parts), which
 materializes a redirect's `Location`, its `Cache-Control: no-store`, and its
 `Set-Cookie` headers for you:
 
@@ -37,14 +37,14 @@ struct Response {
     body: Bytes,
 }
 
-fn lower(resp: LoginResponse) -> Response {
+fn into_framework_response(resp: LoginResponse) -> Response {
     let (status, headers, body) = resp.into_parts();
     Response { status, headers, body }
 }
 ```
 
 Avoid matching the [`Redirect`](crate::engine::LoginResponse::Redirect) variant
-field-by-field: its `set_cookies` are load-bearing (after the callback they
+field-by-field: its `set_cookies` must be delivered (after the callback they
 mint the initial session cookie; after logout they clear it), and a
 destructuring that drops the field compiles fine and strands every new login.
 
@@ -103,7 +103,7 @@ The order matters and is the same in every adapter:
 #     headers: Vec<(HeaderName, HeaderValue)>,
 #     body: Bytes,
 # }
-# fn lower(resp: huskarl_login::engine::LoginResponse) -> Response {
+# fn into_framework_response(resp: huskarl_login::engine::LoginResponse) -> Response {
 #     let (status, headers, body) = resp.into_parts();
 #     Response { status, headers, body }
 # }
@@ -148,7 +148,7 @@ async fn handle_request<SD: SessionDriver>(
     //    Forward Origin unchanged: logout POSTs require an exact public-origin
     //    match as their CSRF boundary.
     if let Some(resp) = engine.try_handle_login_route(method, headers, uri).await {
-        return lower(resp);
+        return into_framework_response(resp);
     }
 
     // 3. Load and validate the session. This never redirects; it only
@@ -162,7 +162,7 @@ async fn handle_request<SD: SessionDriver>(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            return lower(engine.render_error(status, "session unavailable"));
+            return into_framework_response(engine.render_error(status, "session unavailable"));
         }
     };
 
@@ -172,13 +172,13 @@ async fn handle_request<SD: SessionDriver>(
         // 302-to-the-AS for browser navigations and a 401 for API/XHR
         // requests. (On routes that don't require auth, run the inner
         // handler anonymously instead.)
-        LoadedSession::Missing => lower(engine.redirect_to_login(headers, uri).await),
+        LoadedSession::Missing => into_framework_response(engine.redirect_to_login(headers, uri).await),
 
         // A session was presented but torn down (expired, refresh rejected,
         // …). Same as Missing, except the clears for the stale cookies must
         // reach whatever response goes out — anonymous ones included.
         LoadedSession::Cleared { clears, .. } => {
-            let mut resp = lower(engine.redirect_to_login(headers, uri).await);
+            let mut resp = into_framework_response(engine.redirect_to_login(headers, uri).await);
             attach_cookies(&mut resp, clears);
             resp
         }
@@ -188,7 +188,7 @@ async fn handle_request<SD: SessionDriver>(
         // anonymous fallback or a login redirect (both would misfire against
         // the same unavailable authorization server).
         LoadedSession::RefreshUnavailable => {
-            let mut resp = lower(
+            let mut resp = into_framework_response(
                 engine.render_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
             );
             resp.headers
@@ -206,7 +206,7 @@ async fn handle_request<SD: SessionDriver>(
         }
 
         // Authenticated, but the eager persist of a refreshed session
-        // failed — a save is owed after the inner handler responds.
+        // failed — a save is owed after the inner handler returns, before sending the response.
         LoadedSession::ActivePending { pending } => {
             let mut resp = inner_handler(Some(pending.session())).await;
             match pending.commit(engine, headers).await {
@@ -218,7 +218,7 @@ async fn handle_request<SD: SessionDriver>(
                 // handler's response still goes out (its side effects have
                 // already happened) or is replaced to force a clean retry.
                 Err(e) => match policy.handle(&e) {
-                    Some(replacement) => lower(replacement),
+                    Some(replacement) => into_framework_response(replacement),
                     None => resp,
                 },
             }
@@ -369,7 +369,7 @@ on its outgoing headers. The engine preserves unrelated application cookies
 while the session driver removes its own pointer, chunk, and key-id cookies;
 the proxy therefore does not need to know the driver's cookie layout.
 
-The engine's design assumes adapters like this exist: refreshes are persisted
-*eagerly* inside `load_session` precisely so that an adapter with no reliable
-post-response phase only ever risks losing a retry, not the rotated refresh
-token — see the [refresh explanation](crate::_docs::explanation::refresh).
+The engine persists refreshes *eagerly* inside `load_session`, reducing its
+dependence on later adapter phases. A failed eager save still needs a retry,
+and cookie-session writes still require delivery to the browser. See the
+[refresh explanation](crate::_docs::explanation::refresh).

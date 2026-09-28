@@ -8,8 +8,9 @@ have consequences for how you deploy the crate.
 ## Eager persistence after refresh
 
 A successful refresh is persisted *inside* `load_session`, before it returns —
-not deferred to the adapter's post-response
-[`PendingPersist::commit`](crate::engine::PendingPersist::commit) call.
+not deferred until the handler returns. The adapter calls
+[`PendingPersist::commit`](crate::engine::PendingPersist::commit) only when
+persistence needs a retry.
 
 The reason is refresh-token rotation. When the authorization server (AS) rotates
 refresh tokens on each use, a deferred save that never runs — because the
@@ -34,8 +35,9 @@ On success the session is returned as
 cookies in `set_cookies`. If the eager persist *fails*, the session is returned
 as [`ActivePending`](crate::engine::LoadedSession::ActivePending), carrying a
 [`PendingPersist`](crate::engine::PendingPersist) that pairs the session with
-the token response and the original expected refresh revision. The post-response
-[`commit`](crate::engine::PendingPersist::commit) then acts as the retry,
+the token response and the original expected refresh revision. The
+[`commit`](crate::engine::PendingPersist::commit) call after the handler returns,
+before sending the response, then acts as the retry,
 re-committing the refresh through the same merge-safe path; a commit failure
 falls to the adapter's [`PersistFailurePolicy`](crate::PersistFailurePolicy).
 The default policy maps a missing record (`Gone`, commonly a concurrent

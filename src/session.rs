@@ -360,12 +360,20 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// commits through CAS, rejecting mismatches with
     /// [`SessionErrorKind::Conflict`]. Expiry is compared at serialized
     /// whole-second precision and the stored value is preserved. Application
-    /// fields remain
-    /// last-writer-wins within a refresh generation. The
+    /// fields remain last-writer-wins within a refresh generation. The
     /// engine's refresh persist goes through
     /// [`apply_refresh_and_save`](Self::apply_refresh_and_save) instead, so it
     /// never overwrites a concurrent
     /// [`update`](crate::StoreBackedSessionStore::update).
+    /// An uncontended store-backed save makes two backend calls: a load and
+    /// a compare-and-swap. A CAS conflict repeats both calls and all refresh
+    /// state checks, up to the driver's retry budget. A refresh-state mismatch
+    /// returns `Conflict` without writing. Use
+    /// [`StoreBackedSessionStore::update`](crate::StoreBackedSessionStore::update)
+    /// for merge-safe application changes;
+    /// application updates must preserve refresh fields and the revision.
+    /// Direct backend writes bypass these checks.
+    ///
     /// A changed refresh token or expiry from `ActivePending` is rejected even
     /// if the revision matches. Use
     /// [`PendingPersist::commit`](crate::engine::PendingPersist::commit).

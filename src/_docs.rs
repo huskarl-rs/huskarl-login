@@ -28,7 +28,9 @@ pub mod tutorial {
 /// Understand the design and its trade-offs.
 ///
 /// - [The session model](explanation::session_model) defines the core terms,
-///   persistence choices, request states, and lifetime policies.
+///   persistence choices, and request states.
+/// - [Session lifetime policy](explanation::session_lifetime) explains absolute
+///   lifetime limits and how configuration changes affect existing sessions.
 /// - [Token refresh](explanation::refresh) explains eager persistence,
 ///   transient failure, and concurrent refresh.
 /// - [Server-side liveness](explanation::liveness) explains idle tracking and
@@ -38,6 +40,9 @@ pub mod tutorial {
 pub mod explanation {
     #[doc = include_str!("../docs/explanation/session_model.md")]
     pub mod session_model {}
+
+    #[doc = include_str!("../docs/explanation/session_lifetime.md")]
+    pub mod session_lifetime {}
 
     #[doc = include_str!("../docs/explanation/refresh.md")]
     pub mod refresh {}

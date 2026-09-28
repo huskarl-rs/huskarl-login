@@ -43,8 +43,59 @@ use crate::{
 /// by [`LoadOutcome`] and [`SaveOutcome`]. Reserve [`Self::Error`] for backend
 /// failures. Every successful write must change [`Self::Version`] and apply
 /// the supplied `deadline` as the record's absolute retention deadline.
-/// See [Implement an external session
-/// store](crate::_docs::how_to::external_store) for the complete contract.
+///
+/// ## Versioning contract
+///
+/// Each record is stored alongside a version — the
+/// [`Version`](crate::ExternalSessionStore::Version) associated type — that the
+/// store owns entirely. It never appears in the session type; it travels through
+/// the trait methods instead:
+///
+/// - [`load`](crate::ExternalSessionStore::load) returns the stored version with
+///   the session, and the driver supplies a loaded version as `expected` when
+///   attempting a write.
+/// - [`compare_and_swap`](crate::ExternalSessionStore::compare_and_swap) writes
+///   only if the stored version still equals `expected`, changing it on success
+///   and returning [`SaveOutcome::Conflict`](crate::SaveOutcome) on a version
+///   mismatch or [`SaveOutcome::Missing`](crate::SaveOutcome) if the row is gone.
+///   Never insert a missing row: logout must not be undone by an in-flight write.
+///
+/// Version is compared by **equality only**, so any per-write-unique value works:
+/// an integer column you `+ 1` on write, a database row version (e.g. Postgres
+/// `xmin`), an ETag, a fresh UUID per write.
+///
+/// ## TTL contract
+///
+/// Every insert and compare-and-swap receives an absolute `deadline` from
+/// the driver. It is the sooner of the effective absolute session cap and the
+/// activity horizon `max(now, token_expiry) + idle_timeout`; the driver also keeps
+/// that idle horizon in lockstep with the [`LivenessConfig`](crate::LivenessConfig)
+/// attached through
+/// [`with_liveness`](crate::StoreBackedSessionStore::with_liveness). Apply the
+/// supplied deadline as the record's absolute TTL on **every** successful write,
+/// erring late:
+///
+/// - The deadline is measured on the application's clock, so a backend expiring
+///   exactly at it by its own clock can already be early — deleting early logs a
+///   user out, while a late delete costs storage and stretches the idle bound by
+///   at most the skew. Add a margin; rounding up is free.
+/// - Re-apply the TTL on **every** write — backends like Redis drop a key's TTL
+///   on a plain overwrite.
+/// - Never use a sliding window: one shorter than the remaining deadline deletes
+///   an idle-but-valid record out from under its user.
+/// - On backends whose TTLs are relative (Cassandra, etcd leases), compute
+///   `deadline − now` at write time and clamp up to a small positive value rather
+///   than deleting.
+///
+/// The horizon renews with every write: an active session refreshes its tokens
+/// (roughly once per access-token lifetime), each refresh writes the record, and
+/// the deadline moves out. A session nobody uses stops being written, so its
+/// record — refresh token included — expires even under a
+/// [delegated](crate::SessionLifetime::DelegatedToAuthorizationServer) lifetime,
+/// where `expire_at` is `None`.
+///
+/// See [Implement an external session store](crate::_docs::how_to::external_store)
+/// for a worked implementation.
 pub trait ExternalSessionStore: MaybeSendSync {
     /// The session type returned by this store. Must implement [`Session`] and
     /// [`PersistedSession`]. `Clone` because
@@ -56,7 +107,7 @@ pub trait ExternalSessionStore: MaybeSendSync {
     /// the session and handed back unchanged as `expected` to
     /// [`compare_and_swap`](Self::compare_and_swap). Compared by equality
     /// only. See the
-    /// [external store guide](crate::_docs::how_to::external_store) for
+    /// [versioning contract](ExternalSessionStore#versioning-contract) for
     /// choosing a representation.
     type Version: MaybeSendSync + 'static;
 
@@ -91,7 +142,7 @@ pub trait ExternalSessionStore: MaybeSendSync {
     /// Apply the supplied `deadline` as the record's absolute TTL on **every**
     /// successful write — backends like Redis drop a key's TTL on a plain
     /// overwrite — and never convert it to a sliding duration.
-    /// See the [external store guide](crate::_docs::how_to::external_store)
+    /// See the [TTL contract](ExternalSessionStore#ttl-contract)
     /// for the full retention contract.
     fn compare_and_swap(
         &self,

@@ -56,7 +56,7 @@ type EngineError = SessionError;
 
 /// A framework-neutral HTTP response produced by the login engine.
 ///
-/// Framework adapters lower this into their native response type via
+/// Framework adapters convert this into their native response type via
 /// [`into_parts`](Self::into_parts) at the response boundary.
 #[must_use]
 pub enum LoginResponse {
@@ -95,7 +95,7 @@ impl LoginResponse {
         }
     }
 
-    /// Lowers this response into concrete HTTP parts: status, full header list,
+    /// Converts this response into concrete HTTP parts: status, full header list,
     /// and body (a [`Redirect`](Self::Redirect)'s headers are materialized here).
     #[must_use]
     pub fn into_parts(self) -> (StatusCode, Vec<(HeaderName, HeaderValue)>, Bytes) {
@@ -578,7 +578,7 @@ impl TeardownReason {
     }
 }
 
-/// Decides how a framework adapter reacts when the post-response save of a
+/// Decides how a framework adapter reacts when the deferred save of a
 /// refreshed session fails.
 ///
 /// The inner handler has already run (including side effects) by the time this
@@ -659,7 +659,7 @@ pub(super) fn login_state_aad(state: &str) -> Vec<u8> {
 /// Drives login, callback, session loading and refresh, and logout.
 ///
 /// `SD` selects the persistence model through a [`SessionDriver`]. The engine
-/// is HTTP-framework-neutral: an adapter calls its operations and lowers
+/// is HTTP-framework-neutral: an adapter calls its operations and converts
 /// [`LoginResponse`] and [`SetCookies`] values into framework responses. Build
 /// an engine with [`LoginEngine::builder`].
 ///

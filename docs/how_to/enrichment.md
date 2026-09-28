@@ -2,8 +2,8 @@
 
 After a successful login the session driver prepares a _seed_ and the
 [`CompletedLogin`](crate::CompletedLogin); you turn them into your session type.
-How you do that depends on whether construction needs network I/O. The four
-recipes below go from least to most involved. All use
+How you do that depends on whether construction needs network I/O. Choose one of the four
+recipes below; they are alternatives, ordered from least to most involved. All use
 [`CookieSessionStore`](crate::CookieSessionStore); for
 [`StoreBackedSessionStore`](crate::StoreBackedSessionStore) only the seed type
 changes (to [`PersistedSessionState`](crate::PersistedSessionState)).
@@ -11,13 +11,13 @@ changes (to [`PersistedSessionState`](crate::PersistedSessionState)).
 Whichever recipe you choose, the session type must be `Clone` (derive it) —
 [`PendingPersist::commit`](crate::engine::PendingPersist::commit) explains why.
 
-## 1. No claims, no I/O — `build()`
+## No claims, no I/O — `build()`
 
 If the session type implements `From<Seed>`, finish the builder with `build()`
 and the default [`NoEnrichment`](crate::NoEnrichment) does the rest. Nothing to
 write here beyond the `From` impl.
 
-## 2. Map ID token claims, no I/O — `build_with_claims`
+## Map ID token claims, no I/O — `build_with_claims`
 
 The common case: the session is the seed plus a few ID token claims, no network
 call. Pass a synchronous closure — no `SessionEnricher` impl, no
@@ -26,14 +26,17 @@ call. Pass a synchronous closure — no `SessionEnricher` impl, no
 ```rust
 use huskarl_login::core::crypto::{cipher::AeadCipher, seal::AeadV1Sealer};
 use huskarl_login::{CookieSessionStore, Session, SessionState};
-# struct MySession {
-#     state: SessionState,
-#     email: Option<String>,
-# }
-# impl Session for MySession {
-#     fn state(&self) -> &SessionState { &self.state }
-#     fn set_state(&mut self, state: SessionState) { self.state = state; }
-# }
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct MySession {
+    state: SessionState,
+    email: Option<String>,
+}
+
+impl Session for MySession {
+    fn state(&self) -> &SessionState { &self.state }
+    fn set_state(&mut self, state: SessionState) { self.state = state; }
+}
 # fn attach(cipher: impl AeadCipher + 'static) -> CookieSessionStore<MySession> {
 let store = CookieSessionStore::<MySession>::builder()
     .sealer(AeadV1Sealer::new(cipher))
@@ -54,7 +57,7 @@ let store = CookieSessionStore::<MySession>::builder()
 Returning `Err` from the closure fails session creation (the callback responds
 500). For non-standard claims, use `claims.extra.get("…")`.
 
-## 3. A named, reusable enricher — `SessionEnricher`
+## A named, reusable enricher — `SessionEnricher`
 
 The same no-I/O mapping written as a type, when you want to name and reuse it:
 
@@ -87,7 +90,7 @@ impl SessionEnricher<SessionState, MySession> for ClaimsEnricher {
 }
 ```
 
-## 4. Call the `UserInfo` endpoint — `SessionEnricher` with I/O
+## Call the `UserInfo` endpoint — `SessionEnricher` with I/O
 
 When the session needs claims the ID token doesn't carry, the enricher owns its
 clients and awaits them. Attach it with `build_with_enricher`:

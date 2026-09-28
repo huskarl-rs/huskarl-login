@@ -44,6 +44,7 @@ uuid = { version = "1", features = ["v7", "serde"] }
 uuid = { version = "1", features = ["v7", "serde", "js"] }
 
 [dev-dependencies]
+huskarl-reqwest = { version = "0.9", path = "../huskarl/huskarl-reqwest", features = ["rustls-tls"] }
 hex = "0.4"
 huskarl-crypto-native = { version = "0.11", path = "../huskarl/huskarl-crypto-native" }
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
