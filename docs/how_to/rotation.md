@@ -6,6 +6,11 @@ your adapter, and a staging deployment with the same replica layout as productio
 This concerns OAuth refresh tokens; cookie encryption-key rotation is described
 in [Cookie security](crate::_docs::explanation::cookie_security).
 
+For storage, HTTPS, keys, and logout decisions, start with
+[Choose and configure a deployment](crate::_docs::how_to::deployment).
+Refresh coordination means preventing simultaneous requests from exchanging
+the same refresh token.
+
 ## 1. Establish the provider's reuse behavior
 
 Check the provider's documentation and configuration for concurrent reuse of one

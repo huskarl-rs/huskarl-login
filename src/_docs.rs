@@ -56,6 +56,7 @@ pub mod explanation {
 
 /// Complete a specific integration or deployment task.
 ///
+/// - [Choose and configure a deployment](how_to::deployment).
 /// - [Build a framework adapter](how_to::adapter).
 /// - [Build an application session](how_to::enrichment).
 /// - [Implement an external session store](how_to::external_store).
@@ -63,6 +64,9 @@ pub mod explanation {
 /// - [Deploy refresh-token rotation safely](how_to::rotation).
 /// - [Troubleshoot browser login](how_to::troubleshooting).
 pub mod how_to {
+    #[doc = include_str!("../docs/how_to/deployment.md")]
+    pub mod deployment {}
+
     #[doc = include_str!("../docs/how_to/troubleshooting.md")]
     pub mod troubleshooting {}
 
