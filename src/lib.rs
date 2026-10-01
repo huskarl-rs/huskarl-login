@@ -33,6 +33,11 @@
 //! Choose [`CookieSessionStore`] to keep the encrypted session in the browser.
 //! Choose [`StoreBackedSessionStore`] to keep only an encrypted lookup key in
 //! the browser and store the session through an [`ExternalSessionStore`].
+//! With fully stateless cookie sessions, logout clears the browser's cookies but
+//! cannot selectively invalidate copied cookies that are still valid. Delayed
+//! responses can also reinstall older session cookies. These are architectural
+//! limitations, not implementation bugs. Use store-backed sessions when you need
+//! server-enforced revocation and protection against stale session updates.
 //!
 //! # Documentation
 //!
