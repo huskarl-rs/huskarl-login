@@ -30,8 +30,8 @@ combines it with framework-managed state to build the application’s
 
 ```text
 authorization code ─▶ CompletedLogin ─┐
-                                     ├─▶ SessionEnricher ─▶ Session ─▶ store
-                    managed state ───┘
+                                      ├─▶ SessionEnricher ─▶ Session ─▶ store
+                     managed state ───┘
 ```
 
 Choose [`CookieSessionStore`](https://docs.rs/huskarl-login/latest/huskarl_login/cookie_session/struct.CookieSessionStore.html) to keep the encrypted session in the browser.

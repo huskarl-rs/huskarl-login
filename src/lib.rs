@@ -26,8 +26,8 @@
 //!
 //! ```text
 //! authorization code ─▶ CompletedLogin ─┐
-//!                                      ├─▶ SessionEnricher ─▶ Session ─▶ store
-//!                     managed state ───┘
+//!                                       ├─▶ SessionEnricher ─▶ Session ─▶ store
+//!                      managed state ───┘
 //! ```
 //!
 //! Choose [`CookieSessionStore`] to keep the encrypted session in the browser.
