@@ -1805,7 +1805,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending.state().refresh_revision, 1);
-        assert!(store.save_session(&pending).await.unwrap().is_empty());
+        assert_eq!(
+            store.save_session(&pending).await.unwrap(),
+            [] as [http::HeaderValue; 0]
+        );
         assert_eq!(store.external.stored_version(), 2);
     }
 
@@ -1882,7 +1885,10 @@ mod tests {
         });
         let store = store_over(external).await;
         snapshot.persisted.state.sid = Some("whole-session-write".to_owned());
-        assert!(store.save_session(&snapshot).await.unwrap().is_empty());
+        assert_eq!(
+            store.save_session(&snapshot).await.unwrap(),
+            [] as [http::HeaderValue; 0]
+        );
         let (stored, version) = store
             .external
             .load(snapshot.persisted().session_key)
@@ -2270,7 +2276,7 @@ mod tests {
             .unwrap();
 
         // No Set-Cookie: the pointer cookie is unchanged by a refresh.
-        assert!(cookies.is_empty());
+        assert_eq!(cookies, [] as [http::HeaderValue; 0]);
         // The caller's session was replaced with the committed merge: the
         // concurrent `sid` write survived AND the refresh was applied.
         assert_eq!(snapshot.persisted.state.sid.as_deref(), Some("concurrent"));

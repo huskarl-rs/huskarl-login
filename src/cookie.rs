@@ -726,7 +726,10 @@ mod tests {
     fn login_state_names_empty_without_matches() {
         let mut headers = http::HeaderMap::new();
         headers.insert(header::COOKIE, "session=abc; foo=bar".parse().unwrap());
-        assert!(login_state_cookie_names(&headers, "__Host-huskarl_login_").is_empty());
+        assert_eq!(
+            login_state_cookie_names(&headers, "__Host-huskarl_login_"),
+            [] as [String; 0]
+        );
     }
 
     // -- is_valid_oauth_state tests --

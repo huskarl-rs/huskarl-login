@@ -945,7 +945,7 @@ fn is_cross_site_request_cases(#[case] pairs: &[(&str, &str)], #[case] expected:
 fn error_chain_formats_single_error() {
     let err = "not-a-number".parse::<i32>().unwrap_err();
     let chain = error_chain(&err);
-    assert!(!chain.is_empty());
+    assert_ne!(chain, "");
     assert!(chain.contains("invalid digit"), "got: {chain}");
 }
 
@@ -1197,7 +1197,7 @@ async fn untracked_verdict_yields_active() {
     let e = engine(MockSessionStore::with_session(valid_session())).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let (_session, set_cookies) = expect_active(loaded);
-    assert!(set_cookies.is_empty());
+    assert_eq!(set_cookies, [] as [HeaderValue; 0]);
 }
 
 #[tokio::test]
@@ -1209,7 +1209,7 @@ async fn active_verdict_yields_active() {
     let e = engine(store).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let (_session, set_cookies) = expect_active(loaded);
-    assert!(set_cookies.is_empty());
+    assert_eq!(set_cookies, [] as [HeaderValue; 0]);
     assert!(!e.session_store.save_called());
 }
 
@@ -1497,7 +1497,7 @@ async fn valid_token_within_refresh_margin_without_refresh_token_stays_active() 
 
     assert_eq!(session.token_expiry(), expiry);
     assert!(session.refresh_token().is_none());
-    assert!(set_cookies.is_empty());
+    assert_eq!(set_cookies, [] as [HeaderValue; 0]);
     assert!(!e.session_store.revoke_called());
     assert!(!e.session_store.save_called());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1722,7 +1722,7 @@ async fn transient_refresh_failure_with_valid_token_retains_session() {
     // The default driver verdict is `Untracked`, so the retained session comes
     // back `Active` with nothing owed.
     let (_session, set_cookies) = expect_active(loaded);
-    assert!(set_cookies.is_empty());
+    assert_eq!(set_cookies, [] as [HeaderValue; 0]);
     assert!(!e.session_store.revoke_called());
     // The full retry budget was spent before falling back to retention.
     assert_eq!(calls.load(Ordering::SeqCst), super::REFRESH_MAX_ATTEMPTS);
@@ -1817,7 +1817,7 @@ async fn commit_calls_store_save() {
     let pending = PendingPersist::new(session, token_response_fixture(), 0);
     let set_cookies = pending.commit(&e, &api_headers()).await.unwrap();
     assert!(e.session_store.save_called());
-    assert!(!set_cookies.into_headers().is_empty());
+    assert_ne!(set_cookies.into_headers(), [] as [HeaderValue; 0]);
 }
 
 #[test]
