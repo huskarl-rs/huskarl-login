@@ -44,7 +44,7 @@ login that still presents the old pointer cookie deletes the record it names.
 Logout clears the browser's pointer cookie independently, even when loading or
 deleting the record fails. That logs out the current browser during a store
 outage, but a copied pointer remains usable until deletion succeeds or the
-record reaches its storage deadline; monitor the logged revocation failures.
+record reaches its storage deadline; monitor revocation failures through the engine diagnostic handler and handled-failure counter (see [metrics](crate::metrics)).
 Records it cannot reach — the pointer cookie was cleared, or its cookie key
 was rotated out without a grace period — are the backend's to reap, and
 the stored deadline is the detector: a record past its deadline is one your

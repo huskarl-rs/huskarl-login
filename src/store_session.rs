@@ -622,7 +622,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         // qualifying request after the callback. This remains best-effort like
         // later activity touches: the record deadline is the fail-open bound.
         if let Some((liveness, _)) = &self.liveness
-            && let Err(e) = liveness
+            && let Err(_error) = liveness
                 .touch(
                     session.persisted().session_key,
                     now,
@@ -630,7 +630,6 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
                 )
                 .await
         {
-            log::warn!("failed to initialize session liveness (best-effort): {e}");
             self.record_liveness_failure(&LivenessFailure::Touch);
         }
         Ok((session, cookies))
@@ -640,7 +639,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     fn record_liveness_failure(&self, failure: &LivenessFailure) {
         crate::metrics::emit_counter(
             "huskarl.session.liveness_failure",
-            vec![metrics::Label::new("op", failure.as_str())],
+            [("op", failure.as_str())],
             self.sealer.metrics_name.as_deref(),
         );
     }
@@ -720,8 +719,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         // stale entry that expires under its own TTL; it must not fail logout.
         if let Some((liveness, _)) = &self.liveness {
             let key = session.persisted().session_key;
-            if let Err(e) = liveness.clear(key).await {
-                log::warn!("failed to clear liveness entry on revocation: {e}");
+            if let Err(_error) = liveness.clear(key).await {
                 self.record_liveness_failure(&LivenessFailure::Clear);
             }
         }
@@ -755,20 +753,14 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         let result = match self.external.load(old_key).await {
             Ok(Some((old, _version))) => match self.external.delete(&old).await {
                 Ok(()) => SupersededDeleteResult::Deleted,
-                Err(e) => {
-                    log::warn!("failed to delete superseded session record: {e}");
-                    SupersededDeleteResult::DeleteFailed
-                }
+                Err(_error) => SupersededDeleteResult::DeleteFailed,
             },
             Ok(None) => SupersededDeleteResult::NotFound,
-            Err(e) => {
-                log::warn!("failed to load superseded session record: {e}");
-                SupersededDeleteResult::LoadFailed
-            }
+            Err(_error) => SupersededDeleteResult::LoadFailed,
         };
         crate::metrics::emit_counter(
             "huskarl.session.superseded_delete",
-            vec![metrics::Label::new("outcome", result.as_str())],
+            [("outcome", result.as_str())],
             self.sealer.metrics_name.as_deref(),
         );
         // Preserve the old liveness verdict when the authoritative record may
@@ -781,9 +773,8 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         );
         if record_is_gone
             && let Some((liveness, _)) = &self.liveness
-            && let Err(e) = liveness.clear(old_key).await
+            && let Err(_error) = liveness.clear(old_key).await
         {
-            log::warn!("failed to clear superseded liveness entry: {e}");
             self.record_liveness_failure(&LivenessFailure::Clear);
         }
     }
@@ -902,8 +893,7 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
         // AS-side) until the store recovers.
         let last_active = match liveness.last_active(key).await {
             Ok(last_active) => last_active,
-            Err(e) => {
-                log::warn!("liveness read failed; treating session as active: {e}");
+            Err(_error) => {
                 self.record_liveness_failure(&LivenessFailure::Read);
                 return Ok(LivenessVerdict::Active);
             }
@@ -931,9 +921,8 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
         if record_activity
             && verdict == LivenessVerdict::Active
             && due
-            && let Err(e) = liveness.touch(key, now, deadline).await
+            && let Err(_error) = liveness.touch(key, now, deadline).await
         {
-            log::warn!("liveness touch failed (best-effort): {e}");
             self.record_liveness_failure(&LivenessFailure::Touch);
         }
         Ok(verdict)
@@ -954,7 +943,7 @@ mod tests {
         core::{crypto::seal::AeadV1Sealer, platform::MaybeSendBoxFuture},
         session_state::{Session, SessionState},
         test_support::{
-            RevocableExternalStore, aes_key_with_kid, request_cookies, test_cipher, test_sealer,
+            RevocableExternalStore, aes_key_with_kid, request_cookies, test_sealer,
             test_sealer_with_kid, test_session_policy,
         },
     };
@@ -2827,8 +2816,10 @@ mod tests {
 
     // ── Cookie metrics emission ──────────────────────────────────────────
 
-    use crate::test_support::{counter_value, with_metrics};
+    #[cfg(feature = "metrics")]
+    use crate::test_support::{counter_value, test_cipher, with_metrics};
 
+    #[cfg(feature = "metrics")]
     fn test_session_and_store() -> (MinimalSession, MinimalExternalStore) {
         let s = test_session();
         (s.clone(), MinimalExternalStore(s))
@@ -2836,10 +2827,12 @@ mod tests {
 
     /// Counter labels for a pointer-cookie decrypt with the given outcome. The
     /// decrypt counter carries no kid label (see [`CookieSealer::record_decrypt`]).
+    #[cfg(feature = "metrics")]
     fn decrypt_labels(outcome: &str) -> [(&str, &str); 2] {
         [("cookie", "__Host-session"), ("outcome", outcome)]
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_pointer_cookie_records_encrypt() {
         let ((), counters) = with_metrics(async {
@@ -2865,6 +2858,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_pointer_cookie_records_kid_when_cipher_has_identity() {
         let ((), counters) = with_metrics(async {
@@ -2890,6 +2884,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_read_pointer_cookie_absent_is_silent() {
         let ((), counters) = with_metrics(async {
@@ -2910,6 +2905,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_read_pointer_cookie_bad_encoding() {
         let ((), counters) = with_metrics(async {
@@ -2937,6 +2933,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_read_pointer_cookie_tampered_records_decrypt_failed() {
         let ((), counters) = with_metrics(async {
@@ -2964,6 +2961,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_read_pointer_cookie_payload_invalid_when_not_16_bytes() {
         let ((), counters) = with_metrics(async {
@@ -2998,6 +2996,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_read_pointer_cookie_success_records_ok() {
         let ((), counters) = with_metrics(async {
@@ -3040,6 +3039,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_name_stamped_via_session_policy_labels_store_counters() {
         let ((), counters) = with_metrics(async {
@@ -3080,6 +3080,7 @@ mod tests {
 
     // ── Storage metrics emission ─────────────────────────────────────────
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_superseded_delete_records_deleted() {
         let ((), counters) = with_metrics(async {
@@ -3113,6 +3114,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_liveness_read_failure_records_fail_open() {
         let ((), counters) = with_metrics(async {

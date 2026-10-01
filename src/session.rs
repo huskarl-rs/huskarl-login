@@ -318,7 +318,7 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// [`SessionLifetime::Bounded`](crate::SessionLifetime) cap, `None` when
     /// delegated) clamps the cookie `Max-Age`, so no session cookie outlives
     /// the session cap; `metrics_name` becomes the `name` label on every
-    /// counter the driver emits (`None` omits it).
+    /// counter the driver emits (`None` uses the empty string).
     ///
     /// # Errors
     ///

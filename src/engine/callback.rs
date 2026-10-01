@@ -5,7 +5,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use serde::Deserialize;
 
-use super::{LoginEngine, LoginResponse, LoginStateCookie, error_chain};
+use super::{DiagnosticOperation, LoginEngine, LoginResponse, LoginStateCookie};
 use crate::{
     CompletedLogin, DriverLoad, Session, SessionDriver,
     client::grant::authorization_code::{CompleteInput, CompleteOutput},
@@ -94,7 +94,7 @@ where
                 .maybe_id_token_claims(id_token.map(|jwt| jwt.claims))
                 .build(),
             Err(e) => {
-                log::error!("token exchange failed: {}", error_chain(&e));
+                self.diagnose(DiagnosticOperation::Exchange, &e);
                 self.record_login_complete(&LoginCompleteResult::TokenExchangeFailed, None);
                 return self.callback_error(
                     StatusCode::BAD_GATEWAY,
@@ -111,7 +111,7 @@ where
         {
             Ok(c) => c,
             Err(e) => {
-                log::error!("failed to create session: {}", error_chain(&e));
+                self.diagnose(DiagnosticOperation::Create, &e);
                 self.record_login_complete(&LoginCompleteResult::SessionCreateFailed, None);
                 return self.callback_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -139,10 +139,7 @@ where
             }
             Ok(DriverLoad::Absent | DriverLoad::Invalid(_)) => false,
             Err(e) => {
-                log::debug!(
-                    "session load failed during callback fallback: {}",
-                    error_chain(&e)
-                );
+                self.diagnose(DiagnosticOperation::CallbackLoad, &e);
                 false
             }
         }

@@ -43,6 +43,46 @@ use crate::{
     session_state::bounded_time_add,
 };
 
+/// Engine operation whose error was consumed rather than returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::AsRefStr)]
+#[strum(serialize_all = "snake_case")]
+#[non_exhaustive]
+pub enum DiagnosticOperation {
+    /// Construct the authorization redirect.
+    Start,
+    /// Complete the authorization-code exchange.
+    Exchange,
+    /// Create a session after exchange.
+    Create,
+    /// Load an existing session during callback fallback.
+    CallbackLoad,
+    /// Persist refreshed tokens eagerly (a deferred retry follows).
+    EagerPersist,
+    /// Refresh tokens, after the retry loop has terminated.
+    Refresh,
+    /// Revoke a session during automatic teardown.
+    Revoke,
+    /// Load a session during logout.
+    LogoutLoad,
+    /// Revoke a session during logout.
+    LogoutRevoke,
+    /// Construct the end-session URL (falls back to the local target).
+    LogoutUrl,
+    /// Encode the logout redirect header.
+    LogoutRedirect,
+}
+
+/// Borrowed operational diagnostic; not a durable audit or lifecycle event.
+#[derive(Debug)]
+pub struct LoginDiagnostic<'a> {
+    /// Operation that failed.
+    pub operation: DiagnosticOperation,
+    /// Original error and source chain; potentially sensitive or untrusted.
+    pub error: &'a dyn std::error::Error,
+}
+
+type DiagnosticHandler = Arc<dyn Fn(LoginDiagnostic<'_>) + Send + Sync>;
+
 mod callback;
 mod logout;
 mod redirect;
@@ -161,12 +201,14 @@ impl LoginResponse {
 /// [`into_headers`](Self::into_headers) (or iterate it) and append every
 /// value to the outgoing response.
 ///
-/// Dropping a **non-empty**, unconsumed `SetCookies` logs an error; dropping
-/// an empty guard (the steady state) is silent. For what a discarded cookie
+/// Dropping a **non-empty**, unconsumed `SetCookies` increments the optional
+/// dropped-work counter; dropping an empty guard (the steady state) is silent. For what a discarded cookie
 /// costs, see the [refresh explanation](crate::_docs::explanation::refresh).
 #[must_use = "session Set-Cookie headers must be appended to the response"]
 #[derive(Default)]
 pub struct SetCookies {
+    #[cfg(feature = "metrics")]
+    metrics_name: Option<Arc<str>>,
     headers: Vec<HeaderValue>,
     /// Test-only observer incremented when the guard fires, so tests can
     /// assert drop detection deterministically (a global counter would race
@@ -176,6 +218,30 @@ pub struct SetCookies {
 }
 
 impl SetCookies {
+    fn with_metrics_name(mut self, name: Option<&Arc<str>>) -> Self {
+        #[cfg(feature = "metrics")]
+        {
+            self.metrics_name = name.cloned();
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            let _ = (&mut self, name);
+        }
+        self
+    }
+
+    fn metrics_name(&self) -> Option<&str> {
+        #[cfg(feature = "metrics")]
+        {
+            self.metrics_name.as_deref()
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            let _ = self;
+            None
+        }
+    }
+
     /// Wraps headers owed to the response. Crate-internal: adapters only
     /// consume this type.
     pub(crate) fn new(headers: Vec<HeaderValue>) -> Self {
@@ -183,6 +249,8 @@ impl SetCookies {
             headers,
             #[cfg(test)]
             drop_probe: None,
+            #[cfg(feature = "metrics")]
+            metrics_name: None,
         }
     }
 
@@ -205,7 +273,7 @@ impl SetCookies {
         std::mem::take(&mut self.headers)
     }
 
-    /// Consumes the guard without logging, dropping the cookies.
+    /// Consumes the guard without counting a drop, dropping the cookies.
     ///
     /// Only correct when the response is already gone — e.g. a persistence
     /// fallback that runs after the response was written, where non-delivery
@@ -257,12 +325,10 @@ impl Drop for SetCookies {
         if let Some(probe) = &self.drop_probe {
             probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        log::error!(
-            "{} session Set-Cookie header(s) dropped without reaching a response; \
-             a dropped re-sealed session cookie can strand a rotated refresh token \
-             and kill the session — consume `SetCookies` into the response instead \
-             of discarding it",
-            self.headers.len()
+        crate::metrics::emit_counter(
+            "huskarl.session.dropped",
+            [("operation", "set_cookies")],
+            self.metrics_name(),
         );
     }
 }
@@ -393,12 +459,14 @@ impl<S> std::fmt::Debug for LoadedSession<S> {
 ///
 /// Dropping an uncommitted `PendingPersist` forfeits the retry of the failed
 /// eager persist, so, like [`SetCookies`], the drop is detected at runtime
-/// and logged as an error; for what a forfeited retry costs, see the
+/// and counted when `metrics` is enabled; for what a forfeited retry costs, see
 /// [refresh explanation](crate::_docs::explanation::refresh). The one
 /// legitimate abandonment (the session was deleted instead) is spelled
 /// [`abandon`](Self::abandon).
 #[must_use = "an owed session persist must be committed after the response"]
 pub struct PendingPersist<S> {
+    #[cfg(feature = "metrics")]
+    metrics_name: Option<Arc<str>>,
     /// The loaded session, with the refresh applied in memory. Shared so
     /// adapters can serve it while this value waits out the inner handler.
     session: Arc<S>,
@@ -418,6 +486,30 @@ pub struct PendingPersist<S> {
 }
 
 impl<S> PendingPersist<S> {
+    fn with_metrics_name(mut self, name: Option<&Arc<str>>) -> Self {
+        #[cfg(feature = "metrics")]
+        {
+            self.metrics_name = name.cloned();
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            let _ = (&mut self, name);
+        }
+        self
+    }
+
+    fn metrics_name(&self) -> Option<&str> {
+        #[cfg(feature = "metrics")]
+        {
+            self.metrics_name.as_deref()
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            let _ = self;
+            None
+        }
+    }
+
     /// Pairs a refreshed session with the refresh response whose persist is
     /// owed. [`LoginEngine::load_session`] constructs these; the constructor
     /// is public so adapter tests can fabricate the deferred-persist path
@@ -431,6 +523,8 @@ impl<S> PendingPersist<S> {
             expected_refresh_revision,
             #[cfg(test)]
             drop_probe: None,
+            #[cfg(feature = "metrics")]
+            metrics_name: None,
         }
     }
 
@@ -508,7 +602,7 @@ impl<S> PendingPersist<S> {
                 request_headers,
             )
             .await
-            .map(SetCookies::new)
+            .map(|headers| engine.set_cookies(headers))
     }
 
     /// Defuses the drop guard without committing — only correct when the owed
@@ -537,12 +631,10 @@ impl<S> Drop for PendingPersist<S> {
         if let Some(probe) = &self.drop_probe {
             probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        log::error!(
-            "owed session persist dropped without commit; the retry of the failed \
-             eager refresh persist is forfeited — with refresh-token rotation this \
-             strands the rotated token and the session dies on its next request. \
-             Commit the `PendingPersist` after the response (or `abandon` it if \
-             the session was deleted instead)"
+        crate::metrics::emit_counter(
+            "huskarl.session.dropped",
+            [("operation", "persist")],
+            self.metrics_name(),
         );
     }
 }
@@ -681,8 +773,9 @@ pub struct LoginEngine<SD> {
     secure: bool,
     cipher: SessionCipher,
     error_page: Box<dyn ErrorPage>,
-    /// Instance `name` label for emitted counters; `None` omits it.
-    metrics_name: Option<String>,
+    /// Instance `name` label for emitted counters; `None` uses the empty string.
+    metrics_name: Option<Arc<str>>,
+    diagnostic_handler: Option<DiagnosticHandler>,
 }
 
 // ── Constructor ───────────────────────────────────────────────────────────────
@@ -720,9 +813,16 @@ where
         error_page: Box<dyn ErrorPage>,
         /// Instance name added as the `name` label on every counter this
         /// engine and its session store emit, telling engines apart when one
-        /// process runs several. `None` (the default) omits the label.
+        /// process runs several. `None` (the default) uses `name=""`. Keep names
+        /// bounded by configuration.
         #[builder(into)]
         metrics_name: Option<String>,
+        /// Receives errors consumed by the engine. Runs synchronously and may
+        /// run concurrently; must not block or panic. Error sources can contain
+        /// secrets or untrusted text: redact before export. No durable delivery
+        /// or security-event semantics are implied. Works without `metrics`.
+        #[builder(with = |handler: impl Fn(LoginDiagnostic<'_>) + Send + Sync + 'static| Arc::new(handler) as DiagnosticHandler)]
+        diagnostics: Option<DiagnosticHandler>,
     ) -> Result<Self, ConfigError> {
         // Re-derive these values at the trust boundary. `LoginConfig` fields
         // are public for adapter inspection and may have been changed after
@@ -802,7 +902,8 @@ where
             secure,
             cipher: sealer,
             error_page,
-            metrics_name,
+            metrics_name: metrics_name.map(Arc::from),
+            diagnostic_handler: diagnostics,
         })
     }
 }
@@ -933,7 +1034,7 @@ where
                 self.record_teardown_with_invalid_reason(reason, Some(invalid_reason));
                 return Ok(LoadedSession::Cleared {
                     reason,
-                    clears: SetCookies::new(self.session_store.clear_session_cookies(headers)),
+                    clears: self.set_cookies(self.session_store.clear_session_cookies(headers)),
                 });
             }
         };
@@ -1006,10 +1107,7 @@ where
                 resp
             }
             Err(e) => {
-                log::error!(
-                    "failed to redirect to authorization server: {}",
-                    error_chain(&e)
-                );
+                self.diagnose(DiagnosticOperation::Start, &e);
                 self.record_login_start(&LoginStartResult::Error);
                 self.build_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1046,7 +1144,6 @@ where
         now: SystemTime,
     ) -> Option<TeardownReason> {
         if is_too_far_future(session.created_at(), now) {
-            log::warn!("session timestamps are too far in the future — treating as expired");
             return Some(TeardownReason::ClockSkew);
         }
         if let Some(deadline) = self.session_deadline(session)
@@ -1109,7 +1206,7 @@ where
                 {
                     Ok(set_cookies) => LoadedSession::Active {
                         session,
-                        set_cookies: SetCookies::new(set_cookies),
+                        set_cookies: self.set_cookies(set_cookies),
                     },
                     Err(e) if e.kind() == SessionErrorKind::Gone => {
                         let reason = self
@@ -1120,23 +1217,19 @@ where
                         self.record_teardown_with_invalid_reason(reason, invalid_reason);
                         LoadedSession::Cleared {
                             reason,
-                            clears: SetCookies::new(
-                                self.session_store.clear_session_cookies(headers),
-                            ),
+                            clears: self
+                                .set_cookies(self.session_store.clear_session_cookies(headers)),
                         }
                     }
                     Err(e) => {
-                        log::warn!(
-                            "failed to eagerly persist refreshed session; deferring to \
-                             post-response persist: {}",
-                            error_chain(&e)
-                        );
+                        self.diagnose(DiagnosticOperation::EagerPersist, &e);
                         LoadedSession::ActivePending {
                             pending: PendingPersist::new(
                                 session,
                                 token_response,
                                 expected_refresh_revision,
-                            ),
+                            )
+                            .with_metrics_name(self.metrics_name.as_ref()),
                         }
                     }
                 }
@@ -1144,11 +1237,7 @@ where
             // Re-read the clock: the retry loop slept, and the token may have
             // expired while we were waiting.
             Err(e) if advises_retry(&e) && SystemTime::now() < session.token_expiry() => {
-                log::warn!(
-                    "token refresh failed transiently; retaining session while access token \
-                     is still valid: {}",
-                    error_chain(&e)
-                );
+                self.diagnose(DiagnosticOperation::Refresh, &e);
                 self.record_refresh(&RefreshResult::FailedRetained);
                 // Rare transient path — retain as-is without an activity touch;
                 // the next request re-evaluates liveness.
@@ -1164,10 +1253,7 @@ where
             // server recovers — an AS blip at the wrong moment must not force
             // every idle user back through login.
             Err(e) if advises_retry(&e) => {
-                log::warn!(
-                    "token refresh unavailable; retaining session for a later retry: {}",
-                    error_chain(&e)
-                );
+                self.diagnose(DiagnosticOperation::Refresh, &e);
                 self.record_refresh(&RefreshResult::FailedUnavailable);
                 LoadedSession::RefreshUnavailable
             }
@@ -1175,7 +1261,7 @@ where
             // reuse-detection revocation): the AS disowned the refresh token,
             // so the session is dead — tear it down.
             Err(e) => {
-                log::error!("token refresh failed: {}", error_chain(&e));
+                self.diagnose(DiagnosticOperation::Refresh, &e);
                 let reason = TeardownReason::RefreshRejected;
                 let clears = self.terminate_best_effort(&session, headers).await;
                 self.record_refresh(&RefreshResult::Failed);
@@ -1186,16 +1272,16 @@ where
     }
 
     /// Builds browser clears first, then attempts authoritative revocation.
-    /// A backend failure is logged but can never keep the current browser from
-    /// dropping its dead session state.
+    /// A backend failure is reported to the diagnostic handler but cannot
+    /// prevent returning clears for the current browser.
     async fn terminate_best_effort(
         &self,
         session: &SD::SessionType,
         headers: &HeaderMap,
     ) -> SetCookies {
-        let clears = SetCookies::new(self.session_store.clear_session_cookies(headers));
+        let clears = self.set_cookies(self.session_store.clear_session_cookies(headers));
         if let Err(e) = self.session_store.revoke(session).await {
-            log::error!("failed to revoke session: {}", error_chain(&e));
+            self.diagnose(DiagnosticOperation::Revoke, &e);
         }
         clears
     }
@@ -1231,15 +1317,17 @@ where
                     // the session and lets the next request try again.
                     let delay = refresh_retry_delay(attempt).max(after.unwrap_or_default());
                     if delay > REFRESH_RETRY_MAX_DELAY {
-                        log::warn!(
-                            "token refresh failed (attempt {attempt}/{REFRESH_MAX_ATTEMPTS}); \
-                             authorization server asked to wait {delay:?}, longer than the \
-                             {REFRESH_RETRY_MAX_DELAY:?} in-request budget: {e}"
+                        crate::metrics::emit_counter(
+                            "huskarl.session.refresh_retry",
+                            [("outcome", "delay_exceeded")],
+                            self.metrics_name.as_deref(),
                         );
                         return Err(e);
                     }
-                    log::warn!(
-                        "token refresh failed (attempt {attempt}/{REFRESH_MAX_ATTEMPTS}, retrying in {delay:?}): {e}"
+                    crate::metrics::emit_counter(
+                        "huskarl.session.refresh_retry",
+                        [("outcome", "scheduled")],
+                        self.metrics_name.as_deref(),
                     );
                     sleep(delay).await;
                 }
@@ -1247,10 +1335,25 @@ where
         }
     }
 
+    fn diagnose(&self, operation: DiagnosticOperation, error: &dyn std::error::Error) {
+        crate::metrics::emit_counter(
+            "huskarl.login.handled_failure",
+            [("operation", operation.as_ref())],
+            self.metrics_name.as_deref(),
+        );
+        if let Some(handler) = &self.diagnostic_handler {
+            handler(LoginDiagnostic { operation, error });
+        }
+    }
+
+    fn set_cookies(&self, headers: Vec<HeaderValue>) -> SetCookies {
+        SetCookies::new(headers).with_metrics_name(self.metrics_name.as_ref())
+    }
+
     fn record_login_start(&self, result: &LoginStartResult) {
         crate::metrics::emit_counter(
             "huskarl.login.start",
-            vec![metrics::Label::new("outcome", result.as_str())],
+            [("outcome", result.as_str())],
             self.metrics_name.as_deref(),
         );
     }
@@ -1258,9 +1361,9 @@ where
     fn record_login_complete(&self, result: &LoginCompleteResult, as_error: Option<&'static str>) {
         crate::metrics::emit_counter(
             "huskarl.login.complete",
-            vec![
-                metrics::Label::new("outcome", result.as_str()),
-                metrics::Label::new("error", as_error.unwrap_or("none")),
+            [
+                ("outcome", result.as_str()),
+                ("error", as_error.unwrap_or("none")),
             ],
             self.metrics_name.as_deref(),
         );
@@ -1269,7 +1372,7 @@ where
     fn record_refresh(&self, result: &RefreshResult) {
         crate::metrics::emit_counter(
             "huskarl.session.refresh",
-            vec![metrics::Label::new("outcome", result.as_str())],
+            [("outcome", result.as_str())],
             self.metrics_name.as_deref(),
         );
     }
@@ -1285,9 +1388,9 @@ where
     ) {
         crate::metrics::emit_counter(
             "huskarl.session.teardown",
-            vec![
-                metrics::Label::new("reason", reason.as_str()),
-                metrics::Label::new(
+            [
+                ("reason", reason.as_str()),
+                (
                     "invalid_reason",
                     invalid_reason.map_or("none", |reason| reason.as_str()),
                 ),
@@ -1307,7 +1410,7 @@ where
         session: &SD::SessionType,
         request_headers: &HeaderMap,
     ) -> TerminateSessionOutcome {
-        let clears = SetCookies::new(self.session_store.clear_session_cookies(request_headers));
+        let clears = self.set_cookies(self.session_store.clear_session_cookies(request_headers));
         let revocation = self.session_store.revoke(session).await;
         TerminateSessionOutcome { clears, revocation }
     }
@@ -1338,7 +1441,7 @@ where
         self.session_store
             .save(session, request_headers)
             .await
-            .map(SetCookies::new)
+            .map(|headers| self.set_cookies(headers))
     }
 
     /// Renders an error response through the configured [`ErrorPage`].

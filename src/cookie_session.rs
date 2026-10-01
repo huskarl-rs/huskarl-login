@@ -1824,14 +1824,17 @@ mod tests {
 
     // ── Cookie metrics emission ──────────────────────────────────────────
 
+    #[cfg(feature = "metrics")]
     use crate::test_support::{counter_value, with_metrics};
 
     /// Counter labels for a session-cookie decrypt with the given outcome. The
     /// decrypt counter carries no kid label (see [`CookieSealer::record_decrypt`]).
+    #[cfg(feature = "metrics")]
     fn decrypt_labels(outcome: &str) -> [(&str, &str); 2] {
         [("cookie", "__Host-huskarl_session"), ("outcome", outcome)]
     }
 
+    #[cfg(feature = "metrics")]
     async fn plain_store() -> CookieSessionStore<CookieSession> {
         CookieSessionStore::builder()
             .sealer(test_sealer().await)
@@ -1840,6 +1843,7 @@ mod tests {
             .build()
     }
 
+    #[cfg(feature = "metrics")]
     async fn kid_store() -> CookieSessionStore<CookieSession> {
         CookieSessionStore::builder()
             .sealer(test_sealer_with_kid("v5").await)
@@ -1848,6 +1852,7 @@ mod tests {
             .build()
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_save_records_encrypt() {
         let ((), counters) = with_metrics(async {
@@ -1867,6 +1872,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_save_records_kid_when_cipher_has_identity() {
         let ((), counters) = with_metrics(async {
@@ -1886,6 +1892,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_load_absent_session_is_silent() {
         let ((), counters) = with_metrics(async {
@@ -1899,6 +1906,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_load_bad_base64_records_bad_encoding() {
         let ((), counters) = with_metrics(async {
@@ -1921,6 +1929,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_load_tampered_ciphertext_records_decrypt_failed() {
         let ((), counters) = with_metrics(async {
@@ -1941,6 +1950,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_load_success_records_ok() {
         let ((), counters) = with_metrics(async {
@@ -1963,6 +1973,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn metrics_load_payload_invalid_when_plaintext_is_not_valid_session() {
         let ((), counters) = with_metrics(async {

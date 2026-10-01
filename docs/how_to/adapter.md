@@ -82,7 +82,7 @@ Two contract points, both covered in depth elsewhere:
 
 - **Never drop a non-empty guard.** A dropped re-sealed session cookie after a
   refresh with rotation strands the rotated refresh token and kills the
-  session; the guard logs an error if it happens. The one legitimate
+  session; the guard increments the optional dropped-work counter if it happens. The one legitimate
   non-delivery — the response is already gone — is spelled
   [`discard`](crate::engine::SetCookies::discard).
 - **`Cache-Control: no-store` goes out with the cookies.** The engine marks its own

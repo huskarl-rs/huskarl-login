@@ -3,7 +3,7 @@
 
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 
-use super::{LoginEngine, LoginResponse, error_chain, is_cross_site_request};
+use super::{DiagnosticOperation, LoginEngine, LoginResponse, is_cross_site_request};
 use crate::{
     DriverLoad, LogoutConfig, Session, SessionDriver,
     url::{build_end_session_url, default_post_logout_redirect},
@@ -34,7 +34,7 @@ where
         let location = match HeaderValue::from_str(&redirect_target) {
             Ok(v) => v,
             Err(e) => {
-                log::error!("invalid logout redirect target: {e}");
+                self.diagnose(DiagnosticOperation::LogoutRedirect, &e);
                 return self.build_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "failed to build logout redirect",
@@ -82,7 +82,7 @@ where
             Ok(DriverLoad::Valid(session)) => Some(session),
             Ok(DriverLoad::Absent | DriverLoad::Invalid(_)) => None,
             Err(e) => {
-                log::warn!("failed to load session during logout: {}", error_chain(&e));
+                self.diagnose(DiagnosticOperation::LogoutLoad, &e);
                 None
             }
         }
@@ -117,7 +117,7 @@ where
             Some(post_logout.as_str()),
         )
         .unwrap_or_else(|e| {
-            log::error!("failed to build end_session URL: {e}");
+            self.diagnose(DiagnosticOperation::LogoutUrl, &e);
             post_logout.clone()
         })
     }
@@ -128,7 +128,7 @@ where
         match self.session_store.revoke(session).await {
             Ok(()) => {}
             Err(e) => {
-                log::error!("failed to revoke session on logout: {}", error_chain(&e));
+                self.diagnose(DiagnosticOperation::LogoutRevoke, &e);
             }
         }
     }

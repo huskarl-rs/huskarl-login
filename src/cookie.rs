@@ -404,9 +404,9 @@ impl CookieSealer {
     pub(crate) fn record_encrypt(&self, kid: Option<&str>) {
         crate::metrics::emit_counter(
             "huskarl.session_cookie.encrypt",
-            vec![
-                metrics::Label::new("cookie", self.cookie_name.clone()),
-                metrics::Label::new("kid", kid.map_or_else(|| "none".to_owned(), str::to_owned)),
+            [
+                ("cookie", self.cookie_name.as_str()),
+                ("kid", kid.unwrap_or("none")),
             ],
             self.metrics_name.as_deref(),
         );
@@ -420,9 +420,9 @@ impl CookieSealer {
     pub(crate) fn record_decrypt(&self, result: &DecryptResult) {
         crate::metrics::emit_counter(
             "huskarl.session_cookie.decrypt",
-            vec![
-                metrics::Label::new("cookie", self.cookie_name.clone()),
-                metrics::Label::new("outcome", result.as_str()),
+            [
+                ("cookie", self.cookie_name.as_str()),
+                ("outcome", result.as_str()),
             ],
             self.metrics_name.as_deref(),
         );

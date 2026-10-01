@@ -39,6 +39,9 @@
 //! limitations, not implementation bugs. Use store-backed sessions when you need
 //! server-enforced revocation and protection against stale session updates.
 //!
+//! Telemetry is opt-in through the `metrics` feature. See [`metrics`] for the
+//! catalog, diagnostic handlers, and migration from always-on telemetry.
+//!
 //! # Documentation
 //!
 //! - New to the crate? Follow the [getting-started

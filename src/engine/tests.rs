@@ -2591,15 +2591,18 @@ async fn skew_just_over_limit_clears_session() {
 
 // ── Metrics emission ──────────────────────────────────────────────────────
 
+#[cfg(feature = "metrics")]
 use crate::test_support::{CapturedCounters, counter_value, with_metrics};
 
 /// True if any counter named `name` was emitted, regardless of labels.
+#[cfg(feature = "metrics")]
 fn emitted(counters: &CapturedCounters, name: &str) -> bool {
     counters.iter().any(|(n, _, _)| n == name)
 }
 
 // ── Login start metrics ───────────────────────────────────────────────────
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_login_start_ok_on_nav_redirect() {
     let ((), counters) = with_metrics(async {
@@ -2614,6 +2617,7 @@ fn metrics_login_start_ok_on_nav_redirect() {
     );
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_name_labels_engine_counters() {
     let ((), counters) = with_metrics(async {
@@ -2639,6 +2643,7 @@ fn metrics_name_labels_engine_counters() {
     );
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_no_login_start_on_api_401() {
     // XHR/API 401s don't redirect to the AS — no login start is recorded.
@@ -2651,6 +2656,7 @@ fn metrics_no_login_start_on_api_401() {
     assert!(!emitted(&counters, "huskarl.login.start"));
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_login_start_error_when_grant_start_fails() {
     // PAR-required grant + failing HTTP double: start() must perform HTTP and
@@ -2677,10 +2683,12 @@ fn metrics_login_start_error_when_grant_start_fails() {
 
 /// Counter labels for a login completion with the given outcome and
 /// normalized AS error code.
+#[cfg(feature = "metrics")]
 fn complete_labels<'a>(outcome: &'a str, error: &'a str) -> [(&'a str, &'a str); 2] {
     [("outcome", outcome), ("error", error)]
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_callback_invalid_request_on_missing_params() {
     let ((), counters) = with_metrics(async {
@@ -2699,6 +2707,7 @@ fn metrics_callback_invalid_request_on_missing_params() {
     );
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_callback_as_denied_carries_error_code() {
     let ((), counters) = with_metrics(async {
@@ -2717,6 +2726,7 @@ fn metrics_callback_as_denied_carries_error_code() {
     );
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_callback_as_denied_normalizes_unknown_error_code() {
     // The `error` parameter is attacker-suppliable; anything outside the
@@ -2740,6 +2750,7 @@ fn metrics_callback_as_denied_normalizes_unknown_error_code() {
     );
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_callback_already_authenticated_on_stale_callback_with_session() {
     // A stale callback rescued by an existing session must not be counted as
@@ -2760,6 +2771,7 @@ fn metrics_callback_already_authenticated_on_stale_callback_with_session() {
     );
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_callback_invalid_request_on_missing_state_cookie() {
     let ((), counters) = with_metrics(async {
@@ -2778,6 +2790,7 @@ fn metrics_callback_invalid_request_on_missing_state_cookie() {
     );
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_callback_state_invalid_on_tampered_bundle() {
     let ((), counters) = with_metrics(async {
@@ -2800,6 +2813,7 @@ fn metrics_callback_state_invalid_on_tampered_bundle() {
     );
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_callback_ok_on_successful_login() {
     let ((), counters) = with_metrics(async {
@@ -2828,6 +2842,7 @@ fn metrics_callback_ok_on_successful_login() {
     );
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_callback_token_exchange_failed_when_grant_complete_fails() {
     // The default engine's HTTP double fails every token request — verify
@@ -2854,6 +2869,7 @@ fn metrics_callback_token_exchange_failed_when_grant_complete_fails() {
 
 // ── Refresh metrics ───────────────────────────────────────────────────────
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_refresh_no_refresh_token_when_none_available() {
     let ((), counters) = with_metrics(async {
@@ -2883,6 +2899,7 @@ fn metrics_refresh_no_refresh_token_when_none_available() {
     );
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_refresh_failed_when_grant_refresh_fails() {
     let ((), counters) = with_metrics(async {
@@ -2916,6 +2933,7 @@ fn metrics_refresh_failed_when_grant_refresh_fails() {
 
 // ── Teardown metrics ──────────────────────────────────────────────────────
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_teardown_on_idle_timeout() {
     let ((), counters) = with_metrics(async {
@@ -2934,6 +2952,7 @@ fn metrics_teardown_on_idle_timeout() {
     );
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_invalid_session_teardown_preserves_driver_reason() {
     let expected = [
@@ -2977,6 +2996,7 @@ fn metrics_invalid_session_teardown_preserves_driver_reason() {
     }
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_refresh_failed_retained_on_transient_failure_with_valid_token() {
     let ((), counters) = with_metrics(async {
@@ -3003,9 +3023,26 @@ fn metrics_refresh_failed_retained_on_transient_failure_with_valid_token() {
         ),
         1
     );
+    assert_eq!(
+        counter_value(
+            &counters,
+            "huskarl.session.refresh_retry",
+            &[("outcome", "scheduled")]
+        ),
+        u64::from(super::REFRESH_MAX_ATTEMPTS - 1)
+    );
+    assert_eq!(
+        counter_value(
+            &counters,
+            "huskarl.login.handled_failure",
+            &[("operation", "refresh")]
+        ),
+        1
+    );
     assert!(!emitted(&counters, "huskarl.session.teardown"));
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_refresh_failed_unavailable_on_transient_failure_with_expired_token() {
     // Transient failure past expiry: the session is retained (no teardown
@@ -3034,6 +3071,7 @@ fn metrics_refresh_failed_unavailable_on_transient_failure_with_expired_token() 
     assert!(!emitted(&counters, "huskarl.session.teardown"));
 }
 
+#[cfg(feature = "metrics")]
 #[test]
 fn metrics_refresh_ok_on_successful_refresh() {
     let ((), counters) = with_metrics(async {
@@ -3288,4 +3326,143 @@ async fn engine_mapping_preserves_exact_prefix_callback_and_cookie_paths() {
             redirect.to_string()
         );
     }
+}
+
+#[test]
+fn diagnostics_preserve_consumed_errors_independently_of_metrics() {
+    use super::DiagnosticOperation;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let ((), counters) = crate::test_support::with_metrics(async {
+        let engine = LoginEngine::builder()
+            .config(default_config())
+            .grant(par_failing_grant().await)
+            .session_store(MockSessionStore::empty())
+            .sealer(test_sealer().await)
+            .metrics_name("diagnostics")
+            .diagnostics(move |event| {
+                sink.lock()
+                    .unwrap()
+                    .push((event.operation, event.error.to_string()));
+            })
+            .build()
+            .unwrap();
+        let response = engine
+            .redirect_to_login(&nav_headers(), &"/protected".parse().unwrap())
+            .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    });
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, DiagnosticOperation::Start);
+    assert!(!seen[0].1.is_empty());
+    #[cfg(feature = "metrics")]
+    assert_eq!(
+        crate::test_support::counter_value(
+            &counters,
+            "huskarl.login.handled_failure",
+            &[("name", "diagnostics"), ("operation", "start")]
+        ),
+        1
+    );
+    #[cfg(not(feature = "metrics"))]
+    assert!(counters.is_empty());
+}
+
+#[test]
+fn dropped_work_is_named_and_explicit_disposal_is_silent() {
+    let ((), counters) = crate::test_support::with_metrics(async {
+        let mut engine = engine(MockSessionStore::empty()).await;
+        engine.metrics_name = Some("guard-owner".into());
+        let cookies = || vec![HeaderValue::from_static("session=secret")];
+        drop(engine.set_cookies(cookies()));
+        engine.set_cookies(cookies()).discard();
+        let _ = engine.set_cookies(cookies()).into_headers();
+        drop(engine.set_cookies(Vec::new()));
+        let pending = || {
+            PendingPersist::new((), token_response_fixture(), 0)
+                .with_metrics_name(engine.metrics_name.as_ref())
+        };
+        drop(pending());
+        pending().abandon();
+    });
+    #[cfg(feature = "metrics")]
+    {
+        for operation in ["set_cookies", "persist"] {
+            assert_eq!(
+                crate::test_support::counter_value(
+                    &counters,
+                    "huskarl.session.dropped",
+                    &[("name", "guard-owner"), ("operation", operation)]
+                ),
+                1
+            );
+        }
+        assert_eq!(counters.len(), 2);
+    }
+    #[cfg(not(feature = "metrics"))]
+    assert!(counters.is_empty());
+}
+
+#[cfg(not(feature = "metrics"))]
+#[test]
+fn disabled_metrics_emit_nothing_for_login_and_cookie_operations() {
+    let ((), counters) = crate::test_support::with_metrics(async {
+        let engine = engine(MockSessionStore::empty()).await;
+        let _ = engine
+            .redirect_to_login(&nav_headers(), &"/protected".parse().unwrap())
+            .await;
+        let _ = engine
+            .try_handle_login_route(
+                &Method::GET,
+                &HeaderMap::new(),
+                &"/callback?error=untrusted".parse().unwrap(),
+            )
+            .await;
+        let sealer = crate::cookie::CookieSealer::new(
+            Arc::new(test_sealer().await),
+            "session".parse().unwrap(),
+            "/".parse().unwrap(),
+            Duration::from_secs(60),
+        );
+        sealer.record_encrypt(Some("configured-key"));
+        sealer.record_decrypt(&crate::metrics::DecryptResult::DecryptFailed);
+    });
+    assert!(counters.is_empty());
+}
+
+#[cfg(feature = "metrics")]
+#[test]
+fn metrics_retry_delay_cap_counts_once_without_scheduling() {
+    let ((), counters) = with_metrics(async {
+        let session = refreshable_session(SystemTime::now() - Duration::from_secs(60));
+        let (engine, _) =
+            engine_with_refresh_advice(RetryAdvice::retry_after(Duration::from_secs(60)), session)
+                .await;
+        let _ = engine.load_session(&HeaderMap::new()).await.unwrap();
+    });
+    assert_eq!(
+        counter_value(
+            &counters,
+            "huskarl.session.refresh_retry",
+            &[("outcome", "delay_exceeded")]
+        ),
+        1
+    );
+    assert_eq!(
+        counter_value(
+            &counters,
+            "huskarl.session.refresh_retry",
+            &[("outcome", "scheduled")]
+        ),
+        0
+    );
+    assert_eq!(
+        counter_value(
+            &counters,
+            "huskarl.session.refresh",
+            &[("outcome", "failed_unavailable")]
+        ),
+        1
+    );
 }

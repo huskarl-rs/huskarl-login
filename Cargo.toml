@@ -13,11 +13,13 @@ categories = ["authentication"]
 readme = "README.md"
 
 [package.metadata.docs.rs]
+all-features = true
 # Keep the docs.rs-only nightly cfg private to this crate so it cannot activate
 # similarly named cfgs in dependencies.
 rustdoc-args = ["--cfg", "docsrs_huskarl_login"]
 
 [features]
+metrics = ["dep:metrics", "huskarl/metrics", "huskarl-core/metrics"]
 test-support = []
 
 [lints.rust]
@@ -32,8 +34,7 @@ http = { version = "1", default-features = false }
 huskarl = { version = "0.11", default-features = false }
 # The URL mapping API re-exported by huskarl requires core 0.10.3.
 huskarl-core = { version = "0.10.3", default-features = false }
-log = "0.4"
-metrics = { version = "0.24", default-features = false }
+metrics = { version = "0.24", default-features = false, optional = true }
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_html_form = "0.4"
@@ -46,6 +47,7 @@ uuid = { version = "1", features = ["v7", "serde"] }
 uuid = { version = "1", features = ["v7", "serde", "js"] }
 
 [dev-dependencies]
+metrics = { version = "0.24", default-features = false }
 huskarl-reqwest = { version = "0.9", features = ["rustls-tls"] }
 hex = "0.4"
 huskarl-crypto-native = { version = "0.11" }

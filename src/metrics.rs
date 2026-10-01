@@ -1,4 +1,5 @@
-//! Metrics emitted by this crate through the [`metrics`] facade. Install a
+//! Metrics emitted by this crate through the optional `metrics` facade. Enable the
+//! off-by-default `metrics` feature and install a
 //! recorder (e.g. `metrics-exporter-prometheus`) to collect them; without one
 //! they are no-ops. All are counters, incremented inline on the request path.
 //!
@@ -13,26 +14,119 @@
 //! | `huskarl.session_cookie.encrypt` | `cookie`: cookie name; `kid`: active key id, `none` if the key has no identity |
 //! | `huskarl.session_cookie.decrypt` | `cookie`: cookie name; `outcome`: `ok`, `bad_encoding`, `decrypt_failed`, `payload_invalid` |
 //!
+//! Every counter has a `name` label (the empty string when unnamed).
 //! When `metrics_name` is set on the [`LoginEngine`] builder, every counter
-//! additionally carries a `name` label with that value — it tells engine
+//! carries a `name` label with that value — it tells engine
 //! instances apart when one process runs several (the same label
 //! `huskarl.aead.*` uses for cipher instances).
+//!
+//! # Installation and ownership
+//!
+//! `metrics` propagates to `huskarl/metrics` and `huskarl-core/metrics`.
+//! This engine and its built-in session drivers emit automatically. Supplied
+//! HTTP clients and cryptography implementations still need their explicit
+//! lower-level metrics decorators. Independently constructed grants keep their
+//! own metrics identity; engine naming does not rename shared dependencies.
+//! No recorder is installed by this library. Disabled builds allocate no metric
+//! labels and make no recorder calls. No library logs are emitted.
+//!
+//! # Observation boundaries
+//!
+//! All instruments are counters with unit occurrences, incremented by one.
+//! Each row below describes its population and observation point. Outcome
+//! values in the schema above are closed; new classifications require a
+//! documented schema change rather than copying arbitrary error text.
+//!
+//! | Counter suffix | Owner and observation |
+//! | --- | --- |
+//! | `login.start` | Engine, after an attempted authorization redirect finishes; API 401 and cross-site rejection bypass it. `ok` means a response was prepared. |
+//! | `login.complete` | Engine, once a callback reaches a classified terminal result, including malformed callbacks and already-authenticated fallback. `ok` means the driver created a session and prepared cookies. |
+//! | `session.refresh` | Engine, once per logical refresh, including missing refresh tokens. Internal retries do not recount it. `ok` records exchange success before persistence, which can still fail or be deferred. |
+//! | `session.teardown` | Engine load/refresh policy decision to clear a presented session, not successful backend revocation. Explicit logout and termination do not enter this denominator. |
+//! | `session.superseded_delete` | Store driver, after a valid old pointer enters replacement cleanup. Missing or invalid pointers bypass it. |
+//! | `session.liveness_failure` | Store driver, each failed read/touch/clear, including initial touch and cleanup. It is a failure count, not an operation denominator. |
+//! | `session_cookie.encrypt` | Cookie sealer, after sealing a session payload or store pointer successfully (oversized cookie payloads are excluded). Later expiry/header checks can still fail. One seal, independent of cookie chunk count; excludes login-state cookies. |
+//! | `session_cookie.decrypt` | Cookie sealer, each classified decoding attempt. Absent cookies bypass it. No client-provided key identifier enters labels. |
+//!
+//! Additional counters replace previously log-only operational information:
+//!
+//! | Counter | Labels and observation |
+//! | --- | --- |
+//! | `huskarl.login.handled_failure` | `operation`: snake-case [`DiagnosticOperation`](crate::engine::DiagnosticOperation) variant. Each error consumed by the engine at that operation, including logout failures and eager-persist fallback. No successful-operation denominator. |
+//! | `huskarl.session.refresh_retry` | `outcome`: `scheduled` before retry sleep, or `delay_exceeded` when the requested delay exceeds the in-request budget. Attempts exhausted or conclusively rejected do not enter this counter. |
+//! | `huskarl.session.dropped` | `operation`: `set_cookies` or `persist`. One armed guard dropped outside panic unwinding, irrespective of cookie count. Explicit `discard`/`abandon` disarms it. Engine-produced guards retain their engine name; fabricated `PendingPersist::new` guards are unnamed. |
+//!
+//! These counters have distinct populations: one request can increment several.
+//! Framework adapters own their separate load/persist/revoke and response-write
+//! metrics. They must not re-emit these engine counters. Cancellation before a
+//! classified result emits no terminal result; earlier observations remain and
+//! armed guards can count a drop. No counter proves browser receipt, cookie
+//! acceptance, durable audit delivery, or successful upstream response delivery.
+//!
+//! # Cardinality
+//!
+//! `name` and `cookie` come from bounded local configuration. Names must not be
+//! derived from subjects, sessions, URLs, or request values. The encrypt-side
+//! `kid` comes from the configured encryptor, which must use a bounded rotation
+//! policy over the recorder's retention window. A new key per request is not
+//! safe. Cookie names are the configured base names, not chunk or state suffixes.
+//! Unknown authorization-server error codes map to `other`. No arbitrary label
+//! bag, raw error, subject, token, or decrypt-side `kid` is exposed.
+//!
+//! # Diagnostics and migration from 0.4.0
+//!
+//! Enable `features = ["metrics"]` to retain counters. Unnamed series now carry
+//! `name=""`; update dashboards for that label-schema change. Names, labels,
+//! and counting semantics are documented interfaces; changes require migration
+//! notes. Existing outcome spellings are retained.
+//!
+//! Use `LoginEngine::builder().diagnostics(...)` to receive original consumed
+//! engine errors, independently of the metrics feature. The synchronous handler
+//! may run concurrently, must not block or panic, and propagates panics. Redact
+//! sensitive/untrusted error sources before export; queueing, overflow, and
+//! delivery guarantees belong to the application. It is not a session security
+//! event or transactional audit API. Returned errors remain available to callers.
+//!
+//! To inspect best-effort liveness or superseded-record failure sources, decorate
+//! the supplied [`LivenessStore`](crate::LivenessStore) or
+//! [`ExternalSessionStore`](crate::ExternalSessionStore). Their existing bounded
+//! counters remain. Without such a decorator, individual backend failure text is
+//! deliberately no longer retained. Drop guards retain counts, not per-request
+//! details. Retry timing is defined by the retry policy; no formatted per-attempt
+//! errors or timings are retained by this crate.
+//!
+//! Axum and Pingora should forward their optional metrics feature using
+//! `huskarl-login?/metrics` once they depend on a release containing this feature.
+//! Their existing adapter diagnostics remain separate from engine diagnostics.
+//! Yanking 0.4.0 cannot replace its contents: these changes require a new version,
+//! with the release number and any yank decided separately.
 //!
 //! [`TeardownReason`]: crate::engine::TeardownReason
 //! [`InvalidSessionReason`]: crate::InvalidSessionReason
 //! [`LoginEngine`]: crate::engine::LoginEngine
 
-/// Increments counter `name` with `labels`, appending the instance `name`
-/// label when `metrics_name` is set.
-pub(crate) fn emit_counter(
+/// Closed call-site labels only. Disabled builds perform no label allocation
+/// or recorder calls. Borrowed values are copied only with metrics enabled.
+#[inline]
+pub(crate) fn emit_counter<const N: usize>(
     name: &'static str,
-    mut labels: Vec<metrics::Label>,
+    labels: [(&'static str, &str); N],
     metrics_name: Option<&str>,
 ) {
-    if let Some(v) = metrics_name {
-        labels.push(metrics::Label::new("name", v.to_owned()));
+    #[cfg(feature = "metrics")]
+    {
+        let labels = labels
+            .into_iter()
+            .map(|(key, value)| metrics::Label::new(key, value.to_owned()))
+            .chain(std::iter::once(metrics::Label::new(
+                "name",
+                metrics_name.unwrap_or_default().to_owned(),
+            )))
+            .collect::<Vec<_>>();
+        metrics::counter!(name, labels).increment(1);
     }
-    metrics::counter!(name, labels).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = (name, labels, metrics_name);
 }
 
 /// Outcome of a session cookie decryption attempt; the

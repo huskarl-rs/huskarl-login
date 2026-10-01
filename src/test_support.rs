@@ -164,7 +164,8 @@ pub(crate) fn with_metrics<T>(fut: impl Future<Output = T>) -> (T, CapturedCount
 }
 
 /// The value of the counter matching `name` and exactly `labels` (order
-/// insensitive), or 0 if never emitted.
+/// insensitive), adding `name=""` when omitted, or 0 if never emitted.
+#[cfg(feature = "metrics")]
 pub(crate) fn counter_value(
     counters: &CapturedCounters,
     name: &str,
@@ -174,6 +175,9 @@ pub(crate) fn counter_value(
         .iter()
         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
         .collect();
+    if !expected.iter().any(|(key, _)| key == "name") {
+        expected.push(("name".to_owned(), String::new()));
+    }
     expected.sort();
     counters
         .iter()
