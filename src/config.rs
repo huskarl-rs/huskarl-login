@@ -476,6 +476,8 @@ pub struct LoginConfig {
     /// liveness store. Defaults to [`ActivityPolicy::FirstParty`].
     pub activity_policy: ActivityPolicy,
     /// How early to refresh before token expiry. Defaults to 30 seconds.
+    /// Without a refresh token, the access token remains usable until expiry,
+    /// subject to the session's lifetime and idle-timeout checks.
     pub token_refresh_margin: Duration,
     /// Lifetime assumed when the token response omits `expires_in`. Defaults
     /// to 1 hour.

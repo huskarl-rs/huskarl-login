@@ -1485,6 +1485,25 @@ async fn activity_policy_navigations_only_excludes_same_origin_fetch() {
 }
 
 #[tokio::test]
+async fn valid_token_within_refresh_margin_without_refresh_token_stays_active() {
+    // A short-lived token starts inside the default 30-second refresh margin.
+    let now = SystemTime::now();
+    let expiry = now + Duration::from_secs(20);
+    let session = session_with(expiry, None, now);
+    let (e, calls) = engine_with_failing_refresh(false, session).await;
+
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    let (session, set_cookies) = expect_active(loaded);
+
+    assert_eq!(session.token_expiry(), expiry);
+    assert!(session.refresh_token().is_none());
+    assert!(set_cookies.is_empty());
+    assert!(!e.session_store.revoke_called());
+    assert!(!e.session_store.save_called());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn token_expired_no_refresh_token_clears_session() {
     let session = session_with(
         SystemTime::now() - Duration::from_mins(1),

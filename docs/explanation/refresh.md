@@ -2,8 +2,11 @@
 
 [`load_session`](crate::engine::LoginEngine::load_session) refreshes the access
 token when it is at or near expiry (within
-[`token_refresh_margin`](crate::LoginConfig)). Two aspects of how it does this
-have consequences for how you deploy the crate.
+[`token_refresh_margin`](crate::LoginConfig)). Without a refresh token, the
+session remains active until access-token expiry, subject to its absolute
+lifetime and idle-timeout checks. Entering the refresh margin alone does not
+end it. Once the access token expires, a session without a refresh token is
+cleared. Two aspects of refresh have consequences for how you deploy the crate.
 
 ## Eager persistence after refresh
 

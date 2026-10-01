@@ -69,7 +69,7 @@ use crate::{
 /// Every insert and compare-and-swap receives an absolute `deadline` from
 /// the driver. It is the sooner of the effective absolute session cap and the
 /// activity horizon `max(now, token_expiry) + idle_timeout`; the driver also keeps
-/// that idle horizon in lockstep with the [`LivenessConfig`](crate::LivenessConfig)
+/// that idle horizon in lockstep with the [`LivenessConfig`]
 /// attached through
 /// [`with_liveness`](crate::StoreBackedSessionStore::with_liveness). Apply the
 /// supplied deadline as the record's absolute TTL on **every** successful write,

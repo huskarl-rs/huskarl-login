@@ -1061,8 +1061,8 @@ where
     /// is still valid retains the session and keeps serving; a transient
     /// failure after token expiry retains the session but yields
     /// [`LoadedSession::RefreshUnavailable`] (fail the request, not the
-    /// session); only a conclusive rejection — or a session with no refresh
-    /// token — tears the session down and emits cookie clears.
+    /// session); only a conclusive rejection — or an expired access token with
+    /// no refresh token — tears the session down and emits cookie clears.
     async fn refresh_or_clear(
         &self,
         mut session: SD::SessionType,
@@ -1070,6 +1070,14 @@ where
     ) -> LoadedSession<SD::SessionType> {
         let expected_refresh_revision = session.state().refresh_revision;
         let Some(rt) = session.refresh_token().cloned() else {
+            // The refresh margin schedules proactive refresh; it does not
+            // shorten the lifetime of a token that cannot be refreshed.
+            if SystemTime::now() < session.token_expiry() {
+                return LoadedSession::Active {
+                    session,
+                    set_cookies: SetCookies::default(),
+                };
+            }
             let clears = self.terminate_best_effort(&session, headers).await;
             self.record_refresh(&RefreshResult::NoRefreshToken);
             let reason = TeardownReason::NoRefreshToken;
