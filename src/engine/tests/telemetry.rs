@@ -555,8 +555,131 @@ fn diagnostics_preserve_consumed_errors_independently_of_metrics() {
     assert!(counters.is_empty());
 }
 
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn diagnostics_allow_downcasting_consumed_session_errors(#[case] automatic_teardown: bool) {
+    use super::super::DiagnosticOperation;
+    let operation = if automatic_teardown {
+        DiagnosticOperation::Revoke
+    } else {
+        DiagnosticOperation::LogoutRevoke
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let ((), counters) = crate::test_support::with_metrics(async {
+        let engine = LoginEngine::builder()
+            .config(config_with_logout())
+            .grant(test_grant(FailingHttp::new(false).0).await)
+            .session_store(
+                MockSessionStore::with_session_failing_revoke(valid_session()).with_verdict(
+                    if automatic_teardown {
+                        LivenessVerdict::Expired
+                    } else {
+                        LivenessVerdict::Untracked
+                    },
+                ),
+            )
+            .sealer(test_sealer().await)
+            .diagnostics(move |event| {
+                let error = event.error.downcast_ref::<SessionError>().unwrap();
+                assert!(event.error.source().unwrap().is::<StoreRevocationError>());
+                sink.lock().unwrap().push((event.operation, error.kind()));
+            })
+            .build()
+            .unwrap();
+        if automatic_teardown {
+            let loaded = engine.load_session(&HeaderMap::new()).await.unwrap();
+            let (reason, clears) = expect_cleared(loaded);
+            assert_eq!(reason, TeardownReason::IdleTimeout);
+            assert_eq!(
+                clears,
+                vec![HeaderValue::from_static("mock-session=; Max-Age=0")]
+            );
+        } else {
+            let response = engine
+                .try_handle_login_route(
+                    &Method::POST,
+                    &logout_headers(),
+                    &"/logout".parse().unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert!(response.headers().iter().any(|(name, value)| {
+                *name == http::header::SET_COOKIE && value == "mock-session=; Max-Age=0"
+            }));
+        }
+        assert!(engine.session_store.revoke_called());
+    });
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(operation, SessionErrorKind::Unavailable)]
+    );
+    #[cfg(feature = "metrics")]
+    assert_eq!(
+        crate::test_support::counter_value(
+            &counters,
+            "huskarl.login.handled_failure",
+            &[("operation", operation.as_ref())]
+        ),
+        1
+    );
+    #[cfg(not(feature = "metrics"))]
+    assert!(counters.is_empty());
+}
+
 #[test]
-fn diagnostics_allow_downcasting_consumed_session_errors() {
+fn diagnostics_report_eager_persist_failure_once_before_deferred_recovery() {
+    use super::super::DiagnosticOperation;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let ((), counters) = crate::test_support::with_metrics(async {
+        let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+        let mut engine = LoginEngine::builder()
+            .config(default_config())
+            .grant(test_grant(TokenHttp).await)
+            .session_store(MockSessionStore::with_session_failing_save(session))
+            .sealer(test_sealer().await)
+            .diagnostics(move |event| {
+                let error = event.error.downcast_ref::<SessionError>().unwrap();
+                assert!(event.error.source().unwrap().is::<StoreSaveError>());
+                sink.lock().unwrap().push((event.operation, error.kind()));
+            })
+            .build()
+            .unwrap();
+        let loaded = engine.load_session(&HeaderMap::new()).await.unwrap();
+        let pending = expect_pending(loaded);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        engine.session_store.fail_save = false;
+        let cookies = pending.commit(&engine, &HeaderMap::new()).await.unwrap();
+        assert_eq!(
+            cookies.into_headers(),
+            vec![HeaderValue::from_static(MOCK_SAVE_COOKIE)]
+        );
+    });
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(
+            DiagnosticOperation::EagerPersist,
+            SessionErrorKind::Unavailable
+        )]
+    );
+    #[cfg(feature = "metrics")]
+    assert_eq!(
+        counter_value(
+            &counters,
+            "huskarl.login.handled_failure",
+            &[("operation", "eager_persist")]
+        ),
+        1
+    );
+    #[cfg(not(feature = "metrics"))]
+    assert!(counters.is_empty());
+}
+
+#[test]
+fn diagnostics_preserve_original_logout_load_error() {
     use super::super::DiagnosticOperation;
     let seen = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();
@@ -564,14 +687,11 @@ fn diagnostics_allow_downcasting_consumed_session_errors() {
         let engine = LoginEngine::builder()
             .config(config_with_logout())
             .grant(test_grant(FailingHttp::new(false).0).await)
-            .session_store(MockSessionStore::with_session_failing_revoke(
-                valid_session(),
-            ))
+            .session_store(ErrorSessionStore)
             .sealer(test_sealer().await)
             .diagnostics(move |event| {
-                let error = event.error.downcast_ref::<SessionError>().unwrap();
-                assert!(event.error.source().unwrap().is::<StoreRevocationError>());
-                sink.lock().unwrap().push((event.operation, error.kind()));
+                assert!(event.error.is::<StoreLoadError>());
+                sink.lock().unwrap().push(event.operation);
             })
             .build()
             .unwrap();
@@ -584,20 +704,17 @@ fn diagnostics_allow_downcasting_consumed_session_errors() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(response.headers().iter().any(|(name, value)| {
+            *name == http::header::SET_COOKIE && value == "mock-session=; Max-Age=0"
+        }));
     });
-    assert_eq!(
-        *seen.lock().unwrap(),
-        vec![(
-            DiagnosticOperation::LogoutRevoke,
-            SessionErrorKind::Unavailable
-        )]
-    );
+    assert_eq!(*seen.lock().unwrap(), vec![DiagnosticOperation::LogoutLoad]);
     #[cfg(feature = "metrics")]
     assert_eq!(
-        crate::test_support::counter_value(
+        counter_value(
             &counters,
             "huskarl.login.handled_failure",
-            &[("operation", "logout_revoke")]
+            &[("operation", "logout_load")]
         ),
         1
     );
