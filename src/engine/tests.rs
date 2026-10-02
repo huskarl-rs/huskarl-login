@@ -3370,6 +3370,56 @@ fn diagnostics_preserve_consumed_errors_independently_of_metrics() {
 }
 
 #[test]
+fn diagnostics_allow_downcasting_consumed_session_errors() {
+    use super::DiagnosticOperation;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let ((), counters) = crate::test_support::with_metrics(async {
+        let engine = LoginEngine::builder()
+            .config(config_with_logout())
+            .grant(test_grant(FailingHttp::new(false).0).await)
+            .session_store(MockSessionStore::with_session_failing_revoke(
+                valid_session(),
+            ))
+            .sealer(test_sealer().await)
+            .diagnostics(move |event| {
+                let error = event.error.downcast_ref::<SessionError>().unwrap();
+                assert!(event.error.source().unwrap().is::<StoreRevocationError>());
+                sink.lock().unwrap().push((event.operation, error.kind()));
+            })
+            .build()
+            .unwrap();
+        let response = engine
+            .try_handle_login_route(
+                &Method::POST,
+                &logout_headers(),
+                &"/logout".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    });
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(
+            DiagnosticOperation::LogoutRevoke,
+            SessionErrorKind::Unavailable
+        )]
+    );
+    #[cfg(feature = "metrics")]
+    assert_eq!(
+        crate::test_support::counter_value(
+            &counters,
+            "huskarl.login.handled_failure",
+            &[("operation", "logout_revoke")]
+        ),
+        1
+    );
+    #[cfg(not(feature = "metrics"))]
+    assert!(counters.is_empty());
+}
+
+#[test]
 fn dropped_work_is_named_and_explicit_disposal_is_silent() {
     let ((), counters) = crate::test_support::with_metrics(async {
         let mut engine = engine(MockSessionStore::empty()).await;

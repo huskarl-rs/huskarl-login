@@ -78,7 +78,8 @@ pub struct LoginDiagnostic<'a> {
     /// Operation that failed.
     pub operation: DiagnosticOperation,
     /// Original error and source chain; potentially sensitive or untrusted.
-    pub error: &'a dyn std::error::Error,
+    /// Downcast to the concrete error type to inspect its domain classification.
+    pub error: &'a (dyn std::error::Error + 'static),
 }
 
 type DiagnosticHandler = Arc<dyn Fn(LoginDiagnostic<'_>) + Send + Sync>;
@@ -1335,7 +1336,7 @@ where
         }
     }
 
-    fn diagnose(&self, operation: DiagnosticOperation, error: &dyn std::error::Error) {
+    fn diagnose(&self, operation: DiagnosticOperation, error: &(dyn std::error::Error + 'static)) {
         crate::metrics::emit_counter(
             "huskarl.login.handled_failure",
             [("operation", operation.as_ref())],
