@@ -9,7 +9,7 @@ response handling; consult your adapter's docs for those hooks.
 Enable the crate's `metrics` feature in the dependency used by your integration:
 
 ```toml
-huskarl-login = { version = "0.4", features = ["metrics"] }
+huskarl-login = { version = "0.5", features = ["metrics"] }
 ```
 
 Install a recorder through your application's chosen `metrics` exporter during

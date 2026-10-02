@@ -35,7 +35,7 @@ Add these dependencies to the generated `Cargo.toml`:
 
 ```toml
 [dependencies]
-huskarl-login = "0.4"
+huskarl-login = "0.5"
 huskarl-crypto-native = "0.11"
 huskarl-reqwest = { version = "0.9", features = ["rustls-tls"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

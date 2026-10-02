@@ -1,6 +1,6 @@
 [package]
 name = "huskarl-login"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.92"
 description = "OAuth2/OIDC login flow helpers for huskarl."
@@ -39,7 +39,7 @@ serde = { version = "1", features = ["derive"] }
 serde_html_form = "0.4"
 serde_json = { version = "1", default-features = false }
 snafu = { version = "0.9", default-features = false, features = ["rust_1_81", "std"] }
-strum = { version = "0.27", default-features = false, features = ["derive"] }
+strum = { version = "0.28", default-features = false, features = ["derive"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
@@ -52,6 +52,6 @@ hex = "0.4"
 huskarl-crypto-native = { version = "0.11" }
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 rand = "0.10"
-rstest = "0.26"
+rstest = "0.27"
 tokio = { version = "1", features = ["full"] }
 url = "2"
