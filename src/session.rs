@@ -283,9 +283,8 @@ impl std::error::Error for SessionError {
     }
 }
 
-/// Sealed trait marker module.
-#[doc(hidden)]
-pub mod sealed {
+// Accessible to built-in drivers and crate tests, but not downstream crates.
+pub(crate) mod sealed {
     pub trait Sealed {}
 }
 
@@ -297,6 +296,13 @@ pub mod sealed {
 /// [`ExternalSessionStore`](crate::ExternalSessionStore) for server-held
 /// sessions. Framework adapters normally use [`LoginEngine`](crate::engine::LoginEngine)
 /// rather than calling driver methods directly.
+///
+/// External implementations cannot opt into the private sealing trait:
+///
+/// ```compile_fail,E0603
+/// struct CustomDriver;
+/// impl huskarl_login::session::sealed::Sealed for CustomDriver {}
+/// ```
 pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// The session type stored and retrieved by this driver.
     ///
