@@ -541,7 +541,7 @@ fn diagnostics_preserve_consumed_errors_independently_of_metrics() {
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].0, DiagnosticOperation::Start);
-    assert!(!seen[0].1.is_empty());
+    assert_ne!(seen[0].1, "");
     #[cfg(feature = "metrics")]
     assert_eq!(
         crate::test_support::counter_value(
