@@ -475,7 +475,11 @@ pub struct LoginConfig {
     /// Which requests count as user activity. Only affects sessions with a
     /// liveness store. Defaults to [`ActivityPolicy::FirstParty`].
     pub activity_policy: ActivityPolicy,
-    /// How early to refresh before token expiry. Defaults to 30 seconds.
+    /// Maximum proactive refresh margin before token expiry. Defaults to 30
+    /// seconds. Each load independently samples a threshold between 75% and
+    /// 100% of this margin (22.5–30 seconds by default), reducing synchronized
+    /// refresh attempts. Expired tokens are always due; zero disables proactive
+    /// refresh. No delay is added to requests.
     /// Without a refresh token, the access token remains usable until expiry,
     /// subject to the session's lifetime and idle-timeout checks.
     pub token_refresh_margin: Duration,
@@ -604,7 +608,9 @@ impl LoginConfig {
         /// [`ActivityPolicy::FirstParty`].
         #[builder(default)]
         activity_policy: ActivityPolicy,
-        /// How early to refresh before token expiry. Defaults to 30 seconds.
+        /// Maximum proactive refresh margin before token expiry. Defaults to
+        /// 30 seconds. Each load uses 75–100% of this margin, independently
+        /// jittered. Zero disables proactive refresh; expired tokens remain due.
         #[builder(default = Duration::from_secs(30))]
         token_refresh_margin: Duration,
         /// Lifetime assumed when the token response omits `expires_in`.

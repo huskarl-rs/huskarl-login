@@ -1077,13 +1077,12 @@ where
             return Ok(LoadedSession::Cleared { reason, clears });
         }
 
-        let refresh_due = session
-            .token_expiry()
-            .duration_since(now)
-            .map_or(true, |remaining| {
-                remaining <= self.config.token_refresh_margin
-            });
-        if refresh_due {
+        if refresh_due(
+            session.token_expiry(),
+            now,
+            self.config.token_refresh_margin,
+            &mut rand::rng(),
+        ) {
             return Ok(self.refresh_or_clear(session, headers).await);
         }
 
@@ -1488,6 +1487,29 @@ const REFRESH_RETRY_JITTER_MAX: Duration = Duration::from_millis(50);
 /// `Retry-After` of a minute must not become a minute of latency.
 const REFRESH_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
+/// Randomize the proactive refresh threshold independently on each load.
+/// Keep at least three quarters of the configured headroom, without sleeping
+/// or postponing an expired token. A session-wide offset would merely move
+/// the point at which concurrent requests all decide to refresh.
+fn refresh_due(
+    expiry: SystemTime,
+    now: SystemTime,
+    margin: Duration,
+    rng: &mut impl rand::Rng,
+) -> bool {
+    let Ok(remaining) = expiry.duration_since(now) else {
+        return true;
+    };
+    let jitter_window = margin / 4;
+    if remaining <= margin.saturating_sub(jitter_window) {
+        return true;
+    }
+    if remaining > margin {
+        return false;
+    }
+    remaining <= margin.saturating_sub(rng.random_range(Duration::ZERO..=jitter_window))
+}
+
 /// Wait before retry `attempt` (1-indexed): `base * 2^(attempt-1) + jitter`,
 /// jitter uniform in `[0, REFRESH_RETRY_JITTER_MAX)`.
 fn refresh_retry_delay(attempt: u32) -> Duration {
@@ -1668,6 +1690,57 @@ mod retry_delay_tests {
         assert!(
             samples.len() > 5,
             "expected jitter to vary, got {samples:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod refresh_threshold_tests {
+    use rand::{SeedableRng, rngs::StdRng};
+    use rstest::rstest;
+
+    use super::{Duration, SystemTime, refresh_due};
+
+    #[rstest]
+    #[case::expired(Duration::from_secs(30), -1, true)]
+    #[case::at_expiry(Duration::from_secs(30), 0, true)]
+    #[case::guaranteed_refresh(Duration::from_secs(30), 22_500_000_000, true)]
+    #[case::outside_margin(Duration::from_secs(30), 30_000_000_001, false)]
+    #[case::zero_margin_before_expiry(Duration::ZERO, 1, false)]
+    #[case::zero_margin_at_expiry(Duration::ZERO, 0, true)]
+    #[case::zero_margin_expired(Duration::ZERO, -1, true)]
+    #[case::subnanosecond_window(Duration::from_nanos(3), 3, true)]
+    #[case::tiny_margin_outside(Duration::from_nanos(3), 4, false)]
+    #[case::maximum_margin(Duration::MAX, 1, true)]
+    fn threshold_boundaries(
+        #[case] margin: Duration,
+        #[case] remaining_nanos: i64,
+        #[case] expected: bool,
+    ) {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let remaining = Duration::from_nanos(remaining_nanos.unsigned_abs());
+        let expiry = if remaining_nanos < 0 {
+            now - remaining
+        } else {
+            now + remaining
+        };
+        let mut rng = StdRng::seed_from_u64(42);
+        for _ in 0..100 {
+            assert_eq!(refresh_due(expiry, now, margin, &mut rng), expected);
+        }
+    }
+
+    #[test]
+    fn requests_in_jitter_window_make_different_decisions() {
+        let now = SystemTime::UNIX_EPOCH;
+        let expiry = now + Duration::from_secs(26);
+        let mut rng = StdRng::seed_from_u64(42);
+        let due = (0..100)
+            .filter(|_| refresh_due(expiry, now, Duration::from_secs(30), &mut rng))
+            .count();
+        assert!(
+            due > 0 && due < 100,
+            "requests must not share a fixed threshold"
         );
     }
 }

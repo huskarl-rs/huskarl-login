@@ -81,7 +81,9 @@ those writers too. See
 
 Repeat the staging checks with your intended
 [`token_refresh_margin`](crate::LoginConfig) and provider configuration.
-The margin changes when refresh begins; it does not fix concurrency races.
+Each load independently jitters its threshold within 75–100% of the margin.
+This can reduce simultaneous exchanges, but does not prevent concurrency races
+or recover a lost refresh response.
 
 During rollout, monitor refresh rejections, persistence failures, dropped-cookie
 guard errors, and unexpected repeat logins. If these increase, stop expanding

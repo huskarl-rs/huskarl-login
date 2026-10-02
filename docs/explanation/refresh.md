@@ -1,8 +1,12 @@
 # Token refresh and refresh-token rotation
 
 [`load_session`](crate::engine::LoginEngine::load_session) refreshes the access
-token when it is at or near expiry (within
-[`token_refresh_margin`](crate::LoginConfig)). Without a refresh token, the
+token when it is at or near expiry. On each load, the proactive threshold is
+independently sampled between 75% and 100% of
+[`token_refresh_margin`](crate::LoginConfig): 22.5–30 seconds before expiry
+with the default margin. This spreads refresh decisions without sleeping in
+the request path. Expired tokens are always due; a zero margin disables
+proactive refresh. Without a refresh token, the
 session remains active until access-token expiry, subject to its absolute
 lifetime and idle-timeout checks. Entering the refresh margin alone does not
 end it. Once the access token expires, a session without a refresh token is
@@ -90,6 +94,12 @@ the browser is waiting on, so a longer delay ends the attempts and leaves the
 outcome to the retained-session paths above.
 
 ## Concurrent refresh
+
+Initial-threshold jitter can reduce collisions when requests enter the refresh
+window, giving a completed refresh time to become visible to later requests.
+It does not coordinate exchanges: requests inside the final 75% of the margin
+all consider refresh due, including bursts after an idle period. It also cannot
+recover a rotated refresh token whose response was lost.
 
 Two in-flight requests or replicas can exchange the same refresh token
 independently. The engine calls `RefreshGrant::exchange` directly; the
