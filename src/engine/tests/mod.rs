@@ -1,7 +1,6 @@
 //! Shared fixtures for the engine unit tests.
 
 use std::{
-    convert::Infallible,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
@@ -393,7 +392,6 @@ impl Sealed for MockSessionStore {}
 #[allow(clippy::unused_async_trait_impl)]
 impl SessionDriver for MockSessionStore {
     type SessionType = MockSession;
-    type LoadError = Infallible;
 
     fn apply_session_policy(
         &mut self,
@@ -431,7 +429,7 @@ impl SessionDriver for MockSessionStore {
             vec![],
         ))
     }
-    async fn load(&self, _: &HeaderMap) -> Result<crate::DriverLoad<MockSession>, Infallible> {
+    async fn load(&self, _: &HeaderMap) -> Result<crate::DriverLoad<MockSession>, SessionError> {
         if let Some(reason) = self.invalid_load {
             return Ok(crate::DriverLoad::Invalid(reason));
         }
@@ -519,7 +517,6 @@ impl Sealed for ErrorSessionStore {}
 #[allow(clippy::unused_async_trait_impl)]
 impl SessionDriver for ErrorSessionStore {
     type SessionType = MockSession;
-    type LoadError = StoreLoadError;
 
     fn apply_session_policy(
         &mut self,
@@ -546,8 +543,11 @@ impl SessionDriver for ErrorSessionStore {
     ) -> Result<(MockSession, Vec<HeaderValue>), SessionError> {
         unimplemented!()
     }
-    async fn load(&self, _: &HeaderMap) -> Result<crate::DriverLoad<MockSession>, StoreLoadError> {
-        Err(StoreLoadError)
+    async fn load(&self, _: &HeaderMap) -> Result<crate::DriverLoad<MockSession>, SessionError> {
+        Err(SessionError::new(
+            SessionErrorKind::Unavailable,
+            StoreLoadError,
+        ))
     }
     async fn save(&self, _: &MockSession, _: &HeaderMap) -> Result<Vec<HeaderValue>, SessionError> {
         unimplemented!()

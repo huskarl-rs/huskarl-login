@@ -27,7 +27,7 @@ use crate::{
     metrics::{DecryptResult, LivenessFailure, SupersededDeleteResult},
     session::{
         DriverLoad, InvalidSessionReason, SessionDriver, SessionError, SessionErrorKind,
-        SessionPolicy, to_session_err,
+        SessionPolicy,
     },
     session_state::{Session, SessionState, bounded_time_add, storage_deadline},
 };
@@ -40,9 +40,19 @@ use crate::{
 /// handled by the [`SessionEnricher`] attached to the driver.
 ///
 /// A missing record and a version conflict are normal outcomes, represented
-/// by [`LoadOutcome`] and [`SaveOutcome`]. Reserve [`Self::Error`] for backend
+/// by [`LoadOutcome`] and [`SaveOutcome`]. Reserve [`SessionError`] for backend
 /// failures. Every successful write must change [`Self::Version`] and apply
 /// the supplied `deadline` as the record's absolute retention deadline.
+///
+/// ## Errors
+///
+/// Return [`SessionError`] with a classification appropriate to the specific
+/// failure. Use [`SessionErrorKind::Unavailable`] for transient connection or
+/// service failures, and [`SessionErrorKind::Store`] for corrupt stored data,
+/// schema mismatches, or permanent backend failures. Do not classify every
+/// database error as unavailable. Preserve the backend cause with
+/// [`SessionError::new`]; the driver and engine propagate the error unchanged.
+/// Missing records and version conflicts remain ordinary outcomes, not errors.
 ///
 /// ## Versioning contract
 ///
@@ -111,11 +121,6 @@ pub trait ExternalSessionStore: MaybeSendSync {
     /// choosing a representation.
     type Version: MaybeSendSync + 'static;
 
-    /// The backend's own error type (e.g. `sqlx::Error`); transport-failure
-    /// channel only. Boxed into
-    /// [`SessionErrorKind::Unavailable`].
-    type Error: std::error::Error + MaybeSendSync + 'static;
-
     /// Persist a newly created session. Called once per login, after
     /// enrichment. Apply `deadline` as the record's absolute TTL; the retention
     /// contract on [`compare_and_swap`](Self::compare_and_swap) applies.
@@ -123,14 +128,14 @@ pub trait ExternalSessionStore: MaybeSendSync {
         &self,
         session: &Self::SessionType,
         deadline: SystemTime,
-    ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
+    ) -> impl Future<Output = Result<(), SessionError>> + MaybeSend;
 
     /// Load a session by its key, together with the stored
     /// [`Version`](Self::Version). Returns `None` if the key does not exist.
     fn load(
         &self,
         session_key: Uuid,
-    ) -> impl Future<Output = Result<LoadOutcome<Self>, Self::Error>> + MaybeSend;
+    ) -> impl Future<Output = Result<LoadOutcome<Self>, SessionError>> + MaybeSend;
 
     /// Save `session` only if the stored [`Version`](Self::Version) still
     /// equals `expected`, changing it on success. Return
@@ -149,14 +154,14 @@ pub trait ExternalSessionStore: MaybeSendSync {
         session: &Self::SessionType,
         expected: Self::Version,
         deadline: SystemTime,
-    ) -> impl Future<Output = Result<SaveOutcome, Self::Error>> + MaybeSend;
+    ) -> impl Future<Output = Result<SaveOutcome, SessionError>> + MaybeSend;
 
     /// Delete the session's stored record. Idempotent: a missing record is
     /// `Ok(())`.
     fn delete(
         &self,
         session: &Self::SessionType,
-    ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
+    ) -> impl Future<Output = Result<(), SessionError>> + MaybeSend;
 }
 
 /// Outcome of [`ExternalSessionStore::load`]: the session and its stored
@@ -385,8 +390,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     /// # Errors
     ///
     /// [`SessionErrorKind::Gone`] (no session), [`SessionErrorKind::Conflict`]
-    /// (retry budget exhausted), or [`SessionErrorKind::Unavailable`] (store
-    /// error).
+    /// (retry budget exhausted), or the backend's classified [`SessionError`], propagated unchanged.
     pub async fn update<F>(
         &self,
         session_key: Uuid,
@@ -420,12 +424,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         F: Fn(&mut E::SessionType) -> Result<(), SessionError> + MaybeSend,
     {
         for _ in 0..UPDATE_MAX_ATTEMPTS {
-            let Some((mut session, version)) = self
-                .external
-                .load(session_key)
-                .await
-                .map_err(to_session_err)?
-            else {
+            let Some((mut session, version)) = self.external.load(session_key).await? else {
                 return Err(SessionError::new(SessionErrorKind::Gone, SessionNotFound));
             };
             mutate(&mut session)?;
@@ -436,8 +435,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
                     version,
                     self.write_deadline(&session, SystemTime::now()),
                 )
-                .await
-                .map_err(to_session_err)?
+                .await?
             {
                 SaveOutcome::Committed => return Ok(session),
                 SaveOutcome::Conflict => {}
@@ -462,9 +460,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         lifetime: Duration,
     ) -> Result<E::SessionType, SessionError> {
         for _ in 0..UPDATE_MAX_ATTEMPTS {
-            let Some((mut fresh, version)) =
-                self.external.load(key).await.map_err(to_session_err)?
-            else {
+            let Some((mut fresh, version)) = self.external.load(key).await? else {
                 return Err(SessionError::new(SessionErrorKind::Gone, SessionNotFound));
             };
             if fresh.state().refresh_revision != expected_revision {
@@ -488,8 +484,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
                     version,
                     self.write_deadline(&fresh, SystemTime::now()),
                 )
-                .await
-                .map_err(to_session_err)?
+                .await?
             {
                 SaveOutcome::Committed => return Ok(fresh),
                 SaveOutcome::Conflict => {}
@@ -618,10 +613,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             return Err(SessionErrorKind::Gone.into());
         }
         let retention_deadline = self.write_deadline(&session, now);
-        self.external
-            .insert(&session, retention_deadline)
-            .await
-            .map_err(to_session_err)?;
+        self.external.insert(&session, retention_deadline).await?;
         // Login is the session's first activity. Seed liveness immediately so
         // precise idle tracking starts at creation rather than at the first
         // qualifying request after the callback. This remains best-effort like
@@ -652,7 +644,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     pub(crate) async fn load_session(
         &self,
         headers: &http::HeaderMap,
-    ) -> Result<DriverLoad<E::SessionType>, E::Error> {
+    ) -> Result<DriverLoad<E::SessionType>, SessionError> {
         let session_key = match self.read_pointer_cookie(headers).await {
             DriverLoad::Absent => return Ok(DriverLoad::Absent),
             DriverLoad::Invalid(reason) => return Ok(DriverLoad::Invalid(reason)),
@@ -671,8 +663,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     ) -> Result<Vec<HeaderValue>, SessionError> {
         let key = session.persisted().session_key;
         for _ in 0..UPDATE_MAX_ATTEMPTS {
-            let Some((current, version)) = self.external.load(key).await.map_err(to_session_err)?
-            else {
+            let Some((current, version)) = self.external.load(key).await? else {
                 return Err(SessionError::new(SessionErrorKind::Gone, SessionNotFound));
             };
             if !session.state().matches_persisted_refresh(current.state()) {
@@ -695,8 +686,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
                     version,
                     self.write_deadline(&candidate, SystemTime::now()),
                 )
-                .await
-                .map_err(to_session_err)?
+                .await?
             {
                 // The session key is unchanged, so no new pointer cookie.
                 SaveOutcome::Committed => return Ok(vec![]),
@@ -716,10 +706,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         &self,
         session: &E::SessionType,
     ) -> Result<(), SessionError> {
-        self.external
-            .delete(session)
-            .await
-            .map_err(to_session_err)?;
+        self.external.delete(session).await?;
         // Best-effort: drop the liveness entry too. A failure here just leaves a
         // stale entry that expires under its own TTL; it must not fail logout.
         if let Some((liveness, _)) = &self.liveness {
@@ -789,7 +776,6 @@ impl<E: ExternalSessionStore> crate::session::sealed::Sealed for StoreBackedSess
 
 impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
     type SessionType = E::SessionType;
-    type LoadError = E::Error;
 
     fn apply_session_policy(&mut self, policy: &SessionPolicy) -> Result<(), crate::ConfigError> {
         // The callback must receive the old pointer so a successful re-login
@@ -834,7 +820,7 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
     async fn load(
         &self,
         headers: &http::HeaderMap,
-    ) -> Result<DriverLoad<E::SessionType>, E::Error> {
+    ) -> Result<DriverLoad<E::SessionType>, SessionError> {
         self.load_session(headers).await
     }
 

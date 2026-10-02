@@ -426,7 +426,6 @@ impl<C: CookiePayload> crate::session::sealed::Sealed for CookieSessionStore<C> 
 
 impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
     type SessionType = C;
-    type LoadError = std::convert::Infallible;
 
     fn apply_session_policy(&mut self, policy: &SessionPolicy) -> Result<(), crate::ConfigError> {
         // Callback visibility is optional for stateless sessions: the callback
@@ -466,10 +465,7 @@ impl<C: CookiePayload> SessionDriver for CookieSessionStore<C> {
         Ok((session, cookies))
     }
 
-    async fn load(
-        &self,
-        headers: &http::HeaderMap,
-    ) -> Result<DriverLoad<C>, std::convert::Infallible> {
+    async fn load(&self, headers: &http::HeaderMap) -> Result<DriverLoad<C>, SessionError> {
         Ok(self.load_session(headers).await)
     }
 

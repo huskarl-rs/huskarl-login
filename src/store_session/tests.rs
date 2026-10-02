@@ -1,5 +1,3 @@
-use std::convert::Infallible;
-
 use super::*;
 use crate::{
     cookie::encode_kid,
@@ -50,13 +48,12 @@ struct MinimalExternalStore(MinimalSession);
 impl ExternalSessionStore for MinimalExternalStore {
     type SessionType = MinimalSession;
     type Version = i32;
-    type Error = Infallible;
 
-    async fn insert(&self, _: &MinimalSession, _: SystemTime) -> Result<(), Infallible> {
+    async fn insert(&self, _: &MinimalSession, _: SystemTime) -> Result<(), SessionError> {
         Ok(())
     }
 
-    async fn load(&self, _: Uuid) -> Result<Option<(MinimalSession, i32)>, Infallible> {
+    async fn load(&self, _: Uuid) -> Result<Option<(MinimalSession, i32)>, SessionError> {
         Ok(Some((self.0.clone(), 0)))
     }
 
@@ -65,11 +62,11 @@ impl ExternalSessionStore for MinimalExternalStore {
         _: &MinimalSession,
         _: i32,
         _: SystemTime,
-    ) -> Result<SaveOutcome, Infallible> {
+    ) -> Result<SaveOutcome, SessionError> {
         Ok(SaveOutcome::Committed)
     }
 
-    async fn delete(&self, _: &MinimalSession) -> Result<(), Infallible> {
+    async fn delete(&self, _: &MinimalSession) -> Result<(), SessionError> {
         Ok(())
     }
 }
@@ -522,14 +519,13 @@ impl VersioningStore {
 impl ExternalSessionStore for VersioningStore {
     type SessionType = MinimalSession;
     type Version = i32;
-    type Error = std::io::Error;
 
-    async fn insert(&self, s: &MinimalSession, deadline: SystemTime) -> Result<(), std::io::Error> {
+    async fn insert(&self, s: &MinimalSession, deadline: SystemTime) -> Result<(), SessionError> {
         *self.stored.lock().unwrap() = Some((s.clone(), 0));
         self.deadlines.lock().unwrap().push(deadline);
         Ok(())
     }
-    async fn load(&self, _: Uuid) -> Result<Option<(MinimalSession, i32)>, std::io::Error> {
+    async fn load(&self, _: Uuid) -> Result<Option<(MinimalSession, i32)>, SessionError> {
         Ok(self.stored.lock().unwrap().clone())
     }
     async fn compare_and_swap(
@@ -537,7 +533,7 @@ impl ExternalSessionStore for VersioningStore {
         s: &MinimalSession,
         expected: i32,
         deadline: SystemTime,
-    ) -> Result<SaveOutcome, std::io::Error> {
+    ) -> Result<SaveOutcome, SessionError> {
         if self.always_conflict {
             return Ok(SaveOutcome::Conflict);
         }
@@ -554,7 +550,10 @@ impl ExternalSessionStore for VersioningStore {
                 *stored = Some((s.clone(), expected + 1));
                 self.deadlines.lock().unwrap().push(deadline);
                 if std::mem::take(&mut *self.lose_ack_once.lock().unwrap()) {
-                    return Err(std::io::Error::other("lost commit acknowledgement"));
+                    return Err(SessionError::new(
+                        SessionErrorKind::Unavailable,
+                        std::io::Error::other("lost commit acknowledgement"),
+                    ));
                 }
                 Ok(SaveOutcome::Committed)
             }
@@ -562,7 +561,7 @@ impl ExternalSessionStore for VersioningStore {
             None => Ok(SaveOutcome::Missing),
         }
     }
-    async fn delete(&self, _: &MinimalSession) -> Result<(), std::io::Error> {
+    async fn delete(&self, _: &MinimalSession) -> Result<(), SessionError> {
         *self.stored.lock().unwrap() = None;
         Ok(())
     }
@@ -1711,13 +1710,12 @@ struct EnrichedExternalStore(std::sync::Arc<std::sync::Mutex<Option<String>>>);
 impl ExternalSessionStore for EnrichedExternalStore {
     type SessionType = EnrichedStoreSession;
     type Version = i32;
-    type Error = Infallible;
 
-    async fn insert(&self, s: &EnrichedStoreSession, _: SystemTime) -> Result<(), Infallible> {
+    async fn insert(&self, s: &EnrichedStoreSession, _: SystemTime) -> Result<(), SessionError> {
         *self.0.lock().unwrap() = Some(s.email.clone());
         Ok(())
     }
-    async fn load(&self, _: Uuid) -> Result<Option<(EnrichedStoreSession, i32)>, Infallible> {
+    async fn load(&self, _: Uuid) -> Result<Option<(EnrichedStoreSession, i32)>, SessionError> {
         Ok(None)
     }
     async fn compare_and_swap(
@@ -1725,10 +1723,10 @@ impl ExternalSessionStore for EnrichedExternalStore {
         _: &EnrichedStoreSession,
         _: i32,
         _: SystemTime,
-    ) -> Result<SaveOutcome, Infallible> {
+    ) -> Result<SaveOutcome, SessionError> {
         Ok(SaveOutcome::Missing)
     }
-    async fn delete(&self, _: &EnrichedStoreSession) -> Result<(), Infallible> {
+    async fn delete(&self, _: &EnrichedStoreSession) -> Result<(), SessionError> {
         Ok(())
     }
 }

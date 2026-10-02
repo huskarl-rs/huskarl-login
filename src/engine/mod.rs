@@ -1032,12 +1032,7 @@ where
         &self,
         headers: &HeaderMap,
     ) -> Result<LoadedSession<SD::SessionType>, SessionError> {
-        let session = match self
-            .session_store
-            .load(headers)
-            .await
-            .map_err(crate::session::to_session_err)?
-        {
+        let session = match self.session_store.load(headers).await? {
             DriverLoad::Absent => return Ok(LoadedSession::Missing),
             DriverLoad::Valid(session) => session,
             DriverLoad::Invalid(invalid_reason) => {

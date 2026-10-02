@@ -72,7 +72,6 @@ using this pattern in a deployment.
 
 ```rust
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::sync::Mutex;
 
 use huskarl_login::core::{
@@ -81,7 +80,7 @@ use huskarl_login::core::{
 };
 use huskarl_login::{
     ExternalSessionStore, PersistedSession, PersistedSessionState, SaveOutcome, Session,
-    SessionState, StoreBackedSessionStore,
+    SessionError, SessionState, StoreBackedSessionStore,
 };
 use uuid::Uuid;
 
@@ -112,7 +111,6 @@ struct InMemoryStore {
 impl ExternalSessionStore for InMemoryStore {
     type SessionType = MySession;
     type Version = i32;
-    type Error = Infallible;
 
     // A real backend also applies `deadline` as an absolute TTL. This demo
     // stores it so a sweeper could remove expired rows.
@@ -120,13 +118,13 @@ impl ExternalSessionStore for InMemoryStore {
         &self,
         session: &MySession,
         deadline: SystemTime,
-    ) -> Result<(), Infallible> {
+    ) -> Result<(), SessionError> {
         let key = session.persisted().session_key;
         self.rows.lock().unwrap().insert(key, (session.clone(), 0, deadline));
         Ok(())
     }
 
-    async fn load(&self, session_key: Uuid) -> Result<Option<(MySession, i32)>, Infallible> {
+    async fn load(&self, session_key: Uuid) -> Result<Option<(MySession, i32)>, SessionError> {
         Ok(self.rows.lock().unwrap().get(&session_key)
             .map(|(session, version, _)| (session.clone(), *version)))
     }
@@ -136,7 +134,7 @@ impl ExternalSessionStore for InMemoryStore {
         session: &MySession,
         expected: i32,
         deadline: SystemTime,
-    ) -> Result<SaveOutcome, Infallible> {
+    ) -> Result<SaveOutcome, SessionError> {
         let key = session.persisted().session_key;
         let mut rows = self.rows.lock().unwrap();
         match rows.get(&key) {
@@ -149,7 +147,7 @@ impl ExternalSessionStore for InMemoryStore {
         }
     }
 
-    async fn delete(&self, session: &MySession) -> Result<(), Infallible> {
+    async fn delete(&self, session: &MySession) -> Result<(), SessionError> {
         self.rows.lock().unwrap().remove(&session.persisted().session_key);
         Ok(())
     }
@@ -193,7 +191,7 @@ let updated = store
 
 It errors with [`Gone`](crate::SessionErrorKind) if the key is absent,
 [`Conflict`](crate::SessionErrorKind) if the retry budget is exhausted, or
-[`Unavailable`](crate::SessionErrorKind) on a store error.
+the backend's classified [`SessionError`](crate::SessionError), propagated unchanged.
 
 ## Add idle-timeout tracking
 
@@ -216,6 +214,21 @@ Use [`PendingPersist::commit`](crate::engine::PendingPersist::commit) for a
 pending refresh. Preserve refresh fields in application updates and route
 writes through the driver so its concurrency checks run.
 
+## Error classification and migration
+
+All four backend methods return `SessionError`. Classify transient connection
+and service failures as `SessionErrorKind::Unavailable`, and corrupt stored
+data, schema mismatches, and permanent backend failures as
+`SessionErrorKind::Store`. Classify the specific failure rather than treating
+every database error as transient. Preserve its source with
+`SessionError::new(kind, error)`; the driver and engine propagate it unchanged.
+Missing records and version conflicts still use `LoadOutcome` and `SaveOutcome`.
+
+When migrating an existing implementation, remove `type Error`, change method
+return types to `SessionError`, and explicitly map backend errors at each I/O
+or decoding boundary. `SessionDriver::load` also returns `SessionError` now;
+remove `type LoadError` from any driver test doubles.
+
 ## Verify the backend
 
 Before connecting a real backend, check these outcomes:
@@ -224,6 +237,8 @@ Before connecting a real backend, check these outcomes:
 - A write after deletion: returns `Missing` and leaves the record absent.
 - A successful overwrite: retains the supplied storage deadline.
 - An expired record: is removed by your TTL or cleanup mechanism.
+- Permanent failures remain non-retryable, transient failures remain retryable,
+  and the original error remains available through `std::error::Error::source`.
 
 These checks exercise the backend's atomicity and retention behavior; the
 in-memory example alone does not establish those properties for your database.

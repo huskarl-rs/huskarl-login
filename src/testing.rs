@@ -14,7 +14,8 @@ use std::{
 use uuid::Uuid;
 
 use crate::{
-    ExternalSessionStore, LoadOutcome, PersistedSession, SaveOutcome, Session,
+    ExternalSessionStore, LoadOutcome, PersistedSession, SaveOutcome, Session, SessionError,
+    SessionErrorKind,
     core::platform::{MaybeSendSync, SystemTime},
 };
 
@@ -98,12 +99,12 @@ impl<S> InMemoryExternalSessionStore<S> {
         self.state().calls
     }
 
-    /// Configures subsequent inserts to return [`InjectedExternalStoreError`].
+    /// Configures subsequent inserts to return an unavailable [`SessionError`] caused by [`InjectedExternalStoreError`].
     pub fn set_fail_inserts(&self, fail: bool) {
         self.fail_inserts.store(fail, Ordering::Relaxed);
     }
 
-    /// Configures subsequent deletes to return [`InjectedExternalStoreError`].
+    /// Configures subsequent deletes to return an unavailable [`SessionError`] caused by [`InjectedExternalStoreError`].
     pub fn set_fail_deletes(&self, fail: bool) {
         self.fail_deletes.store(fail, Ordering::Relaxed);
     }
@@ -137,13 +138,15 @@ where
 {
     type SessionType = S;
     type Version = u64;
-    type Error = InjectedExternalStoreError;
 
-    async fn insert(&self, session: &S, _: SystemTime) -> Result<(), Self::Error> {
+    async fn insert(&self, session: &S, _: SystemTime) -> Result<(), SessionError> {
         let mut state = self.state();
         state.calls.inserts += 1;
         if self.fail_inserts.load(Ordering::Relaxed) {
-            return Err(InjectedExternalStoreError);
+            return Err(SessionError::new(
+                SessionErrorKind::Unavailable,
+                InjectedExternalStoreError,
+            ));
         }
         state
             .records
@@ -151,7 +154,7 @@ where
         Ok(())
     }
 
-    async fn load(&self, session_key: Uuid) -> Result<LoadOutcome<Self>, Self::Error> {
+    async fn load(&self, session_key: Uuid) -> Result<LoadOutcome<Self>, SessionError> {
         let mut state = self.state();
         state.calls.loads += 1;
         Ok(state.records.get(&session_key).cloned())
@@ -162,7 +165,7 @@ where
         session: &S,
         expected: u64,
         _: SystemTime,
-    ) -> Result<SaveOutcome, Self::Error> {
+    ) -> Result<SaveOutcome, SessionError> {
         let mut state = self.state();
         state.calls.compare_and_swaps += 1;
         let Some((stored, version)) = state.records.get_mut(&session.persisted().session_key)
@@ -177,11 +180,14 @@ where
         Ok(SaveOutcome::Committed)
     }
 
-    async fn delete(&self, session: &S) -> Result<(), Self::Error> {
+    async fn delete(&self, session: &S) -> Result<(), SessionError> {
         let mut state = self.state();
         state.calls.deletes += 1;
         if self.fail_deletes.load(Ordering::Relaxed) {
-            return Err(InjectedExternalStoreError);
+            return Err(SessionError::new(
+                SessionErrorKind::Unavailable,
+                InjectedExternalStoreError,
+            ));
         }
         state.records.remove(&session.persisted().session_key);
         Ok(())

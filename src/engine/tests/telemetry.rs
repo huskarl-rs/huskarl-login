@@ -690,7 +690,13 @@ fn diagnostics_preserve_original_logout_load_error() {
             .session_store(ErrorSessionStore)
             .sealer(test_sealer().await)
             .diagnostics(move |event| {
-                assert!(event.error.is::<StoreLoadError>());
+                let error = event.error.downcast_ref::<SessionError>().unwrap();
+                assert_eq!(error.kind(), SessionErrorKind::Unavailable);
+                assert!(
+                    std::error::Error::source(error)
+                        .unwrap()
+                        .is::<StoreLoadError>()
+                );
                 sink.lock().unwrap().push(event.operation);
             })
             .build()

@@ -283,11 +283,6 @@ impl std::error::Error for SessionError {
     }
 }
 
-/// Box a store's own error as an [`Unavailable`](SessionErrorKind::Unavailable) session error.
-pub(crate) fn to_session_err(e: impl std::error::Error + MaybeSendSync + 'static) -> SessionError {
-    SessionError::new(SessionErrorKind::Unavailable, e)
-}
-
 /// Sealed trait marker module.
 #[doc(hidden)]
 pub mod sealed {
@@ -309,9 +304,6 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     /// [`PendingPersist::commit`](crate::engine::PendingPersist::commit)
     /// persists from a clone.
     type SessionType: Session + Clone + MaybeSendSync + 'static;
-
-    /// The error type returned by [`load`](Self::load).
-    type LoadError: std::error::Error + MaybeSendSync + 'static;
 
     /// Stamp the engine-derived session policy onto this driver. Called once
     /// at engine construction, so the values cannot drift from the config:
@@ -351,7 +343,7 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
     fn load(
         &self,
         headers: &http::HeaderMap,
-    ) -> impl Future<Output = Result<DriverLoad<Self::SessionType>, Self::LoadError>> + MaybeSend;
+    ) -> impl Future<Output = Result<DriverLoad<Self::SessionType>, SessionError>> + MaybeSend;
 
     /// Persist updated session state, returning any `Set-Cookie` header values
     /// (re-encrypted cookies plus `Max-Age=0` clears for now-unused chunks; none

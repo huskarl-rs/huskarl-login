@@ -273,9 +273,7 @@ async fn load_session_store_error_bubbles_up() {
         .load_session(&HeaderMap::new())
         .await
         .expect_err("opaque store load failure must surface as an error");
-    // An opaque backing-store failure is classified `Unavailable` — the more
-    // often transient kind — so callers treat it as retryable rather than a
-    // hard 4xx/permanent fault.
+    // The driver's explicit classification reaches the caller unchanged.
     assert_eq!(err.kind(), SessionErrorKind::Unavailable);
     assert!(err.is_retryable());
 }
@@ -344,4 +342,135 @@ async fn skew_just_over_limit_clears_session() {
     let (reason, _) = expect_cleared(loaded);
     assert_eq!(reason, TeardownReason::ClockSkew);
     assert!(e.session_store.revoke_called());
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackendOperation {
+    Insert,
+    Load,
+    Save,
+    Delete,
+}
+
+struct ClassifiedFailureStore {
+    inner: RevocableExternalStore<PersistedSessionState>,
+    failure: Arc<Mutex<Option<BackendOperation>>>,
+    kind: SessionErrorKind,
+}
+
+impl ClassifiedFailureStore {
+    fn check(&self, operation: BackendOperation) -> Result<(), SessionError> {
+        if *self.failure.lock().unwrap() == Some(operation) {
+            Err(SessionError::new(self.kind, StoreLoadError).with_context("backend operation"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl crate::ExternalSessionStore for ClassifiedFailureStore {
+    type SessionType = PersistedSessionState;
+    type Version = u64;
+
+    async fn insert(
+        &self,
+        session: &PersistedSessionState,
+        deadline: SystemTime,
+    ) -> Result<(), SessionError> {
+        self.check(BackendOperation::Insert)?;
+        self.inner.insert(session, deadline).await
+    }
+
+    async fn load(&self, key: uuid::Uuid) -> Result<crate::LoadOutcome<Self>, SessionError> {
+        self.check(BackendOperation::Load)?;
+        self.inner.load(key).await
+    }
+
+    async fn compare_and_swap(
+        &self,
+        session: &PersistedSessionState,
+        expected: u64,
+        deadline: SystemTime,
+    ) -> Result<crate::SaveOutcome, SessionError> {
+        self.check(BackendOperation::Save)?;
+        self.inner
+            .compare_and_swap(session, expected, deadline)
+            .await
+    }
+
+    async fn delete(&self, session: &PersistedSessionState) -> Result<(), SessionError> {
+        self.check(BackendOperation::Delete)?;
+        self.inner.delete(session).await
+    }
+}
+
+#[rstest]
+#[case::permanent(SessionErrorKind::Store, false)]
+#[case::transient(SessionErrorKind::Unavailable, true)]
+#[tokio::test]
+async fn backend_errors_preserve_classification_and_source(
+    #[case] kind: SessionErrorKind,
+    #[case] retryable: bool,
+    #[values(
+        BackendOperation::Insert,
+        BackendOperation::Load,
+        BackendOperation::Save,
+        BackendOperation::Delete
+    )]
+    operation: BackendOperation,
+) {
+    let failure = Arc::new(Mutex::new(None));
+    let store = StoreBackedSessionStore::builder()
+        .external(ClassifiedFailureStore {
+            inner: RevocableExternalStore::default(),
+            failure: failure.clone(),
+            kind,
+        })
+        .sealer(test_sealer().await)
+        .cookie_name("session".parse().unwrap())
+        .build();
+    let engine = LoginEngine::builder()
+        .config(default_config())
+        .grant(test_grant(FailingHttp::new(false).0).await)
+        .session_store(store)
+        .build()
+        .unwrap();
+    let completed = || {
+        CompletedLogin::builder()
+            .token_response(token_response_fixture())
+            .build()
+    };
+    let (session, cookies) = engine
+        .session_store()
+        .create(completed(), Duration::from_hours(1), &HeaderMap::new())
+        .await
+        .unwrap();
+    let headers = request_cookies(&cookies);
+    *failure.lock().unwrap() = Some(operation);
+    let error = match operation {
+        BackendOperation::Insert => engine
+            .session_store()
+            .create(completed(), Duration::from_hours(1), &headers)
+            .await
+            .err()
+            .unwrap(),
+        BackendOperation::Load => engine.load_session(&headers).await.unwrap_err(),
+        BackendOperation::Save => engine.save_session(&session, &headers).await.unwrap_err(),
+        BackendOperation::Delete => {
+            let (clears, result) = engine
+                .terminate_session(&session, &headers)
+                .await
+                .into_parts();
+            clears.discard();
+            result.unwrap_err()
+        }
+    };
+    assert_eq!(error.kind(), kind);
+    assert_eq!(error.is_retryable(), retryable);
+    assert!(error.to_string().starts_with("backend operation: "));
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .is::<StoreLoadError>()
+    );
 }
