@@ -22,9 +22,15 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_hours(30 * 24);
 /// A server-side store for session liveness (`last_active`) timestamps, keyed
 /// by the store-backed session's `Uuid`.
 ///
-/// Liveness fails open, so an `Err` from any method is diagnostic only: it is
-/// logged and then treated as an active session. Wrap backend failures with
-/// `SessionError::new(SessionErrorKind::Unavailable, err)`.
+/// Liveness fails open: a read error is treated as active, and touch or clear
+/// errors do not fail the request. Failures increment the optional
+/// `huskarl.session.liveness_failure` counter. The driver does not log or pass
+/// these errors to the engine's diagnostic handler; observe individual errors
+/// in your implementation or a wrapper. Classify transient backend failures
+/// with [`SessionErrorKind::Unavailable`](crate::SessionErrorKind::Unavailable).
+///
+/// See [Add idle-timeout tracking](crate::_docs::how_to::liveness) for attachment,
+/// backend requirements, and verification.
 pub trait LivenessStore: MaybeSendSync {
     /// Returns the last activity instant recorded for `key`, or `None` when no
     /// entry exists. `None` is treated as active, not expired.
@@ -34,8 +40,10 @@ pub trait LivenessStore: MaybeSendSync {
     ) -> MaybeSendBoxFuture<'_, Result<Option<SystemTime>, SessionError>>;
 
     /// Records activity for `key` at `now`. Apply `deadline` as the entry's
-    /// absolute TTL (`None` applies none). A plain monotonic write; no
-    /// debounce needed.
+    /// absolute TTL (`None` applies none). Concurrent or delayed writes must
+    /// never move the stored activity time backwards or shorten retention.
+    /// Apply that comparison atomically across replicas. The driver throttles
+    /// touches; the backend need not debounce them.
     fn touch(
         &self,
         key: Uuid,

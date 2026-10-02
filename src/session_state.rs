@@ -146,6 +146,31 @@ impl SessionState {
 /// methods expose its lifecycle fields and apply token refreshes. Override
 /// [`id_token`](Self::id_token) or [`apply_refresh`](Self::apply_refresh) only
 /// when the custom session stores additional related data.
+///
+/// # Example
+///
+/// ```
+/// use huskarl_login::{Session, SessionState};
+///
+/// #[derive(Clone, serde::Serialize, serde::Deserialize)]
+/// struct AppSession {
+///     state: SessionState,
+///     display_name: Option<String>,
+/// }
+///
+/// impl Session for AppSession {
+///     fn state(&self) -> &SessionState {
+///         &self.state
+///     }
+///     fn set_state(&mut self, state: SessionState) {
+///         self.state = state;
+///     }
+/// }
+/// ```
+///
+/// Populate this type with a store builder's `build_with_claims` or
+/// `build_with_enricher` method. See [Build an application
+/// session](crate::_docs::how_to::enrichment) for construction and refresh examples.
 pub trait Session {
     /// Returns a shared reference to the embedded [`SessionState`].
     fn state(&self) -> &SessionState;

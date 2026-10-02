@@ -1,9 +1,15 @@
-# Build your first login engine
+# Build a login engine
 
 Build and run a small program that discovers an OIDC provider and constructs a
 [`LoginEngine`](crate::engine::LoginEngine) with encrypted cookie sessions.
 When it succeeds, it prints `Login engine ready` and exits. Connecting this
 engine to HTTP routes is the next step after this tutorial.
+
+This exercise is for integrators learning the underlying library. For application
+or proxy setup, start with
+[`huskarl-axum`](https://docs.rs/huskarl-axum/latest/huskarl_axum/) or
+[`huskarl-pingora`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/);
+those adapters manage the HTTP lifecycle for you.
 
 ## 1. Prepare a client registration
 
@@ -29,7 +35,7 @@ Add these dependencies to the generated `Cargo.toml`:
 
 ```toml
 [dependencies]
-huskarl-login = "0.3"
+huskarl-login = "0.4"
 huskarl-crypto-native = "0.11"
 huskarl-reqwest = { version = "0.9", features = ["rustls-tls"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -150,17 +156,13 @@ HTTP adapter calls the engine.
 
 ## Next steps
 
-- Continue with [Sign in to an Axum application](https://docs.rs/huskarl-axum/latest/huskarl_axum/login/tutorial/)
-  for a browser login walkthrough. For other frameworks, use `huskarl-pingora`
-  or follow [Build a framework adapter](crate::_docs::how_to::adapter).
-- Diagnose unexpected responses with
-  [Troubleshoot browser login](crate::_docs::how_to::troubleshooting).
-- Add profile fields with [Build an application session](crate::_docs::how_to::enrichment).
-- Keep session data server-side with
-  [Implement an external session store](crate::_docs::how_to::external_store).
-- Choose deployment lifetimes using
-  [Session lifetime policy](crate::_docs::explanation::session_lifetime).
-- Understand cookie encryption-key rotation in
-  [Cookie security](crate::_docs::explanation::cookie_security).
-- Separately, check provider refresh-token rotation using
-  [Deploy refresh-token rotation safely](crate::_docs::how_to::rotation).
+- Integrate the engine with your framework using
+  [Build a framework adapter](crate::_docs::how_to::adapter).
+- Add profile fields with [Build an application session](crate::_docs::how_to::enrichment),
+  or [implement an external store](crate::_docs::how_to::external_store).
+- Choose lifetime policy and verify deployment behavior with
+  [Choose and configure a deployment](crate::_docs::how_to::deployment).
+
+For a browser walkthrough with an existing adapter, return to the
+[Axum](https://docs.rs/huskarl-axum/latest/huskarl_axum/) or
+[Pingora](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/) documentation.

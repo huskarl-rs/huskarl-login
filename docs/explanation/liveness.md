@@ -1,5 +1,8 @@
 # Server-side liveness (idle timeout)
 
+For backend requirements and builder wiring, follow
+[Add idle-timeout tracking](crate::_docs::how_to::liveness).
+
 Idle timeout is enforced **server-side**, not from a timestamp carried on the
 session. A [`StoreBackedSessionStore`](crate::StoreBackedSessionStore) with a
 [`LivenessStore`](crate::LivenessStore) attached (via
@@ -48,10 +51,10 @@ subsequent activity writes are:
   [`LivenessConfig`](crate::LivenessConfig) builder enforces this, and by
   default derives the interval as a quarter of `idle_timeout` (capped at one
   hour);
-- **conditional** — skipped entirely when the engine's
-  [`ActivityPolicy`](crate::ActivityPolicy) classifies the request as
-  non-activity (a cross-site embed, a background poll, …), so those requests
-  keep a session readable without keeping it alive;
+- **conditional** — skipped when [`ActivityPolicy`](crate::ActivityPolicy)
+  classifies the request as non-activity. For example, `NavigationsOnly`
+  excludes background polling, while the default `FirstParty` includes
+  same-origin polling. Non-activity requests do not advance `last_active`;
 - **best-effort and monotonic** — a failed write just delays the next advance;
   it never fails the request.
 

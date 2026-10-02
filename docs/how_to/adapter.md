@@ -1,5 +1,12 @@
 # Build a framework adapter
 
+Use this guide when integrating the engine into a framework or proxy lifecycle.
+For application setup with an existing adapter, start with
+[`huskarl-axum`](https://docs.rs/huskarl-axum/latest/huskarl_axum/) or
+[`huskarl-pingora`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/).
+This guide assumes you have an engine; the
+[engine tutorial](crate::_docs::tutorial::getting_started) shows its construction.
+
 [`LoginEngine`](crate::engine::LoginEngine) is framework-neutral: it takes
 `http` types in (`HeaderMap`, `Method`, `Uri`) and hands back
 [`LoginResponse`](crate::engine::LoginResponse) values and
@@ -82,8 +89,8 @@ Two contract points, both covered in depth elsewhere:
 
 - **Never drop a non-empty guard.** A dropped re-sealed session cookie after a
   refresh with rotation strands the rotated refresh token and kills the
-  session; the guard increments the optional dropped-work counter if it happens. The one legitimate
-  non-delivery — the response is already gone — is spelled
+  session. With `metrics` enabled, the guard counts a dropped cookie update.
+  When the response is already gone, explicitly call
   [`discard`](crate::engine::SetCookies::discard).
 - **`Cache-Control: no-store` goes out with the cookies.** The engine marks its own
   responses; cookies attached to the *inner handler's* response are the
@@ -307,6 +314,9 @@ Route all returned [`SetCookies`](crate::engine::SetCookies) through the same
 guard fire.
 
 ## URIs behind a front proxy
+
+For mapping construction and a public-to-ingress example, see
+[Configure public and ingress URLs](crate::_docs::how_to::url_mapping).
 
 Pass the engine the URI *as your server received it* — including any path
 prefix a front proxy adds. [`LoginConfig::strip_prefix`](crate::LoginConfig)

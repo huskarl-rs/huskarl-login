@@ -80,33 +80,17 @@
 //! Unknown authorization-server error codes map to `other`. No arbitrary label
 //! bag, raw error, subject, token, or decrypt-side `kid` is exposed.
 //!
-//! # Diagnostics and migration from 0.4.0
+//! # Diagnostic errors
 //!
-//! Enable `features = ["metrics"]` to retain counters. Unnamed series now carry
-//! `name=""`; update dashboards for that label-schema change. Names, labels,
-//! and counting semantics are documented interfaces; changes require migration
-//! notes. Existing outcome spellings are retained.
+//! The engine's optional `diagnostics` handler receives errors consumed by the
+//! engine, independently of the metrics feature. Returned errors remain with
+//! the caller. Best-effort liveness and superseded-record failures expose their
+//! sources only through instrumentation on the supplied backend; their counters
+//! remain available here.
 //!
-//! Use `LoginEngine::builder().diagnostics(...)` to receive original consumed
-//! engine errors, independently of the metrics feature. The synchronous handler
-//! may run concurrently, must not block or panic, and propagates panics. Redact
-//! sensitive/untrusted error sources before export; queueing, overflow, and
-//! delivery guarantees belong to the application. It is not a session security
-//! event or transactional audit API. Returned errors remain available to callers.
-//!
-//! To inspect best-effort liveness or superseded-record failure sources, decorate
-//! the supplied [`LivenessStore`](crate::LivenessStore) or
-//! [`ExternalSessionStore`](crate::ExternalSessionStore). Their existing bounded
-//! counters remain. Without such a decorator, individual backend failure text is
-//! deliberately no longer retained. Drop guards retain counts, not per-request
-//! details. Retry timing is defined by the retry policy; no formatted per-attempt
-//! errors or timings are retained by this crate.
-//!
-//! Axum and Pingora should forward their optional metrics feature using
-//! `huskarl-login?/metrics` once they depend on a release containing this feature.
-//! Their existing adapter diagnostics remain separate from engine diagnostics.
-//! Yanking 0.4.0 cannot replace its contents: these changes require a new version,
-//! with the release number and any yank decided separately.
+//! See [Observe login failures](crate::_docs::how_to::observability) for recorder
+//! setup, diagnostic-handler wiring, and backend instrumentation. Existing
+//! integrations should also consult the [migration guide](crate::_docs::how_to::migration).
 //!
 //! [`TeardownReason`]: crate::engine::TeardownReason
 //! [`InvalidSessionReason`]: crate::InvalidSessionReason

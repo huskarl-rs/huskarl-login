@@ -1,8 +1,12 @@
-//! Learn and use `huskarl-login`.
+//! Integrate, customize, and understand the login engine.
 //!
-//! This crate organizes its documentation using
-//! [Diátaxis](https://diataxis.fr). Choose the section that matches what you
-//! are trying to do:
+//! Application and proxy setup starts in
+//! [`huskarl-axum`](https://docs.rs/huskarl-axum/latest/huskarl_axum/) or
+//! [`huskarl-pingora`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/).
+//! The material here covers shared behavior and extension points, and provides
+//! a direct starting point for integrators building on the engine.
+//!
+//! Choose the section that matches your task:
 //!
 //! - **[Tutorial](tutorial)** — build a minimal login engine while learning the
 //!   main pieces.
@@ -16,9 +20,9 @@
 //! This module contains no runtime API and is compiled only while generating
 //! documentation.
 
-/// Learning-oriented material for first-time users.
+/// Learn how to assemble the engine used by framework adapters.
 ///
-/// Start with [Build your first login engine](tutorial::getting_started) to
+/// Start with [Build a login engine](tutorial::getting_started) to
 /// connect OIDC discovery, cookie sealing, session storage, and the engine.
 pub mod tutorial {
     #[doc = include_str!("../docs/tutorial/getting_started.md")]
@@ -60,9 +64,14 @@ pub mod explanation {
 /// - [Build a framework adapter](how_to::adapter).
 /// - [Build an application session](how_to::enrichment).
 /// - [Implement an external session store](how_to::external_store).
+/// - [Add idle-timeout tracking](how_to::liveness).
+/// - [Configure public and ingress URLs](how_to::url_mapping).
+/// - [Rotate cookie encryption keys](how_to::cookie_keys).
+/// - [Observe login failures](how_to::observability).
 /// - [Prevent session responses from being cached](how_to::caching).
 /// - [Deploy refresh-token rotation safely](how_to::rotation).
 /// - [Troubleshoot browser login](how_to::troubleshooting).
+/// - [Adapt an existing integration](how_to::migration).
 pub mod how_to {
     #[doc = include_str!("../docs/how_to/deployment.md")]
     pub mod deployment {}
@@ -84,4 +93,19 @@ pub mod how_to {
 
     #[doc = include_str!("../docs/how_to/caching.md")]
     pub mod caching {}
+
+    #[doc = include_str!("../docs/how_to/liveness.md")]
+    pub mod liveness {}
+
+    #[doc = include_str!("../docs/how_to/url_mapping.md")]
+    pub mod url_mapping {}
+
+    #[doc = include_str!("../docs/how_to/cookie_keys.md")]
+    pub mod cookie_keys {}
+
+    #[doc = include_str!("../docs/how_to/observability.md")]
+    pub mod observability {}
+
+    #[doc = include_str!("../docs/how_to/migration.md")]
+    pub mod migration {}
 }

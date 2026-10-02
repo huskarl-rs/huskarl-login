@@ -86,7 +86,8 @@ impl SessionLifetime {
     }
 }
 
-/// Errors that can occur when building a [`LoginConfig`].
+/// Configuration errors from building a [`LoginConfig`], [`LogoutConfig`], or
+/// [`LoginEngine`](crate::engine::LoginEngine).
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum ConfigError {
@@ -401,7 +402,13 @@ fn browser_path(
     })
 }
 
-/// Logout endpoint configuration. Grouped under [`LoginConfig::logout`].
+/// Configures the engine's POST logout route and optional provider logout.
+///
+/// Attach this to [`LoginConfig::logout`]. The request must carry an `Origin`
+/// matching the grant's public origin. The engine clears browser cookies and
+/// attempts server-side revocation, then returns a `303` redirect. Without an
+/// `end_session_endpoint`, provider SSO remains active. See
+/// [Troubleshoot logout](crate::_docs::how_to::troubleshooting#logout-fails-or-appears-to-sign-in-again).
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct LogoutConfig {
@@ -453,16 +460,43 @@ impl LogoutConfig {
     }
 }
 
-/// Configuration for the login middleware; constructed via
-/// [`builder`](Self::builder). Authorization server endpoints, client
-/// credentials, and redirect URI are configured on the
+/// Routes, scopes, and session policy for the login engine.
+///
+/// Construct with [`builder`](Self::builder); `callback_path`, `scope`, and
+/// `session_lifetime` are required. Authorization server endpoints, client
+/// credentials, and the public redirect URI are configured on the
 /// [`AuthorizationCodeGrant`](crate::client::grant::authorization_code::AuthorizationCodeGrant)
-/// directly.
+/// instead. Configure persistence on the session store and idle tracking with
+/// [`LivenessConfig`](crate::LivenessConfig).
+///
+/// # Example
+///
+/// For a grant whose redirect URI is `https://app.example.com/callback`:
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use huskarl_login::{LoginConfig, LogoutConfig, SessionLifetime};
+///
+/// let config = LoginConfig::builder()
+///     .callback_path("/callback")
+///     .scope(vec!["openid".to_owned()])
+///     .session_lifetime(SessionLifetime::Bounded(Duration::from_secs(8 * 60 * 60)))
+///     .logout(LogoutConfig::builder().path("/logout").build()?)
+///     .build()?;
+/// # Ok::<(), huskarl_login::ConfigError>(())
+/// ```
+///
+/// See [Configure public and ingress URLs](crate::_docs::how_to::url_mapping)
+/// for proxy prefixes, and [Session lifetime policy](crate::_docs::explanation::session_lifetime)
+/// for choosing a lifetime.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct LoginConfig {
-    /// Validated deployment mapping, when configured through the new API.
-    /// Its origin must agree with the grant and its prefixes with these fields.
+    /// Optional mapping between public URLs and engine-side request paths.
+    /// Its public origin must match the grant's redirect URI. The builder
+    /// derives `base_path` and `strip_prefix` from it; do not supply those
+    /// settings separately. See [URL mapping](crate::_docs::how_to::url_mapping).
     pub url_mapping: Option<crate::core::url_mapping::PublicUrlMapping>,
     /// Path at which the callback endpoint is mounted (e.g. `"/callback"`).
     pub callback_path: RoutePath,
@@ -625,8 +659,9 @@ impl LoginConfig {
         /// `redirect_uri` at engine build. Omit when mounted at the origin root.
         #[builder(into)]
         base_path: Option<String>,
-        /// Validated public/ingress mapping; cannot be combined with legacy
-        /// `base_path` or `strip_prefix`. Derive the callback with `url::callback_path`.
+        /// Validated public/ingress mapping; cannot be combined with
+        /// `base_path` or `strip_prefix`. Derive the callback with
+        /// [`crate::url::callback_path`]. See [URL mapping](crate::_docs::how_to::url_mapping).
         url_mapping: Option<crate::core::url_mapping::PublicUrlMapping>,
         /// Front-proxy path prefix to strip before reconstructing the URL.
         #[builder(into)]

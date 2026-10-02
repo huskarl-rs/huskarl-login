@@ -1,21 +1,29 @@
 # Build an application session
 
-After a successful login the session driver prepares a _seed_ and the
-[`CompletedLogin`](crate::CompletedLogin); you turn them into your session type.
-How you do that depends on whether construction needs network I/O. Choose one of the four
-recipes below; they are alternatives, ordered from least to most involved. All use
-[`CookieSessionStore`](crate::CookieSessionStore); for
-[`StoreBackedSessionStore`](crate::StoreBackedSessionStore) only the seed type
-changes (to [`PersistedSessionState`](crate::PersistedSessionState)).
+Use this guide to add claims or application data to the session your adapter
+exposes to handlers. After a successful login, the session driver supplies
+framework-managed initial state (the _seed_) and a
+[`CompletedLogin`](crate::CompletedLogin). Your code combines them into the
+session type. Keep the supplied seed unchanged.
 
-Whichever recipe you choose, the session type must be `Clone` (derive it) —
-[`PendingPersist::commit`](crate::engine::PendingPersist::commit) explains why.
+Choose a recipe below according to whether construction needs network I/O.
+The examples use [`CookieSessionStore`](crate::CookieSessionStore). For
+store-backed sessions, embed [`PersistedSessionState`](crate::PersistedSessionState)
+and implement [`PersistedSession`](crate::PersistedSession) as well as
+[`Session`](crate::Session); the [external-store guide](crate::_docs::how_to::external_store)
+shows that type. Its enricher receives `PersistedSessionState` as the seed.
+
+The session type must be `Clone`. Cookie payloads also need serde serialization
+and deserialization. Enrichment runs at login; it does not automatically reload
+profile data on later requests or refreshes. Request the provider scopes needed
+for your selected claims (for example, `profile` or `email` alongside `openid`).
 
 ## No claims, no I/O — `build()`
 
-If the session type implements `From<Seed>`, finish the builder with `build()`
-and the default [`NoEnrichment`](crate::NoEnrichment) does the rest. Nothing to
-write here beyond the `From` impl.
+Use the default `CookieSession` payload and call `build()` to retain token and
+timing state plus `sub`/`sid`. For a custom type with application defaults,
+implement `From<SessionState>`; [`NoEnrichment`](crate::NoEnrichment) then builds
+it from the supplied seed.
 
 ## Map ID token claims, no I/O — `build_with_claims`
 
@@ -167,9 +175,9 @@ An error from a `UserInfo` call is a [`crate::core::Error`] and converts with
 as optional should catch its own errors and return a partially-populated
 session instead of failing the login.
 
-The same enricher type serves a store-backed deployment by implementing
-`SessionEnricher<PersistedSessionState, MySession>` — only the seed type
-changes.
+For store-backed sessions, implement
+`SessionEnricher<PersistedSessionState, MySession>` and keep that seed in the
+session's persisted-state field. The claim-mapping and I/O logic can stay the same.
 
 ## Customizing the `Session` trait
 
@@ -224,3 +232,11 @@ fn apply_refresh(&mut self, token_response: &TokenResponse, default_lifetime: Du
 }
 # }
 ```
+
+For store-backed sessions, refresh can be replayed against freshly loaded state
+during a compare-and-swap retry. Preserve unrelated application fields and keep
+external side effects out of `apply_refresh`. If custom refresh fields can
+change independently of the refresh token and whole-second expiry, commit a
+pending refresh before allowing a whole-session save: the save guard does not
+compare custom fields. See [`Session::apply_refresh`](crate::Session::apply_refresh)
+and [session updates](crate::_docs::how_to::external_store#save-a-whole-session-only-when-replacement-is-intended).

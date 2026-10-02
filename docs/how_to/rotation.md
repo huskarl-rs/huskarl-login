@@ -75,7 +75,7 @@ expiry; direct backend writes bypass these protections.
 
 When upgrading from binaries that predate these checks, identify and replace
 those writers too. See
-[Revision persistence and upgrades](crate::_docs::explanation::refresh#revision-persistence-and-upgrades).
+[Refresh migration](crate::_docs::how_to::migration#refresh-revisions-and-whole-session-saves).
 
 ## 5. Roll out and observe
 

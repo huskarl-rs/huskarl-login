@@ -53,7 +53,7 @@ For the cookie-path requirements when switching drivers, follow
 
 The default [`NoEnrichment`](crate::NoEnrichment) converts the seed straight
 into the session type via [`From`], and is what the store builders' `build()`
-finisher uses. When the session needs ID token claims or I/O to construct,
+method uses. When the session needs ID token claims or I/O to construct,
 supply a custom enricher instead — see the
 [enrichment guide](crate::_docs::how_to::enrichment).
 

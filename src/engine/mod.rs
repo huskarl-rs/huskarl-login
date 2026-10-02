@@ -382,8 +382,8 @@ pub enum LoadedSession<S> {
         /// `Set-Cookie` clears for the stale session cookies.
         clears: SetCookies,
     },
-    /// Authenticated and fully persisted — nothing is owed after the inner
-    /// handler responds.
+    /// Authenticated, with no deferred store write required. Any `set_cookies`
+    /// must still be delivered on the final response.
     Active {
         /// The loaded session.
         session: S,
@@ -768,6 +768,10 @@ pub(super) fn login_state_aad(state: &str) -> Vec<u8> {
 ///
 /// The engine validates sessions but does not decide which application routes
 /// require authentication. That policy remains in the adapter or application.
+///
+/// See [Build a login engine](crate::_docs::tutorial::getting_started) for
+/// construction and [Build a framework adapter](crate::_docs::how_to::adapter)
+/// for routing, session loading, and response handling.
 #[non_exhaustive]
 pub struct LoginEngine<SD> {
     /// The login configuration.
@@ -808,10 +812,12 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::InvalidRedirectUri`] if the grant's `redirect_uri`
-    /// is not a usable absolute URL, so the client-facing base URL cannot be
-    /// reconstructed from it. (The grant validates its `redirect_uri`, so this
-    /// is defensive.)
+    /// Returns [`ConfigError`] if configuration revalidation fails, the grant's
+    /// redirect URI is unusable or disagrees with the public URL mapping or
+    /// callback path, or the session cookie path does not cover the required
+    /// routes. Cookie paths must cover logout for both drivers and the callback
+    /// for store-backed sessions. See [Configure public and ingress
+    /// URLs](crate::_docs::how_to::url_mapping) for a mapped deployment.
     #[builder]
     pub fn new(
         mut config: LoginConfig,
@@ -829,9 +835,10 @@ where
         #[builder(into)]
         metrics_name: Option<String>,
         /// Receives errors consumed by the engine. Runs synchronously and may
-        /// run concurrently; must not block or panic. Error sources can contain
-        /// secrets or untrusted text: redact before export. No durable delivery
-        /// or security-event semantics are implied. Works without `metrics`.
+        /// run concurrently; must not block or panic. Handler panics propagate.
+        /// Error sources can contain secrets or untrusted text: redact before
+        /// export. No durable delivery or security-event semantics are implied.
+        /// Works without `metrics`. See [Observe login failures](crate::_docs::how_to::observability).
         #[builder(with = |handler: impl Fn(LoginDiagnostic<'_>) + Send + Sync + 'static| Arc::new(handler) as DiagnosticHandler)]
         diagnostics: Option<DiagnosticHandler>,
     ) -> Result<Self, ConfigError> {
@@ -961,6 +968,9 @@ where
     /// Pass the engine-side URI (including any front-proxy `strip_prefix`). The
     /// callback accepts only `GET`, logout only `POST`; other methods on these
     /// paths get `405 Method Not Allowed` with an `Allow` header.
+    /// Logout also requires the request's `Origin` to match the public origin;
+    /// preserve that header when forwarding the request. A rejected origin
+    /// produces `403 Forbidden`.
     pub async fn try_handle_login_route(
         &self,
         method: &Method,
@@ -1014,7 +1024,8 @@ where
     }
 
     /// Loads and validates the session from request cookies, refreshing the
-    /// access token if near expiry. Never redirects or errors. A successful
+    /// access token if near expiry. Returns a session state without producing
+    /// an HTTP response; store failures return [`SessionError`]. A successful
     /// refresh is persisted eagerly, yielding [`LoadedSession::Active`] (or
     /// [`LoadedSession::ActivePending`] if that persist failed).
     ///

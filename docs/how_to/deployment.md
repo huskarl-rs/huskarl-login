@@ -1,8 +1,9 @@
 # Choose and configure a deployment
 
-Use this guide for the session and provider decisions shared by Axum, Pingora,
-and custom adapters. Start with the storage choice, then configure the service
-and test the limits that configuration alone cannot remove.
+Use this guide alongside your Axum or Pingora deployment instructions, or when
+deploying a custom integration. It covers the session and provider decisions
+shared by those adapters. Start with the storage choice, then configure the
+service and verify its behavior.
 
 ## Choose session storage
 
@@ -33,12 +34,12 @@ The redirect URI configures cookie policy; it does not enable a TLS listener.
 Do not substitute an internal HTTP callback when TLS terminates at a reverse
 proxy. Forwarded headers do not replace the grant's configured public origin.
 
-For key rotation, distribute the new unsealing key to every replica before
-switching the active sealing key. Keep old unsealing keys while their cookies
-must remain usable. Never log keys, cookie values, or tokens. See
-[Cookie security](crate::_docs::explanation::cookie_security) for key rings,
-cookie paths, and size limits, and the [caching guide](crate::_docs::how_to::caching)
-for response policy.
+Follow [Rotate cookie encryption keys](crate::_docs::how_to::cookie_keys) for
+key-ring construction and rollout. For prefix rewriting, use
+[Configure public and ingress URLs](crate::_docs::how_to::url_mapping). Configure
+[idle-timeout tracking](crate::_docs::how_to::liveness) if required by your session
+policy, and follow the [caching guide](crate::_docs::how_to::caching) for response
+policy. Never log keys, cookie values, or tokens.
 
 ## Limits configuration cannot remove
 
@@ -92,4 +93,5 @@ Use staging with the intended provider policy, session sizes, and replica layout
 Record the provider reuse policy and accepted cookie-ordering limits. Monitor
 refresh rejections, persistence or revocation failures, and unexpected repeat
 logins. Use [Troubleshoot browser login](crate::_docs::how_to::troubleshooting)
-when behavior differs from the staging checks.
+when behavior differs from the staging checks, with the
+[diagnostic hooks and counters](crate::_docs::how_to::observability) enabled as needed.

@@ -2,8 +2,10 @@
 
 Start with the symptom below. Use the browser's Network panel to follow the
 redirect chain and inspect status codes, cookie names and attributes. Correlate
-that request with application logs. Avoid copying cookie values, authorization
-codes, or tokens into shared diagnostics.
+that request with your adapter's diagnostics. The engine emits no logs itself;
+[enable counters and diagnostic handling](crate::_docs::how_to::observability)
+when investigating engine or backend failures. Avoid copying cookie values,
+authorization codes, or tokens into shared diagnostics.
 
 ## Login repeatedly returns to the provider
 
@@ -26,15 +28,15 @@ continue with the refresh section below.
 
 ## The callback returns 400, 404, or 405
 
-- **400:** Check the error response and corresponding logs. A missing, expired,
+- **400:** Check the error response and `huskarl.login.complete` outcome, if metrics are enabled. A missing, expired,
   or invalid login-state cookie can invalidate the callback. Restart login from
   the application instead of replaying a bookmarked callback URL. Also check
   the provider's error response and registration settings.
 - **404:** Confirm the HTTP framework routes the callback through the login
   layer, and that its path matches `LoginConfig::callback_path`. With Axum,
   register the callback route or an appropriate fallback before adding the
-  login route layer. Behind a proxy, check `base_path` and `strip_prefix` against
-  the path the engine actually receives.
+  login route layer. Behind a proxy, check the [public/ingress mapping](crate::_docs::how_to::url_mapping)
+  against the path the engine actually receives.
 - **405:** The callback accepts GET. Check whether the provider is configured
   to POST the authorization response; use a query response for this integration.
 
@@ -84,7 +86,7 @@ Distinguish a temporary provider failure from a rejected session:
 | `RefreshUnavailable` / retryable response after token expiry | Check provider availability and retry; preserve the session |
 | Conclusive refresh rejection, such as `invalid_grant` | Check provider expiry, revocation, and concurrent refresh-token reuse |
 | `ActivePending` followed by a persistence error | Check backend availability and that the adapter commits after the handler returns, before sending the response |
-| Log reports a dropped non-empty `SetCookies` guard | Trace every adapter branch and deliver its returned cookies |
+| `huskarl.session.dropped{operation="set_cookies"}` increases | Trace every adapter branch and deliver its returned cookies |
 
 If failures correlate with multiple tabs or replicas, follow
 [Deploy refresh-token rotation safely](crate::_docs::how_to::rotation).

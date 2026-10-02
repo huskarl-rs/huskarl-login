@@ -1,4 +1,8 @@
 //! URL reconstruction and logout URL building.
+//!
+//! See [Configure public and ingress URLs](crate::_docs::how_to::url_mapping)
+//! for a worked proxy mapping. Adapters normally derive the callback with
+//! [`callback_path`] and let the engine reconstruct return URLs.
 
 use serde::Serialize;
 

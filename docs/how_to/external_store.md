@@ -20,7 +20,7 @@ Your session type embeds a [`PersistedSessionState`](crate::PersistedSessionStat
 [`PersistedSession`](crate::PersistedSession). It must be `Clone` —
 [`PendingPersist::commit`](crate::engine::PendingPersist::commit) explains why.
 Implement `From<PersistedSessionState>` if you want the plain `build()`
-finisher.
+method.
 
 ## 2. Implement atomic version checks
 
@@ -87,6 +87,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct MySession {
     persisted: PersistedSessionState,
+    compact_view: bool,
 }
 
 impl Session for MySession {
@@ -100,7 +101,9 @@ impl PersistedSession for MySession {
 }
 
 impl From<PersistedSessionState> for MySession {
-    fn from(persisted: PersistedSessionState) -> Self { Self { persisted } }
+    fn from(persisted: PersistedSessionState) -> Self {
+        Self { persisted, compact_view: false }
+    }
 }
 
 #[derive(Default)]
@@ -171,23 +174,39 @@ To mutate a stored session safely under concurrency, use
 [`update`](crate::StoreBackedSessionStore::update). It loads, applies your
 closure, and commits via `compare_and_swap`, retrying on conflict. The closure
 may run more than once against freshly-loaded state, so it must be
-**replayable** — derive the new state from the session it is given, never from a
-value captured beforehand:
+**replayable** — derive changes from the session it is given. Do not replace
+that session with a snapshot captured before the update.
+
+For the `MySession` type above, enable a display preference:
 
 ```rust
-# use huskarl_login::{PersistedSession, SessionError, StoreBackedSessionStore};
+# use huskarl_login::{ExternalSessionStore, PersistedSession, PersistedSessionState, Session, SessionError, SessionState, StoreBackedSessionStore};
 # use uuid::Uuid;
+# #[derive(Clone)]
+# struct MySession { persisted: PersistedSessionState, compact_view: bool }
+# impl Session for MySession {
+#     fn state(&self) -> &SessionState { self.persisted.state() }
+#     fn set_state(&mut self, s: SessionState) { self.persisted.set_state(s); }
+# }
+# impl PersistedSession for MySession {
+#     fn persisted(&self) -> &PersistedSessionState { &self.persisted }
+#     fn persisted_mut(&mut self) -> &mut PersistedSessionState { &mut self.persisted }
+# }
 # async fn demo<E>(store: StoreBackedSessionStore<E>, key: Uuid) -> Result<(), SessionError>
-# where E: huskarl_login::ExternalSessionStore {
+# where E: ExternalSessionStore<SessionType = MySession> {
 let updated = store
     .update(key, |session| {
-        session.persisted_mut().state.sub = Some("alice".to_owned());
+        session.compact_view = true;
     })
     .await?;
 # let _ = updated;
 # Ok(())
 # }
 ```
+
+Keep external side effects out of the replayable closure. Preserve the session
+key and framework-managed state, including identity, refresh fields, and revision.
+The update returns the committed session; it produces no cookie headers.
 
 It errors with [`Gone`](crate::SessionErrorKind) if the key is absent,
 [`Conflict`](crate::SessionErrorKind) if the retry budget is exhausted, or
@@ -201,7 +220,8 @@ Every deployment has an idle bound
 passed. For precise per-request enforcement, attach a
 [`LivenessStore`](crate::LivenessStore) with
 [`with_liveness`](crate::StoreBackedSessionStore::with_liveness). See the
-[liveness explanation](crate::_docs::explanation::liveness).
+[idle-timeout guide](crate::_docs::how_to::liveness) for backend requirements,
+attachment, and verification.
 
 ## Save a whole session only when replacement is intended
 
@@ -214,20 +234,15 @@ Use [`PendingPersist::commit`](crate::engine::PendingPersist::commit) for a
 pending refresh. Preserve refresh fields in application updates and route
 writes through the driver so its concurrency checks run.
 
-## Error classification and migration
+## Classify backend errors
 
-All four backend methods return `SessionError`. Classify transient connection
-and service failures as `SessionErrorKind::Unavailable`, and corrupt stored
-data, schema mismatches, and permanent backend failures as
-`SessionErrorKind::Store`. Classify the specific failure rather than treating
-every database error as transient. Preserve its source with
-`SessionError::new(kind, error)`; the driver and engine propagate it unchanged.
-Missing records and version conflicts still use `LoadOutcome` and `SaveOutcome`.
-
-When migrating an existing implementation, remove `type Error`, change method
-return types to `SessionError`, and explicitly map backend errors at each I/O
-or decoding boundary. `SessionDriver::load` also returns `SessionError` now;
-remove `type LoadError` from any driver test doubles.
+Return `SessionErrorKind::Unavailable` for transient connection or service
+failures, and `SessionErrorKind::Store` for corrupt data, schema mismatches, or
+permanent backend failures. Preserve the cause with `SessionError::new(kind, error)`.
+The driver propagates the classified error unchanged; missing records and version
+conflicts remain ordinary outcomes. See [`ExternalSessionStore`](crate::ExternalSessionStore)
+for the full contract and the [migration guide](crate::_docs::how_to::migration)
+when adapting an older implementation.
 
 ## Verify the backend
 

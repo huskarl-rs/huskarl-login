@@ -105,7 +105,7 @@ impl From<SessionState> for CookieSession {
 /// defaulting to [`CookieSession`]. Decryption failure is classified as an
 /// invalid presented session so the engine clears its cookies. The `Secure`
 /// attribute, the `__Host-`/`__Secure-` prefix, and the `Max-Age` clamp to the
-/// session-lifetime cap are stamped on by the engine via
+/// session-lifetime cap are applied by the engine through
 /// [`SessionDriver::apply_session_policy`],
 /// not configured here.
 ///
@@ -117,6 +117,31 @@ impl From<SessionState> for CookieSession {
 /// bounded lifetime with this store — see [the session
 /// model](crate::_docs::explanation::session_model). For revocation, use
 /// [`StoreBackedSessionStore`](crate::StoreBackedSessionStore).
+///
+/// # Example
+///
+/// Supply a sealer backed by your configured key. The default payload retains
+/// token and timing state plus `sub`/`sid`; use
+/// [an application session](crate::_docs::how_to::enrichment) to retain other claims.
+///
+/// ```
+/// use huskarl_login::{
+///     CookieSessionStore, InvalidCookieName, core::crypto::seal::AeadSealerUnsealer,
+/// };
+///
+/// fn session_store(
+///     sealer: impl AeadSealerUnsealer + 'static,
+/// ) -> Result<CookieSessionStore, InvalidCookieName> {
+///     Ok(CookieSessionStore::builder()
+///         .sealer(sealer)
+///         .cookie_name("session".parse()?)
+///         .build())
+/// }
+/// ```
+///
+/// Pass the resulting store to [`LoginEngine::builder`](crate::engine::LoginEngine::builder).
+/// See [Rotate cookie encryption keys](crate::_docs::how_to::cookie_keys) for
+/// a sealer that can read cookies across key changes.
 pub struct CookieSessionStore<C = CookieSession> {
     /// Shared cookie-sealing machinery — see [`CookieSealer`].
     sealer: CookieSealer,
@@ -135,7 +160,7 @@ impl<C> CookieSessionStore<C> {
     /// Creates a new cookie session store. Finish the builder with `build()`
     /// (uses [`NoEnrichment`]; requires `C: From<SessionState>`) or
     /// `build_with_enricher(…)` to attach an async [`SessionEnricher`].
-    #[builder(state_mod(name = "cookie_store_builder"), finish_fn(vis = "", name = build_internal))]
+    #[builder(finish_fn(vis = "", name = build_internal))]
     pub fn new(
         #[builder(finish_fn)] enricher: Box<dyn SessionEnricher<SessionState, C>>,
         #[builder(with = |sealer: impl AeadSealerUnsealer + 'static| Arc::new(sealer) as Arc<dyn AeadSealerUnsealer>)]
@@ -184,7 +209,7 @@ impl<C> CookieSessionStore<C> {
     }
 }
 
-impl<C, S: cookie_store_builder::IsComplete> CookieSessionStoreBuilder<C, S> {
+impl<C, S: cookie_session_store_builder::IsComplete> CookieSessionStoreBuilder<C, S> {
     /// Finishes the builder with the default [`NoEnrichment`] enricher, which
     /// converts the [`SessionState`] seed into the payload via `From`.
     #[must_use]

@@ -7,7 +7,7 @@ the session key for [`StoreBackedSessionStore`](crate::StoreBackedSessionStore).
 ## `Secure` and the name prefixes
 
 Cookie security is derived from a single source of truth — the grant's
-`redirect_uri` scheme — and stamped onto the store by the engine, so session
+`redirect_uri` scheme — and applied to the store by the engine, so session
 cookies and the login-state cookie always share one policy. An `https`
 redirect URI yields `Secure` cookies, prefixed `__Host-` for host-wide cookies
 (`Path=/`; the browser then guarantees the cookie is host-locked, path-`/`,
@@ -116,6 +116,9 @@ Sealing uses one active key; unsealing accepts several. The cipher can carry a
 key identity (`kid`), emitted in a sidecar cookie next to the sealed value. On
 read the `kid` is a **hint, not a filter**: it picks which key to try first, but
 a value that names the wrong (or a forged) key still falls back to trying the
-others, so a cookie sealed before a rotation keeps working. Because the sidecar
-is client-supplied, a `kid` that reaches a metrics label is normalized — a
-forged value collapses to `unknown` rather than inflating label cardinality.
+others, so a cookie sealed before a rotation keeps working while its key remains
+available. Decrypt metrics omit the client-supplied key ID; encrypt metrics use
+the identity returned by the configured sealer.
+
+For key-ring construction, rollout order, and retirement checks, follow
+[Rotate cookie encryption keys](crate::_docs::how_to::cookie_keys).

@@ -62,8 +62,8 @@ a dropped clear keeps re-presenting a dead session.
 
 Rust cannot flag a `LoadedSession::Active { session, .. }` pattern that
 discards the cookies at compile time, so the engine hands them out wrapped in
-[`SetCookies`](crate::engine::SetCookies) — a drop guard that increments the optional dropped-work counter when a
-non-empty value is dropped without being consumed into a response.
+[`SetCookies`](crate::engine::SetCookies) — a drop guard that counts unconsumed,
+non-empty cookie updates when the `metrics` feature is enabled.
 
 ## Transient vs conclusive failure
 
@@ -121,26 +121,23 @@ refresh state server-side could allow stale cookies to recover, at the cost of
 making refresh handling stateful. See the
 [rotation deployment guide](crate::_docs::how_to::rotation).
 
-## Revision persistence and upgrades
+## Whole-session replacement and refresh
 
-Older serialized sessions default their refresh revision to zero. Store-backed
-whole-session saves load the current record and compare the refresh revision,
-refresh token, and expiry. A mismatch returns `Conflict`; a match commits via
-CAS. A CAS conflict reloads and repeats all three checks. This prevents publishing
-a pending refresh under its old revision as well as overwriting a committed
-refresh. Expiry is compared at its serialized whole-second precision and the
-stored value is preserved. Pending refreshes must use `PendingPersist::commit`.
-Application fields still use last-writer-wins semantics within the same refresh
-generation; prefer `StoreBackedSessionStore::update` for application mutations.
+A refresh revision and the backend's write version protect different things.
+The backend version detects any concurrent write, including application updates.
+The refresh revision identifies which token generation a response belongs to.
+This lets a refresh merge into the latest application state while preventing a
+delayed token response from replacing a newer generation.
 
-Application updates must preserve the refresh fields and revision. Direct writes
-through the low-level backend API bypass the driver's checks. Pre-fix binaries
-also bypass these checks; this compatibility caveat applies when upgrading from
-those binaries, not to every subsequent deployment of compliant writers.
+A whole-session save has different semantics: it replaces application fields.
+Checking only its refresh revision would allow a failed, still-pending refresh
+to be published under the old revision. The driver therefore also compares the
+refresh token and expiry, rejecting a mismatch. These checks protect token
+state; application fields remain last-writer-wins within a generation.
 
-Direct callers of `SessionDriver::apply_refresh_and_save` and adapter tests
-using `PendingPersist::builder` must now supply the revision observed before the
-exchange, including on retries. Do not reconstruct it from the already-refreshed
-in-memory session. A lost write acknowledgement can mean the original commit
-succeeded: the retry observes the advanced revision and adopts stored state
-without applying the response again.
+For mutation procedures and exact contracts, see
+[Update application fields](crate::_docs::how_to::external_store#update-application-fields),
+[`SessionDriver::save`](crate::SessionDriver::save), and
+[`PendingPersist::commit`](crate::engine::PendingPersist::commit).
+For older integrations and stored sessions, see the
+[migration guide](crate::_docs::how_to::migration).

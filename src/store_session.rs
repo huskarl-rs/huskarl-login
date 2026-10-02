@@ -250,11 +250,15 @@ const UPDATE_MAX_ATTEMPTS: u32 = 5;
 ///
 /// The session is built after login by a [`SessionEnricher`] from the
 /// [`PersistedSessionState`] seed; `build()` uses [`NoEnrichment`],
-/// `build_with_enricher(…)` supplies a custom one. The engine stamps on the
+/// `build_with_enricher(…)` supplies a custom one. The engine sets the
 /// `Secure` attribute and `__Host-` prefix, so this store takes no `secure`
 /// setting. Prefer this driver over [`CookieSessionStore`](crate::CookieSessionStore)
 /// when sessions are large or need server-side revocation, liveness tracking,
 /// or compare-and-swap updates.
+///
+/// See [Implement an external session store](crate::_docs::how_to::external_store)
+/// for a complete backend and builder example, and
+/// [Add idle-timeout tracking](crate::_docs::how_to::liveness) for liveness wiring.
 pub struct StoreBackedSessionStore<E: ExternalSessionStore> {
     external: E,
     enricher: Box<dyn SessionEnricher<PersistedSessionState, E::SessionType>>,
@@ -277,7 +281,7 @@ pub struct StoreBackedSessionStore<E: ExternalSessionStore> {
 impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     /// Creates a new store-backed session store. Finish with `build()` (uses
     /// [`NoEnrichment`]) or `build_with_enricher(…)`.
-    #[builder(state_mod(name = "store_builder"), finish_fn(vis = "", name = build_internal))]
+    #[builder(finish_fn(vis = "", name = build_internal))]
     pub fn new(
         #[builder(finish_fn)] enricher: Box<
             dyn SessionEnricher<PersistedSessionState, E::SessionType>,
@@ -315,7 +319,9 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     }
 }
 
-impl<E: ExternalSessionStore, S: store_builder::IsComplete> StoreBackedSessionStoreBuilder<E, S> {
+impl<E: ExternalSessionStore, S: store_backed_session_store_builder::IsComplete>
+    StoreBackedSessionStoreBuilder<E, S>
+{
     /// Finishes the builder with [`NoEnrichment`] (`From<PersistedSessionState>`).
     #[must_use]
     pub fn build(self) -> StoreBackedSessionStore<E>
@@ -357,7 +363,8 @@ impl<E: ExternalSessionStore, S: store_builder::IsComplete> StoreBackedSessionSt
 impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     /// Attach server-side liveness (idle-timeout) tracking, backed by the given
     /// [`LivenessStore`] and configured by `config`. Returns `self`. See
-    /// [`crate::liveness`] for the fail-open / monotonic contract.
+    /// [`crate::liveness`] for the fail-open / monotonic contract and
+    /// [Add idle-timeout tracking](crate::_docs::how_to::liveness) for an example.
     #[must_use]
     pub fn with_liveness(
         mut self,
@@ -385,7 +392,16 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     ///
     /// `mutate` may run more than once against freshly-loaded state, so it must
     /// be replayable: compute the new state from the session it is given, never
-    /// from a value captured before the load.
+    /// from a value captured before the load. Keep external side effects out
+    /// of the closure, since it can run again after a conflict.
+    ///
+    /// Change application fields only. Preserve the session key and the
+    /// framework-managed [`SessionState`], including refresh token, expiry,
+    /// and revision. This method does not validate those fields after the
+    /// closure runs. Use [`PendingPersist::commit`](crate::engine::PendingPersist::commit)
+    /// for a pending refresh. No browser cookies are returned by an update.
+    /// See [Update application fields](crate::_docs::how_to::external_store#update-application-fields)
+    /// for an example.
     ///
     /// # Errors
     ///
@@ -409,7 +425,8 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     /// Like [`update`](Self::update), for mutations that can fail: `mutate`
     /// returning `Err` aborts the update — nothing is written — and the error
     /// is returned as-is. The same replayability contract applies: `mutate`
-    /// may run more than once against freshly-loaded state.
+    /// may run more than once against freshly-loaded state. Preserve the
+    /// session key and framework-managed state as required by [`update`](Self::update).
     ///
     /// # Errors
     ///
@@ -736,7 +753,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     /// before a new login's cookie overwrites the pointer: a fresh login
     /// supersedes the old session, so an exfiltrated copy of its pointer must
     /// not keep working until the storage deadline reaps it. Best-effort:
-    /// failures are logged and must not fail the login.
+    /// failures are counted when metrics are enabled and must not fail the login.
     async fn delete_superseded_session(&self, headers: &http::HeaderMap) {
         let old_key = match self.read_pointer_cookie(headers).await {
             DriverLoad::Valid(key) => key,
