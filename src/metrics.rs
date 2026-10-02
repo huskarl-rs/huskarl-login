@@ -63,6 +63,13 @@
 //! armed guards can count a drop. No counter proves browser receipt, cookie
 //! acceptance, durable audit delivery, or successful upstream response delivery.
 //!
+//! `PendingPersist::commit` disarms its guard when first polled, before awaiting
+//! the store. Cancellation during that await emits no `session.dropped` count
+//! and yields no result for an adapter's completed-operation counter. The backend
+//! may already have committed. Dropping the commit future before its first poll
+//! still drops an armed guard. The dropped-work counter therefore does not count
+//! every interrupted or unsuccessful persistence operation.
+//!
 //! # Cardinality
 //!
 //! `name` and `cookie` come from bounded local configuration. Names must not be

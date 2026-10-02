@@ -570,6 +570,14 @@ impl<S> PendingPersist<S> {
     ///
     /// [`StoreBackedSessionStore::update`]: crate::StoreBackedSessionStore::update
     ///
+    /// # Cancellation
+    ///
+    /// Once polled, this future disarms the dropped-persist guard before awaiting
+    /// the store. Cancellation during that await emits neither a dropped-persist
+    /// count nor a completed-operation result. The backend may already have
+    /// committed; cancellation does not establish whether persistence succeeded.
+    /// Dropping an unpolled commit future still drops an armed guard.
+    ///
     /// # Errors
     ///
     /// Returns [`SessionError`] if the session store fails to write.

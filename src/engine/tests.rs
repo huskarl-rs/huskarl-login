@@ -269,6 +269,7 @@ struct MockSessionStore {
     refresh_revisions: Mutex<Vec<u64>>,
     revoke_called: Mutex<bool>,
     fail_save: bool,
+    suspend_save: bool,
     gone_on_save: bool,
     fail_revoke: bool,
     invalid_load: Option<crate::InvalidSessionReason>,
@@ -303,6 +304,7 @@ impl MockSessionStore {
             refresh_revisions: Mutex::new(Vec::new()),
             revoke_called: Mutex::new(false),
             fail_save: false,
+            suspend_save: false,
             gone_on_save: false,
             fail_revoke: false,
             invalid_load: None,
@@ -345,6 +347,7 @@ impl MockSessionStore {
             refresh_revisions: Mutex::new(Vec::new()),
             revoke_called: Mutex::new(false),
             fail_save: false,
+            suspend_save: false,
             gone_on_save: false,
             fail_revoke: false,
             invalid_load: None,
@@ -463,6 +466,9 @@ impl SessionDriver for MockSessionStore {
             return Err(SessionError::new(SessionErrorKind::Gone, StoreSaveError));
         }
         *self.save_called.lock().unwrap() = true;
+        if self.suspend_save {
+            std::future::pending::<()>().await;
+        }
         Ok(vec![HeaderValue::from_static(MOCK_SAVE_COOKIE)])
     }
     async fn check_liveness(
@@ -1822,6 +1828,52 @@ async fn commit_calls_store_save() {
     let set_cookies = pending.commit(&e, &api_headers()).await.unwrap();
     assert!(e.session_store.save_called());
     assert_ne!(set_cookies.into_headers(), [] as [HeaderValue; 0]);
+}
+
+#[test]
+fn cancelled_commit_counts_only_an_unpolled_persist_as_dropped() {
+    use std::{
+        sync::atomic::AtomicUsize,
+        task::{Context, Waker},
+    };
+
+    for poll_commit in [false, true] {
+        let probe = Arc::new(AtomicUsize::new(0));
+        let ((), counters) = crate::test_support::with_metrics(async {
+            let store = MockSessionStore {
+                suspend_save: true,
+                ..MockSessionStore::empty()
+            };
+            let e = engine(store).await;
+            let pending = PendingPersist::builder()
+                .session(valid_session())
+                .token_response(token_response_fixture())
+                .expected_refresh_revision(0)
+                .build()
+                .with_drop_probe(probe.clone());
+            let headers = api_headers();
+            let mut commit = Box::pin(pending.commit(&e, &headers));
+            if poll_commit {
+                let mut context = Context::from_waker(Waker::noop());
+                assert!(commit.as_mut().poll(&mut context).is_pending());
+            }
+            assert_eq!(e.session_store.save_called(), poll_commit);
+            drop(commit);
+        });
+        assert_eq!(probe.load(Ordering::Relaxed), usize::from(!poll_commit));
+        #[cfg(feature = "metrics")]
+        assert_eq!(
+            crate::test_support::counter_value(
+                &counters,
+                "huskarl.session.dropped",
+                &[("operation", "persist")]
+            ),
+            u64::from(!poll_commit)
+        );
+        if poll_commit || !cfg!(feature = "metrics") {
+            assert!(counters.is_empty());
+        }
+    }
 }
 
 #[test]
