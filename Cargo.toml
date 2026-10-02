@@ -5,7 +5,6 @@ edition = "2024"
 rust-version = "1.92"
 description = "OAuth2/OIDC login flow helpers for huskarl."
 repository = "https://github.com/huskarl-rs/huskarl-login"
-homepage = "https://github.com/huskarl-rs/huskarl-login"
 documentation = "https://docs.rs/huskarl-login"
 license = "MIT OR Apache-2.0"
 keywords = ["oauth2", "oidc", "security", "authentication", "login"]
