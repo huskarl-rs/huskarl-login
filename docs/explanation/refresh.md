@@ -129,7 +129,7 @@ also bypass these checks; this compatibility caveat applies when upgrading from
 those binaries, not to every subsequent deployment of compliant writers.
 
 Direct callers of `SessionDriver::apply_refresh_and_save` and adapter tests
-using `PendingPersist::new` must now supply the revision observed before the
+using `PendingPersist::builder` must now supply the revision observed before the
 exchange, including on retries. Do not reconstruct it from the already-refreshed
 in-memory session. A lost write acknowledgement can mean the original commit
 succeeded: the retry observes the advanced revision and adopts stored state

@@ -54,7 +54,7 @@
 //! | --- | --- |
 //! | `huskarl.login.handled_failure` | `operation`: snake-case [`DiagnosticOperation`](crate::engine::DiagnosticOperation) variant. Each error consumed by the engine at that operation, including logout failures and eager-persist fallback. No successful-operation denominator. |
 //! | `huskarl.session.refresh_retry` | `outcome`: `scheduled` before retry sleep, or `delay_exceeded` when the requested delay exceeds the in-request budget. Attempts exhausted or conclusively rejected do not enter this counter. |
-//! | `huskarl.session.dropped` | `operation`: `set_cookies` or `persist`. One armed guard dropped outside panic unwinding, irrespective of cookie count. Explicit `discard`/`abandon` disarms it. Engine-produced guards retain their engine name; fabricated `PendingPersist::new` guards are unnamed. |
+//! | `huskarl.session.dropped` | `operation`: `set_cookies` or `persist`. One armed guard dropped outside panic unwinding, irrespective of cookie count. Explicit `discard`/`abandon` disarms it. Engine-produced guards retain their engine name; fabricated `PendingPersist::builder` guards are unnamed. |
 //!
 //! These counters have distinct populations: one request can increment several.
 //! Framework adapters own their separate load/persist/revoke and response-write

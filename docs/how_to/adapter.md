@@ -239,9 +239,9 @@ hands out a shared handle that never needs to be returned:
 [`commit`](crate::engine::PendingPersist::commit) proceeds on a clone if a
 handle is still alive. The arm is also the easiest to leave untested, since it
 only arises when an eager persist fails — which is why
-[`PendingPersist::new`](crate::engine::PendingPersist::new) is public: adapter
+[`PendingPersist::builder`](crate::engine::PendingPersist::builder) is public: adapter
 tests can fabricate the deferred-persist path without arranging a failing
-store. Supply its third argument, the expected refresh revision from before
+store. Set `expected_refresh_revision` to the revision from before
 the exchange; the retry must retain that value even when in-memory state changes.
 
 ## Speculative loads and frames

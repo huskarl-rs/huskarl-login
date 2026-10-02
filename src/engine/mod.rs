@@ -486,6 +486,7 @@ pub struct PendingPersist<S> {
     drop_probe: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
+#[bon::bon]
 impl<S> PendingPersist<S> {
     fn with_metrics_name(mut self, name: Option<&Arc<str>>) -> Self {
         #[cfg(feature = "metrics")]
@@ -517,6 +518,7 @@ impl<S> PendingPersist<S> {
     /// without arranging a failing store.
     /// `expected_refresh_revision` must be the revision from before exchange,
     /// not one inferred from the already-refreshed session.
+    #[builder]
     pub fn new(session: S, token_response: TokenResponse, expected_refresh_revision: u64) -> Self {
         Self {
             session: Arc::new(session),
@@ -884,13 +886,13 @@ where
         // `session_lifetime` bound, so session cookies share one
         // `secure`/`__Host-` policy and no cookie outlives the session cap.
         let mut session_store = session_store;
-        let session_policy = crate::session::SessionPolicy::new(
-            secure,
-            config.session_lifetime.bound(),
-            metrics_name.as_deref(),
-            config.browser_callback_path.clone(),
-            config.browser_logout_path.clone(),
-        );
+        let session_policy = crate::session::SessionPolicy::builder()
+            .secure(secure)
+            .maybe_max_lifetime(config.session_lifetime.bound())
+            .maybe_metrics_name(metrics_name.as_deref())
+            .browser_callback_path(config.browser_callback_path.clone())
+            .maybe_browser_logout_path(config.browser_logout_path.clone())
+            .build();
         session_store.apply_session_policy(&session_policy)?;
         // Default here rather than in each adapter, so every adapter gets the
         // shared-key setup (and its safety argument) without reimplementing it.
@@ -1225,12 +1227,12 @@ where
                     Err(e) => {
                         self.diagnose(DiagnosticOperation::EagerPersist, &e);
                         LoadedSession::ActivePending {
-                            pending: PendingPersist::new(
-                                session,
-                                token_response,
-                                expected_refresh_revision,
-                            )
-                            .with_metrics_name(self.metrics_name.as_ref()),
+                            pending: PendingPersist::builder()
+                                .session(session)
+                                .token_response(token_response)
+                                .expected_refresh_revision(expected_refresh_revision)
+                                .build()
+                                .with_metrics_name(self.metrics_name.as_ref()),
                         }
                     }
                 }

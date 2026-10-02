@@ -88,7 +88,9 @@ impl InvalidSessionReason {
     }
 }
 
+#[bon::bon]
 impl SessionPolicy {
+    #[builder]
     pub(crate) fn new(
         secure: bool,
         max_lifetime: Option<std::time::Duration>,

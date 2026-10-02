@@ -265,9 +265,11 @@ pub(crate) struct CookieSealer {
     pub(crate) metrics_name: Option<String>,
 }
 
+#[bon::bon]
 impl CookieSealer {
     /// Stores `sealer` and derives a secure-by-default cookie name; `secure` is
     /// re-stamped later via [`apply_secure`](Self::apply_secure).
+    #[builder]
     pub(crate) fn new(
         sealer: Arc<dyn AeadSealerUnsealer>,
         cookie_name: CookieName,

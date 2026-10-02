@@ -122,7 +122,11 @@ pub(crate) fn request_cookies(set_cookies: &[HeaderValue]) -> HeaderMap {
 
 /// Engine session policy with the common secure, root-scoped test defaults.
 pub(crate) fn test_session_policy(max_lifetime: Option<std::time::Duration>) -> SessionPolicy {
-    SessionPolicy::new(true, max_lifetime, None, crate::RoutePath::root(), None)
+    SessionPolicy::builder()
+        .secure(true)
+        .maybe_max_lifetime(max_lifetime)
+        .browser_callback_path(crate::RoutePath::root())
+        .build()
 }
 
 /// Counters captured by [`with_metrics`]: `(name, sorted (label, value)

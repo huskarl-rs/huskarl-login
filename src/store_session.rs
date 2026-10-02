@@ -297,7 +297,12 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         Self {
             external,
             enricher,
-            sealer: CookieSealer::new(sealer, cookie_name, cookie_path, max_age),
+            sealer: CookieSealer::builder()
+                .sealer(sealer)
+                .cookie_name(cookie_name)
+                .cookie_path(cookie_path)
+                .max_age(max_age)
+                .build(),
             liveness: None,
             max_lifetime: None,
             retention_idle_timeout: crate::liveness::DEFAULT_IDLE_TIMEOUT,
@@ -1099,13 +1104,12 @@ mod tests {
             .build();
 
         let error = store
-            .apply_session_policy(&SessionPolicy::new(
-                true,
-                None,
-                None,
-                "/oauth/callback".parse().unwrap(),
-                None,
-            ))
+            .apply_session_policy(
+                &SessionPolicy::builder()
+                    .secure(true)
+                    .browser_callback_path("/oauth/callback".parse().unwrap())
+                    .build(),
+            )
             .unwrap_err();
 
         assert!(matches!(
@@ -3051,13 +3055,13 @@ mod tests {
                 .cookie_path("/".parse().unwrap())
                 .build();
             store
-                .apply_session_policy(&SessionPolicy::new(
-                    true,
-                    None,
-                    Some("tenant-b"),
-                    "/".parse().unwrap(),
-                    None,
-                ))
+                .apply_session_policy(
+                    &SessionPolicy::builder()
+                        .secure(true)
+                        .metrics_name("tenant-b")
+                        .browser_callback_path("/".parse().unwrap())
+                        .build(),
+                )
                 .unwrap();
             store
                 .pointer_cookie_headers(session.persisted.session_key)

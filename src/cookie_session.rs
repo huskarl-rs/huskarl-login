@@ -171,7 +171,12 @@ impl<C> CookieSessionStore<C> {
         max_chunks: usize,
     ) -> Self {
         Self {
-            sealer: CookieSealer::new(sealer, cookie_name, cookie_path, max_age),
+            sealer: CookieSealer::builder()
+                .sealer(sealer)
+                .cookie_name(cookie_name)
+                .cookie_path(cookie_path)
+                .max_age(max_age)
+                .build(),
             enricher,
             max_chunks: max_chunks.max(1),
             max_lifetime: None,
@@ -625,23 +630,22 @@ mod tests {
             .cookie_path("/app".parse().unwrap())
             .build();
         store
-            .apply_session_policy(&SessionPolicy::new(
-                true,
-                None,
-                None,
-                "/callback".parse().unwrap(),
-                None,
-            ))
+            .apply_session_policy(
+                &SessionPolicy::builder()
+                    .secure(true)
+                    .browser_callback_path("/callback".parse().unwrap())
+                    .build(),
+            )
             .unwrap();
 
         let logout_error = store
-            .apply_session_policy(&SessionPolicy::new(
-                true,
-                None,
-                None,
-                "/app/callback".parse().unwrap(),
-                Some("/logout".parse().unwrap()),
-            ))
+            .apply_session_policy(
+                &SessionPolicy::builder()
+                    .secure(true)
+                    .browser_callback_path("/app/callback".parse().unwrap())
+                    .browser_logout_path("/logout".parse().unwrap())
+                    .build(),
+            )
             .unwrap_err();
         assert!(matches!(
             logout_error,
@@ -1029,18 +1033,18 @@ mod tests {
         // cookie context cannot be unsealed by another that shares the AEAD key
         // but uses a different cookie name.
         let sealer: Arc<dyn AeadSealerUnsealer> = Arc::new(AeadV1Sealer::new(test_cipher().await));
-        let sealer_a = CookieSealer::new(
-            sealer.clone(),
-            "app_a".parse().unwrap(),
-            "/".parse().unwrap(),
-            DEFAULT_COOKIE_MAX_AGE,
-        );
-        let sealer_b = CookieSealer::new(
-            sealer.clone(),
-            "app_b".parse().unwrap(),
-            "/".parse().unwrap(),
-            DEFAULT_COOKIE_MAX_AGE,
-        );
+        let sealer_a = CookieSealer::builder()
+            .sealer(sealer.clone())
+            .cookie_name("app_a".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .max_age(DEFAULT_COOKIE_MAX_AGE)
+            .build();
+        let sealer_b = CookieSealer::builder()
+            .sealer(sealer.clone())
+            .cookie_name("app_b".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .max_age(DEFAULT_COOKIE_MAX_AGE)
+            .build();
 
         let output = sealer_a
             .cipher

@@ -1814,7 +1814,11 @@ async fn commit_calls_store_save() {
     let (session, _) = expect_active(loaded);
     // The public constructor: what adapter tests use to fabricate the
     // deferred-persist path without arranging a failing store.
-    let pending = PendingPersist::new(session, token_response_fixture(), 0);
+    let pending = PendingPersist::builder()
+        .session(session)
+        .token_response(token_response_fixture())
+        .expected_refresh_revision(0)
+        .build();
     let set_cookies = pending.commit(&e, &api_headers()).await.unwrap();
     assert!(e.session_store.save_called());
     assert_ne!(set_cookies.into_headers(), [] as [HeaderValue; 0]);
@@ -1828,7 +1832,11 @@ fn pending_persist_drop_guard_detects_a_dropped_persist() {
     };
 
     let probe = Arc::new(AtomicUsize::new(0));
-    let dropped = PendingPersist::new(valid_session(), token_response_fixture(), 0)
+    let dropped = PendingPersist::builder()
+        .session(valid_session())
+        .token_response(token_response_fixture())
+        .expected_refresh_revision(0)
+        .build()
         .with_drop_probe(Arc::clone(&probe));
     drop(dropped);
     assert_eq!(
@@ -1850,7 +1858,11 @@ async fn pending_persist_drop_guard_stays_silent_for_defused_guards() {
     // `commit` defuses the guard (consuming the returned cookies keeps the
     // `SetCookies` guard quiet too — this test is about the persist guard).
     let e = engine(MockSessionStore::with_session(valid_session())).await;
-    let committed = PendingPersist::new(valid_session(), token_response_fixture(), 0)
+    let committed = PendingPersist::builder()
+        .session(valid_session())
+        .token_response(token_response_fixture())
+        .expected_refresh_revision(0)
+        .build()
         .with_drop_probe(Arc::clone(&probe));
     let _cookies = committed
         .commit(&e, &api_headers())
@@ -1859,7 +1871,11 @@ async fn pending_persist_drop_guard_stays_silent_for_defused_guards() {
         .into_headers();
 
     // So does `abandon`, the explicit non-commit verb.
-    let abandoned = PendingPersist::new(valid_session(), token_response_fixture(), 0)
+    let abandoned = PendingPersist::builder()
+        .session(valid_session())
+        .token_response(token_response_fixture())
+        .expected_refresh_revision(0)
+        .build()
         .with_drop_probe(Arc::clone(&probe));
     abandoned.abandon();
 
@@ -1867,7 +1883,11 @@ async fn pending_persist_drop_guard_stays_silent_for_defused_guards() {
     // persist is collateral of the panic, not a separate bug to report.
     let unwind_probe = Arc::clone(&probe);
     let result = std::panic::catch_unwind(move || {
-        let _armed = PendingPersist::new(valid_session(), token_response_fixture(), 0)
+        let _armed = PendingPersist::builder()
+            .session(valid_session())
+            .token_response(token_response_fixture())
+            .expected_refresh_revision(0)
+            .build()
             .with_drop_probe(unwind_probe);
         panic!("handler panic");
     });
@@ -3430,7 +3450,11 @@ fn dropped_work_is_named_and_explicit_disposal_is_silent() {
         let _ = engine.set_cookies(cookies()).into_headers();
         drop(engine.set_cookies(Vec::new()));
         let pending = || {
-            PendingPersist::new((), token_response_fixture(), 0)
+            PendingPersist::builder()
+                .session(())
+                .token_response(token_response_fixture())
+                .expected_refresh_revision(0)
+                .build()
                 .with_metrics_name(engine.metrics_name.as_ref())
         };
         drop(pending());
@@ -3469,12 +3493,12 @@ fn disabled_metrics_emit_nothing_for_login_and_cookie_operations() {
                 &"/callback?error=untrusted".parse().unwrap(),
             )
             .await;
-        let sealer = crate::cookie::CookieSealer::new(
-            Arc::new(test_sealer().await),
-            "session".parse().unwrap(),
-            "/".parse().unwrap(),
-            Duration::from_secs(60),
-        );
+        let sealer = crate::cookie::CookieSealer::builder()
+            .sealer(Arc::new(test_sealer().await))
+            .cookie_name("session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
+            .max_age(Duration::from_secs(60))
+            .build();
         sealer.record_encrypt(Some("configured-key"));
         sealer.record_decrypt(&crate::metrics::DecryptResult::DecryptFailed);
     });
