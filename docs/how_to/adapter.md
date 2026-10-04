@@ -273,11 +273,14 @@ Each rejection is still one wasted request, though, and only the application
 can prevent that — there is no response header that forbids future prefetches.
 Same-site prefetching of protected pages is almost always app-authored
 (`<link rel="prefetch">`, speculation rules, framework link components that
-prefetch by default, like Next.js `<Link>`), so exclude the authenticated area
-from those hints — `prefetch={false}`, or a speculation-rules `where` clause
-such as `{ "not": { "href_matches": "/app/*" } }`. The exception is Chrome's
+prefetch by default, like Next.js `<Link>`). The exception is Chrome's
 address-bar prerendering, which has no server-side opt-out; the `Sec-Purpose`
 rejection is the backstop there.
+
+When configuring the application that uses the adapter, exclude the
+authenticated area from prefetch hints. Use `prefetch={false}` or a
+speculation-rules `where` clause such as
+`{ "not": { "href_matches": "/app/*" } }`.
 
 ## Serving the session on public routes
 

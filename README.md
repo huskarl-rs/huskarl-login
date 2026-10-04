@@ -41,6 +41,8 @@ authorization code ─▶ CompletedLogin ─┐
                      managed state ───┘
 ```
 
+## Choose session storage
+
 Choose [`CookieSessionStore`](https://docs.rs/huskarl-login/latest/huskarl_login/cookie_session/struct.CookieSessionStore.html) to keep the encrypted session in the browser.
 Choose [`StoreBackedSessionStore`](https://docs.rs/huskarl-login/latest/huskarl_login/store_session/struct.StoreBackedSessionStore.html) to keep only an encrypted lookup key in
 the browser and store the session through an [`ExternalSessionStore`](https://docs.rs/huskarl-login/latest/huskarl_login/store_session/trait.ExternalSessionStore.html).

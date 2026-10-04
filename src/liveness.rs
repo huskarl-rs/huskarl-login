@@ -60,7 +60,7 @@ pub trait LivenessStore: MaybeSendSync {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct LivenessConfig {
-    /// Kill the session after this much inactivity. Defaults to
+    /// Inactivity duration after which the engine expires the session. Defaults to
     /// [`DEFAULT_IDLE_TIMEOUT`]. Also the activity window from which the
     /// driver derives external-store record deadlines.
     pub idle_timeout: Duration,
@@ -83,7 +83,7 @@ impl LivenessConfig {
     /// `touch_min_interval` is not less than `idle_timeout`.
     #[builder]
     pub fn new(
-        /// Kill the session after this much inactivity. Defaults to
+        /// Inactivity duration after which the engine expires the session. Defaults to
         /// [`DEFAULT_IDLE_TIMEOUT`] (30 days).
         idle_timeout: Option<Duration>,
         /// Minimum interval between liveness writes. Must be less than

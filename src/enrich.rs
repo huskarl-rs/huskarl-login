@@ -17,22 +17,31 @@ use crate::{
 /// Builds an application session from framework-managed state and a completed
 /// login.
 ///
-/// Pass an enricher to a session store builder's
-/// `build_with_enricher` method. It can own clients (an OIDC `UserInfo`
-/// client, a database pool) and await them while building the session. `Seed`
-/// is [`SessionState`](crate::SessionState) for cookie sessions or
-/// [`PersistedSessionState`](crate::PersistedSessionState) for store-backed
-/// sessions. Preserve the seed in the session you return so the engine can
-/// continue to enforce token and lifetime policy.
-///
-/// The trait is dyn-capable (`Box<dyn SessionEnricher<Seed, S>>`); write the
-/// body as `Box::pin(async move { ... })`. A failed enrichment fails session
-/// creation (the callback responds 500). For the common no-I/O case — mapping
-/// a few ID token claims — pass a synchronous closure to the builder's
-/// `build_with_claims` method instead of implementing this trait.
-///
 /// Enrichment runs when a session is created after login, not on each request
-/// or token refresh. To update token-derived fields during refresh, implement
+/// or token refresh. A failed enrichment fails session creation (the callback
+/// responds 500).
+///
+/// # Using an enricher
+///
+/// Pass an enricher to a session store builder's `build_with_enricher` method.
+/// For the common no-I/O case — mapping a few ID token claims — pass a
+/// synchronous closure to the builder's `build_with_claims` method instead of
+/// implementing this trait.
+///
+/// # Implementing an enricher
+///
+/// An enricher can own clients (an OIDC `UserInfo` client, a database pool) and
+/// await them while building the session. `Seed` is
+/// [`SessionState`](crate::SessionState) for cookie sessions or
+/// [`PersistedSessionState`](crate::PersistedSessionState) for store-backed
+/// sessions.
+///
+/// Preserve the seed in the session you return so the engine can continue to
+/// enforce token and lifetime policy. The trait is dyn-capable
+/// (`Box<dyn SessionEnricher<Seed, S>>`); write the `build_session` body as
+/// `Box::pin(async move { ... })`.
+///
+/// To update token-derived fields during refresh, implement
 /// [`Session::apply_refresh`](crate::Session::apply_refresh).
 ///
 /// # Example

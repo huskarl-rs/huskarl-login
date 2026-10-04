@@ -19,8 +19,8 @@ The prefix is *always* derived — [`CookieName`](crate::CookieName) rejects
 names that spell one out (in any casing). An explicit prefix could contradict
 the deployment — `__Host-` without `Secure`, or off `Path=/` — and browsers
 **silently discard** such a `Set-Cookie`, which surfaces as a mystery login
-loop with nothing in any log. Configure the bare name; the wire name gets the
-strongest prefix the deployment can honor.
+loop with nothing in any log. Configuration accepts the bare name; the engine
+derives the wire name with the strongest prefix the deployment can honor.
 
 ## AEAD associated data
 

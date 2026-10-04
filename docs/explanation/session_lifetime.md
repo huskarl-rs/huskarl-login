@@ -14,9 +14,7 @@ refresh token, re-verified
 on every token refresh (roughly once per access-token lifetime). This is
 strongest when the AS binds refresh tokens to its SSO session: the
 application session then mirrors the SSO idle and maximum lifetimes, enforced
-by the party that owns identity policy. Before choosing it, verify the AS
-actually bounds refresh-token lifetime — offline tokens or non-expiring
-refresh tokens make the delegated cap meaningless.
+by the party that owns identity policy.
 
 What delegation does **not** provide:
 
@@ -24,12 +22,18 @@ What delegation does **not** provide:
   honors the token, not that the user recently re-authenticated.
 - **Cookie-theft containment** — with
   [`CookieSessionStore`](crate::CookieSessionStore) the refresh token travels
-  in the cookie, so a stolen copy refreshes as well as the original; prefer a
-  bounded lifetime with that store.
+  in the cookie, so a stolen copy refreshes as well as the original.
 - **Storage bounds from the AS** — the AS's refresh-token lifetime is not
   observable here, so external-store records and liveness entries are bounded
   by the activity horizon instead (default 30 days of inactivity) — see the
   [external store guide](crate::_docs::how_to::external_store).
+
+### Choosing delegated lifetime
+
+Before choosing delegation for your deployment, verify that the AS actually
+bounds refresh-token lifetime. Offline tokens or non-expiring refresh tokens
+make the delegated cap meaningless. With cookie sessions, prefer a bounded
+lifetime to limit how long a stolen cookie remains usable.
 
 ## Bounding in this crate
 

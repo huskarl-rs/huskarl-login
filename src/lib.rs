@@ -37,6 +37,8 @@
 //!                      managed state ───┘
 //! ```
 //!
+//! ## Choose session storage
+//!
 //! Choose [`CookieSessionStore`] to keep the encrypted session in the browser.
 //! Choose [`StoreBackedSessionStore`] to keep only an encrypted lookup key in
 //! the browser and store the session through an [`ExternalSessionStore`].
