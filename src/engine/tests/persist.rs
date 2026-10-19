@@ -60,7 +60,14 @@ fn cancelled_commit_counts_only_an_unpolled_persist_as_dropped() {
             u64::from(!poll_commit)
         );
         if poll_commit || !cfg!(feature = "metrics") {
-            assert_eq!(counters, [] as [(std::string::String, std::vec::Vec<(std::string::String, std::string::String)>, u64); 0]);
+            assert_eq!(
+                counters,
+                [] as [(
+                    std::string::String,
+                    std::vec::Vec<(std::string::String, std::string::String)>,
+                    u64
+                ); 0]
+            );
         }
     }
 }
