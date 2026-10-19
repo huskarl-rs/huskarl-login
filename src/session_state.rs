@@ -72,6 +72,12 @@ pub struct SessionState {
     /// affects existing sessions.
     #[serde(with = "option_unix_secs")]
     pub expire_at: Option<SystemTime>,
+    /// Store-backed tombstone written by a conditional teardown before the
+    /// record is deleted. A tombstoned record is treated as missing, so a
+    /// failed delete cannot leave it usable and a racing write cannot revive it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[builder(skip)]
+    pub(crate) terminated: bool,
 }
 
 impl SessionState {
@@ -117,6 +123,7 @@ impl SessionState {
             sid,
             created_at: now,
             expire_at: max_lifetime.map(|max| bounded_time_add(now, max)),
+            terminated: false,
         }
     }
 

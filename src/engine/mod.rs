@@ -33,13 +33,12 @@ use crate::{
     },
     cookie::SessionCipher,
     core::{
-        Error, RetryAdvice,
+        Error, OAuthErrorCode, RetryAdvice,
         crypto::seal::AeadSealerUnsealer,
         platform::{Duration, MaybeSendSync, SystemTime, sleep},
         serde_utils::time::unix_secs,
     },
     metrics::{LoginCompleteResult, LoginStartResult, RefreshResult},
-    session::advises_retry,
     session_state::bounded_time_add,
 };
 
@@ -393,10 +392,17 @@ pub enum LoadedSession<S> {
         set_cookies: SetCookies,
     },
     /// A session was presented, its access token has expired, and the token
-    /// refresh failed **transiently** — authentication can be neither
-    /// confirmed nor refuted right now. The session and its cookies are
-    /// retained so a later request can retry the refresh once the
-    /// authorization server recovers.
+    /// refresh failed without an `invalid_grant` verdict — authentication
+    /// can be neither confirmed nor refuted right now. The session and its
+    /// cookies are retained so a later request can retry the refresh once the
+    /// authorization server recovers or the client configuration is fixed.
+    ///
+    /// Also returned when the refresh was conclusively rejected (or there was
+    /// no refresh token) but the session store failed while checking whether a
+    /// concurrent request had already refreshed the session. Tearing down on a
+    /// guess could log the user out of that request's new credentials. If
+    /// newer credentials are found but their access token has already expired,
+    /// this outcome also keeps the session for a later refresh.
     ///
     /// Serve a retryable error (e.g. `503` with `Retry-After`, via
     /// [`LoginEngine::render_error`]). Do **not** treat the request as
@@ -663,8 +669,8 @@ pub enum TeardownReason {
     IdleTimeout,
     /// Session timestamps too far in the future — corrupt or forged.
     ClockSkew,
-    /// The authorization server conclusively rejected the refresh token
-    /// (e.g. `invalid_grant`).
+    /// The authorization server rejected the refresh token with
+    /// `invalid_grant`.
     RefreshRejected,
     /// The access token expired and the session holds no refresh token.
     NoRefreshToken,
@@ -1170,12 +1176,13 @@ where
         None
     }
 
-    /// Exchanges the refresh token. A transient failure while the access token
-    /// is still valid retains the session and keeps serving; a transient
-    /// failure after token expiry retains the session but yields
-    /// [`LoadedSession::RefreshUnavailable`] (fail the request, not the
-    /// session); only a conclusive rejection — or an expired access token with
-    /// no refresh token — tears the session down and emits cookie clears.
+    /// Exchanges the refresh token. Any failure other than `invalid_grant`
+    /// retains the session: it keeps serving while the access token is still
+    /// valid, and yields [`LoadedSession::RefreshUnavailable`] after expiry
+    /// (fail the request, not the session). Only `invalid_grant` — or an
+    /// expired access token with no refresh token — tears the session down
+    /// and emits cookie clears, but only if no concurrent request has committed
+    /// newer credentials first.
     async fn refresh_or_clear(
         &self,
         mut session: SD::SessionType,
@@ -1191,11 +1198,14 @@ where
                     set_cookies: SetCookies::default(),
                 };
             }
-            let clears = self.terminate_best_effort(&session, headers).await;
-            self.record_refresh(&RefreshResult::NoRefreshToken);
-            let reason = TeardownReason::NoRefreshToken;
-            self.record_teardown(reason);
-            return LoadedSession::Cleared { reason, clears };
+            return self
+                .teardown_observed(
+                    &session,
+                    headers,
+                    TeardownReason::NoRefreshToken,
+                    &RefreshResult::NoRefreshToken,
+                )
+                .await;
         };
         match self.refresh_with_retry(&rt).await {
             Ok(token_response) => {
@@ -1250,9 +1260,26 @@ where
                     }
                 }
             }
-            // Re-read the clock: the retry loop slept, and the token may have
-            // expired while we were waiting.
-            Err(e) if advises_retry(&e) && SystemTime::now() < session.token_expiry() => {
+            // `invalid_grant` is the only response that says something about
+            // the refresh token itself (RFC 6749 §5.2): invalid, expired,
+            // revoked — possibly by reuse detection. Tear the session down
+            // unless a concurrent request has already committed a newer one
+            // (it rotated the token we sent).
+            Err(e) if rejects_refresh_token(&e) => {
+                self.diagnose(DiagnosticOperation::Refresh, &e);
+                self.teardown_observed(
+                    &session,
+                    headers,
+                    TeardownReason::RefreshRejected,
+                    &RefreshResult::Failed,
+                )
+                .await
+            }
+            // Every other failure — transient, a client or configuration
+            // error, an unparseable or oversized response — refutes nothing
+            // about this session. Re-read the clock: the retry loop slept, and
+            // the token may have expired while we were waiting.
+            Err(e) if SystemTime::now() < session.token_expiry() => {
                 self.diagnose(DiagnosticOperation::Refresh, &e);
                 self.record_refresh(&RefreshResult::FailedRetained);
                 // Rare transient path — retain as-is without an activity touch;
@@ -1262,27 +1289,60 @@ where
                     set_cookies: SetCookies::default(),
                 }
             }
-            // Transient failure past token expiry: authentication can be
-            // neither confirmed nor refuted, so fail the *request*, not the
-            // session. Deleting here would permanently destroy a session (and
-            // its refresh token) that resumes by itself once the authorization
-            // server recovers — an AS blip at the wrong moment must not force
-            // every idle user back through login.
-            Err(e) if advises_retry(&e) => {
+            // Failure past token expiry: authentication can be neither
+            // confirmed nor refuted, so fail the *request*, not the session.
+            // Deleting here would permanently destroy a session (and its
+            // refresh token) that resumes by itself once the authorization
+            // server recovers or the deployment is fixed — an AS blip at the
+            // wrong moment must not force every idle user back through login.
+            Err(e) => {
                 self.diagnose(DiagnosticOperation::Refresh, &e);
                 self.record_refresh(&RefreshResult::FailedUnavailable);
                 LoadedSession::RefreshUnavailable
             }
-            // Conclusive rejection (e.g. `invalid_grant`, possibly
-            // reuse-detection revocation): the AS disowned the refresh token,
-            // so the session is dead — tear it down.
-            Err(e) => {
-                self.diagnose(DiagnosticOperation::Refresh, &e);
-                let reason = TeardownReason::RefreshRejected;
-                let clears = self.terminate_best_effort(&session, headers).await;
-                self.record_refresh(&RefreshResult::Failed);
+        }
+    }
+
+    /// Tears down a session because of its observed refresh credentials,
+    /// unless another request has replaced them in the meantime.
+    ///
+    /// A stale observation serves the current session while its access token
+    /// is valid, otherwise yielding `RefreshUnavailable`. Both outcomes keep
+    /// the browser cookies: they point at the same record. A storage failure
+    /// leaves the outcome unknown, so the session and cookies are retained and
+    /// only this request fails. The next request re-evaluates the session.
+    async fn teardown_observed(
+        &self,
+        session: &SD::SessionType,
+        headers: &HeaderMap,
+        reason: TeardownReason,
+        result: &RefreshResult,
+    ) -> LoadedSession<SD::SessionType> {
+        match self.session_store.revoke_observed(session).await {
+            Ok(None) => {
+                let clears = self.set_cookies(self.session_store.clear_session_cookies(headers));
+                self.record_refresh(result);
                 self.record_teardown(reason);
                 LoadedSession::Cleared { reason, clears }
+            }
+            Ok(Some(current)) => {
+                // A newer revision can expire while this request waits for
+                // its exchange. Keep it for a later refresh, but do not serve
+                // an expired access token.
+                if SystemTime::now() >= current.token_expiry() {
+                    self.record_refresh(&RefreshResult::FailedUnavailable);
+                    return LoadedSession::RefreshUnavailable;
+                }
+                self.record_refresh(&RefreshResult::Superseded);
+                LoadedSession::Active {
+                    session: current,
+                    set_cookies: SetCookies::default(),
+                }
+            }
+            Err(e) => {
+                self.diagnose(DiagnosticOperation::Revoke, &e);
+                self.record_refresh(&RefreshResult::FailedUnavailable);
+                LoadedSession::RefreshUnavailable
             }
         }
     }
@@ -1482,6 +1542,15 @@ where
 }
 
 // ── Utility functions ─────────────────────────────────────────────────────────
+
+/// Whether a refresh failure is the authorization server's verdict that the
+/// refresh token is no longer valid, as opposed to a failure that says
+/// nothing about it.
+fn rejects_refresh_token(error: &Error) -> bool {
+    error
+        .verdict()
+        .is_some_and(|verdict| *verdict.code() == OAuthErrorCode::InvalidGrant)
+}
 
 /// Maximum number of refresh attempts (initial + retries) before giving up.
 const REFRESH_MAX_ATTEMPTS: u32 = 3;

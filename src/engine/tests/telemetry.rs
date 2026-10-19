@@ -330,10 +330,10 @@ fn metrics_refresh_failed_when_grant_refresh_fails() {
             Some(RefreshToken::new(SecretString::new("test_refresh"), None)),
             SystemTime::now(),
         );
-        let e = engine(MockSessionStore::with_session(session)).await;
+        let (e, _) = engine_rejecting_refresh(MockSessionStore::with_session(session)).await;
         let _ = e.load_session(&HeaderMap::new()).await.unwrap();
     });
-    // The engine's HTTP double fails non-retryably — a conclusive rejection.
+    // The authorization server answers `invalid_grant` — a conclusive rejection.
     assert_eq!(
         counter_value(
             &counters,

@@ -441,7 +441,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         F: Fn(&mut E::SessionType) -> Result<(), SessionError> + MaybeSend,
     {
         for _ in 0..UPDATE_MAX_ATTEMPTS {
-            let Some((mut session, version)) = self.external.load(session_key).await? else {
+            let Some((mut session, version)) = self.load_live(session_key).await? else {
                 return Err(SessionError::new(SessionErrorKind::Gone, SessionNotFound));
             };
             mutate(&mut session)?;
@@ -477,7 +477,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
         lifetime: Duration,
     ) -> Result<E::SessionType, SessionError> {
         for _ in 0..UPDATE_MAX_ATTEMPTS {
-            let Some((mut fresh, version)) = self.external.load(key).await? else {
+            let Some((mut fresh, version)) = self.load_live(key).await? else {
                 return Err(SessionError::new(SessionErrorKind::Gone, SessionNotFound));
             };
             if fresh.state().refresh_revision != expected_revision {
@@ -668,7 +668,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             DriverLoad::Valid(key) => key,
         };
 
-        Ok(match self.external.load(session_key).await? {
+        Ok(match self.load_live(session_key).await? {
             Some((session, _version)) => DriverLoad::Valid(session),
             None => DriverLoad::Invalid(InvalidSessionReason::SessionNotFound),
         })
@@ -680,7 +680,7 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
     ) -> Result<Vec<HeaderValue>, SessionError> {
         let key = session.persisted().session_key;
         for _ in 0..UPDATE_MAX_ATTEMPTS {
-            let Some((current, version)) = self.external.load(key).await? else {
+            let Some((current, version)) = self.load_live(key).await? else {
                 return Err(SessionError::new(SessionErrorKind::Gone, SessionNotFound));
             };
             if !session.state().matches_persisted_refresh(current.state()) {
@@ -733,6 +733,85 @@ impl<E: ExternalSessionStore> StoreBackedSessionStore<E> {
             }
         }
         Ok(())
+    }
+
+    /// Load a record, treating a tombstone left by
+    /// [`revoke_observed_session`](Self::revoke_observed_session) as missing.
+    async fn load_live(&self, session_key: Uuid) -> Result<LoadOutcome<E>, SessionError> {
+        Ok(self
+            .external
+            .load(session_key)
+            .await?
+            .filter(|(session, _)| !session.state().terminated))
+    }
+
+    /// Revoke the session only while it still holds the refresh revision the
+    /// caller observed, returning the current session otherwise.
+    ///
+    /// The trait's `delete` is unconditional, so the check is made durable by
+    /// first writing a tombstone through `compare_and_swap`: a refresh
+    /// committed after our load makes that write conflict, and every later
+    /// writer sees the tombstone as a missing record. The delete that follows
+    /// is cleanup; if it fails, the tombstone expires under the record's TTL.
+    pub(crate) async fn revoke_observed_session(
+        &self,
+        observed: &E::SessionType,
+    ) -> Result<Option<E::SessionType>, SessionError> {
+        let key = observed.persisted().session_key;
+        let observed_revision = observed.state().refresh_revision;
+        for _ in 0..UPDATE_MAX_ATTEMPTS {
+            let Some((current, version)) = self.external.load(key).await? else {
+                return Ok(None);
+            };
+            if current.state().terminated {
+                self.delete_tombstone(&current).await;
+                return Ok(None);
+            }
+            if current.state().refresh_revision != observed_revision {
+                return Ok(Some(current));
+            }
+            let mut tombstone = current.clone();
+            let mut state = tombstone.state().clone();
+            state.terminated = true;
+            // Drop the disowned credential, and advance the revision so that
+            // a writer which does not know about tombstones still conflicts.
+            state.refresh_token = None;
+            state.refresh_revision = observed_revision.saturating_add(1);
+            tombstone.set_state(state);
+            match self
+                .external
+                .compare_and_swap(
+                    &tombstone,
+                    version,
+                    self.write_deadline(&current, SystemTime::now()),
+                )
+                .await?
+            {
+                SaveOutcome::Committed => {
+                    self.delete_tombstone(&tombstone).await;
+                    return Ok(None);
+                }
+                SaveOutcome::Conflict => {}
+                SaveOutcome::Missing => return Ok(None),
+            }
+        }
+        Err(SessionError::new(
+            SessionErrorKind::Conflict,
+            VersionConflict,
+        ))
+    }
+
+    /// Best-effort removal of a tombstoned record and its liveness entry. The
+    /// tombstone already reads as missing, so failures only delay cleanup.
+    async fn delete_tombstone(&self, tombstone: &E::SessionType) {
+        if self.external.delete(tombstone).await.is_err() {
+            return;
+        }
+        if let Some((liveness, _)) = &self.liveness
+            && let Err(_error) = liveness.clear(tombstone.persisted().session_key).await
+        {
+            self.record_liveness_failure(&LivenessFailure::Clear);
+        }
     }
 
     /// Clears the browser's pointer cookie and key-identity sidecar without
@@ -938,6 +1017,13 @@ impl<E: ExternalSessionStore> SessionDriver for StoreBackedSessionStore<E> {
 
     async fn revoke(&self, session: &E::SessionType) -> Result<(), SessionError> {
         self.revoke_session(session).await
+    }
+
+    async fn revoke_observed(
+        &self,
+        session: &E::SessionType,
+    ) -> Result<Option<E::SessionType>, SessionError> {
+        self.revoke_observed_session(session).await
     }
 }
 

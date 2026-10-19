@@ -20,11 +20,13 @@ Use configuration names, not user or request identifiers.
 Start with these observations; the full label schema and counting boundaries
 are in the [`metrics`](crate::metrics) reference:
 
-| Counter | Investigate when it increases |
+| Counter | Meaning |
 | --- | --- |
 | `huskarl.login.complete` with a failure outcome | Callback validation, provider exchange, or session creation failed. |
-| `huskarl.login.handled_failure` | The engine consumed an error; inspect its `operation` and your diagnostic handler. |
-| `huskarl.session.refresh` with `failed_unavailable` | An expired token could not be refreshed; check provider availability. |
+| `huskarl.login.handled_failure` | The engine consumed an error, classified by `operation`. |
+| `huskarl.session.refresh` with `failed_unavailable` | The request could not be served; the session was retained for a later attempt. |
+| `huskarl.session.refresh` with `failed` | Refresh was rejected and the session cleared. |
+| `huskarl.session.refresh` with `superseded` | Concurrent requests refreshed the same session; the loser kept the winner's credentials. |
 | `huskarl.session.dropped` | An adapter dropped cookie updates or a pending persistence retry. |
 | `huskarl.session.liveness_failure` | Idle tracking failed open or could not record/clear activity. |
 | `huskarl.session.superseded_delete` with `load_failed` or `delete_failed` | Re-login could not clean up the previous server-side session. |
@@ -32,6 +34,10 @@ are in the [`metrics`](crate::metrics) reference:
 These populations overlap. A refresh success counts the exchange, not successful
 persistence or browser receipt; a dropped-work counter does not detect every
 cancelled operation.
+
+Investigate refresh failures when they persist or cause an unacceptable rate of
+failed requests or repeat logins. An occasional `failed_unavailable` outcome may
+recover on the next request; an increase alone does not require intervention.
 
 ## Attach an engine diagnostic handler
 

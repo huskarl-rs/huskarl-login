@@ -27,6 +27,13 @@ If reuse invalidates the retained credentials, resolve exchange coordination
 before rollout. A grace period only tolerates bounded delays; passing this
 check does not establish safety for arbitrary request delays.
 
+Also test a lost refresh response followed by another attempt. Until your
+integration coordinates uncertain exchanges with durable intent, select a
+provider policy that tolerates replay, such as a reuse grace period or rotation
+without family revocation on reuse, or explicitly accept occasional new logins.
+See [Unknown exchange outcomes](crate::_docs::explanation::refresh#unknown-exchange-outcomes)
+for the limits of retries and coordination.
+
 ## 2. Inspect the engine's actual exchange path
 
 `LoginEngine` calls `RefreshGrant::exchange` directly. The client's `TokenCache`

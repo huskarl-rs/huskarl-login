@@ -87,6 +87,46 @@ impl HttpClient for FailingHttp {
     }
 }
 
+/// Answers every request with `400 invalid_grant`: the authorization server's
+/// verdict that the presented refresh token is no longer valid.
+struct RejectingHttp {
+    calls: Arc<AtomicU32>,
+}
+
+impl RejectingHttp {
+    fn new() -> (Self, Arc<AtomicU32>) {
+        let calls = Arc::new(AtomicU32::new(0));
+        (
+            Self {
+                calls: Arc::clone(&calls),
+            },
+            calls,
+        )
+    }
+}
+
+impl HttpClient for RejectingHttp {
+    fn execute(
+        &self,
+        _: http::Request<Bytes>,
+        _: Idempotency,
+    ) -> MaybeSendBoxFuture<'_, Result<HttpResponse, Error>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            Ok(HttpResponse {
+                status: StatusCode::BAD_REQUEST,
+                headers,
+                body: Bytes::from_static(br#"{"error":"invalid_grant"}"#),
+            })
+        })
+    }
+}
+
 /// Answers every request with a minimal valid token response, exercising the
 /// success paths (token exchange on callback, token refresh).
 struct TokenHttp;
@@ -292,6 +332,9 @@ struct MockSessionStore {
     /// falls back to [`NoopSealer`]; a test that exercises the engine's
     /// default-login-state-sealer path sets a real sealer here.
     store_cipher: Option<Arc<dyn AeadSealerUnsealer>>,
+    /// The newer session [`SessionDriver::revoke_observed`] reports instead of
+    /// revoking, as if a concurrent refresh had committed first.
+    superseded_by: Mutex<Option<MockSession>>,
 }
 
 /// The `Set-Cookie` value [`MockSessionStore::save`] returns, so tests can
@@ -314,6 +357,7 @@ impl MockSessionStore {
             last_record_activity: Mutex::new(None),
             applied_policy: Mutex::new(None),
             store_cipher: None,
+            superseded_by: Mutex::new(None),
         }
     }
     fn with_session_failing_save(s: MockSession) -> Self {
@@ -325,6 +369,12 @@ impl MockSessionStore {
     fn with_session_gone_on_save(s: MockSession) -> Self {
         Self {
             gone_on_save: true,
+            ..Self::with_session(s)
+        }
+    }
+    fn with_session_superseded_by(s: MockSession, current: MockSession) -> Self {
+        Self {
+            superseded_by: Mutex::new(Some(current)),
             ..Self::with_session(s)
         }
     }
@@ -357,6 +407,7 @@ impl MockSessionStore {
             last_record_activity: Mutex::new(None),
             applied_policy: Mutex::new(None),
             store_cipher: None,
+            superseded_by: Mutex::new(None),
         }
     }
     fn with_invalid_load(reason: crate::InvalidSessionReason) -> Self {
@@ -481,6 +532,12 @@ impl SessionDriver for MockSessionStore {
     ) -> Result<LivenessVerdict, SessionError> {
         *self.last_record_activity.lock().unwrap() = Some(record_activity);
         Ok(self.verdict)
+    }
+    async fn revoke_observed(&self, s: &MockSession) -> Result<Option<MockSession>, SessionError> {
+        if let Some(current) = self.superseded_by.lock().unwrap().take() {
+            return Ok(Some(current));
+        }
+        self.revoke(s).await.map(|()| None)
     }
     async fn revoke(&self, _: &MockSession) -> Result<(), SessionError> {
         *self.revoke_called.lock().unwrap() = true;
@@ -669,6 +726,22 @@ fn refreshable_session(token_expiry: SystemTime) -> MockSession {
         Some(RefreshToken::new(SecretString::new("test_refresh"), None)),
         SystemTime::now(),
     )
+}
+
+/// Engine whose grant answers every token request with `invalid_grant`,
+/// returning the HTTP call counter alongside.
+async fn engine_rejecting_refresh(
+    store: MockSessionStore,
+) -> (LoginEngine<MockSessionStore>, Arc<AtomicU32>) {
+    let (http, calls) = RejectingHttp::new();
+    let e = LoginEngine::builder()
+        .config(default_config())
+        .grant(test_grant(http).await)
+        .session_store(store)
+        .sealer(test_sealer().await)
+        .build()
+        .unwrap();
+    (e, calls)
 }
 
 /// Engine whose grant fails every token request with the given retryability,

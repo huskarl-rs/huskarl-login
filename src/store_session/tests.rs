@@ -493,6 +493,8 @@ struct VersioningStore {
     /// `compare_and_swap` (advancing the stored version), to force one
     /// conflict-then-retry.
     inject_once: std::sync::Mutex<Option<fn(&mut MinimalSession)>>,
+    /// When `true`, every `delete` fails without removing the record.
+    fail_delete: bool,
 }
 
 impl VersioningStore {
@@ -503,6 +505,7 @@ impl VersioningStore {
             always_conflict: false,
             lose_ack_once: std::sync::Mutex::new(false),
             inject_once: std::sync::Mutex::new(None),
+            fail_delete: false,
         }
     }
 
@@ -562,6 +565,12 @@ impl ExternalSessionStore for VersioningStore {
         }
     }
     async fn delete(&self, _: &MinimalSession) -> Result<(), SessionError> {
+        if self.fail_delete {
+            return Err(SessionError::new(
+                SessionErrorKind::Unavailable,
+                std::io::Error::other("delete failed"),
+            ));
+        }
         *self.stored.lock().unwrap() = None;
         Ok(())
     }
@@ -1503,6 +1512,146 @@ async fn deferred_refresh_cannot_resurrect_deleted_session() {
         .unwrap_err();
     assert_eq!(error.kind(), SessionErrorKind::Gone);
     assert!(store.external.stored.lock().unwrap().is_none());
+}
+
+// ── revoke_observed (refresh-observation teardown) ────────────────────
+
+#[tokio::test]
+async fn observed_teardown_deletes_unchanged_session() {
+    let snapshot = test_session();
+    let store = store_over(VersioningStore::with(snapshot.clone())).await;
+    let current = store.revoke_observed_session(&snapshot).await.unwrap();
+    assert!(current.is_none());
+    assert!(store.external.stored.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn observed_teardown_preserves_newer_refresh() {
+    // Another request rotated the token this request was rejected for, and
+    // committed before the teardown loaded the record.
+    let snapshot = test_session();
+    let mut winner = snapshot.clone();
+    winner.persisted.state.refresh_revision = 1;
+    winner.persisted.state.sid = Some("winning-refresh".to_owned());
+    let store = store_over(VersioningStore::with(winner)).await;
+
+    let current = store.revoke_observed_session(&snapshot).await.unwrap();
+
+    assert_eq!(current.unwrap().sid(), Some("winning-refresh"));
+    assert_eq!(store.external.stored_version(), 0);
+    let (stored, _) = store.external.load(Uuid::nil()).await.unwrap().unwrap();
+    assert!(!stored.state().terminated);
+}
+
+#[tokio::test]
+async fn observed_teardown_rechecks_revision_after_cas_conflict() {
+    // The winner commits between the teardown's load and its write: the
+    // tombstone write must conflict rather than delete the new credentials.
+    let snapshot = test_session();
+    let mut external = VersioningStore::with(snapshot.clone());
+    *external.inject_once.get_mut().unwrap() = Some(|s| {
+        s.persisted.state.refresh_revision = 1;
+        s.persisted.state.sid = Some("winning-refresh".to_owned());
+    });
+    let store = store_over(external).await;
+
+    let current = store.revoke_observed_session(&snapshot).await.unwrap();
+
+    assert_eq!(current.unwrap().state().refresh_revision, 1);
+    let (stored, version) = store.external.load(Uuid::nil()).await.unwrap().unwrap();
+    assert_eq!(version, 1);
+    assert_eq!(stored.sid(), Some("winning-refresh"));
+    assert!(!stored.state().terminated);
+}
+
+#[tokio::test]
+async fn observed_teardown_retries_unrelated_cas_conflict() {
+    // An application update changes the version but not the credentials, so
+    // the observation still holds and the session is torn down.
+    let snapshot = test_session();
+    let mut external = VersioningStore::with(snapshot.clone());
+    *external.inject_once.get_mut().unwrap() = Some(|s| {
+        s.persisted.state.sid = Some("application-update".to_owned());
+    });
+    let store = store_over(external).await;
+
+    let current = store.revoke_observed_session(&snapshot).await.unwrap();
+
+    assert!(current.is_none());
+    assert!(store.external.stored.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn tombstone_reads_as_missing_when_delete_fails() {
+    let mut snapshot = test_session();
+    let store = store_over(VersioningStore {
+        fail_delete: true,
+        ..VersioningStore::with(snapshot.clone())
+    })
+    .await;
+
+    assert!(
+        store
+            .revoke_observed_session(&snapshot)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let (stored, _) = store.external.load(Uuid::nil()).await.unwrap().unwrap();
+    assert!(stored.state().terminated);
+    assert!(stored.refresh_token().is_none());
+    assert_eq!(stored.state().refresh_revision, 1);
+    let key = snapshot.persisted().session_key;
+    assert_eq!(
+        store.update(key, |_| {}).await.err().map(|e| e.kind()),
+        Some(SessionErrorKind::Gone)
+    );
+    // A refresh still in flight for the torn-down revision cannot revive it.
+    let error = store
+        .apply_refresh_and_save(
+            &mut snapshot,
+            &refresh_token_response(),
+            0,
+            Duration::from_hours(1),
+            &http::HeaderMap::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), SessionErrorKind::Gone);
+    // A repeated teardown still treats it as gone.
+    assert!(
+        store
+            .revoke_observed_session(&snapshot)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn tombstoned_pointer_loads_as_missing_session() {
+    let snapshot = test_session();
+    let store = store_over(VersioningStore {
+        fail_delete: true,
+        ..VersioningStore::with(snapshot.clone())
+    })
+    .await;
+    let cookies = store
+        .pointer_cookie_headers(snapshot.persisted().session_key)
+        .await
+        .unwrap();
+    store.revoke_observed_session(&snapshot).await.unwrap();
+
+    let loaded = store
+        .load_session(&request_cookies(&cookies))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        loaded,
+        DriverLoad::Invalid(InvalidSessionReason::SessionNotFound)
+    ));
 }
 
 #[tokio::test]

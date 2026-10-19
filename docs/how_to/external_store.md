@@ -22,6 +22,13 @@ Your session type embeds a [`PersistedSessionState`](crate::PersistedSessionStat
 Implement `From<PersistedSessionState>` if you want the plain `build()`
 method.
 
+Persist the entire [`SessionState`](crate::SessionState) using its Serde
+implementation and deserialize it intact on load. Do not reconstruct it from
+only its public fields: private fields include the termination marker that
+keeps a session unusable if deletion fails after conditional teardown. For a
+column-based backend, store the serialized state in a dedicated column;
+application fields and the session key can use separate columns.
+
 ## 2. Implement atomic version checks
 
 Choose a version value that changes on every write. Return it from `load` and

@@ -43,9 +43,9 @@ async fn token_expired_refresh_fails_clears_session() {
         SystemTime::now(),
     );
     let store = MockSessionStore::with_session(session);
-    let e = engine(store).await;
+    let (e, _) = engine_rejecting_refresh(store).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
-    // The engine's HTTP double fails non-retryably — a conclusive rejection.
+    // The authorization server answers `invalid_grant`: a conclusive rejection.
     let (reason, _) = expect_cleared(loaded);
     assert_eq!(reason, TeardownReason::RefreshRejected);
     assert!(e.session_store.revoke_called());
@@ -211,15 +211,129 @@ async fn transient_refresh_failure_with_valid_token_retains_session() {
 }
 
 #[tokio::test]
-async fn non_retryable_refresh_failure_clears_session_even_with_valid_token() {
-    // The AS conclusively rejected the refresh token (e.g. invalid_grant —
+async fn rejected_refresh_clears_session_even_with_valid_token() {
+    // The AS conclusively rejected the refresh token (`invalid_grant` —
     // possibly reuse-detection revocation). Retention would serve a session
     // the AS just disowned; tear it down even though the token has 15s left.
     let session = refreshable_session(SystemTime::now() + Duration::from_secs(15));
-    let (e, _) = engine_with_failing_refresh(false, session).await;
+    let (e, calls) = engine_rejecting_refresh(MockSessionStore::with_session(session)).await;
     let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
     let (reason, _) = expect_cleared(loaded);
     assert_eq!(reason, TeardownReason::RefreshRejected);
+    assert!(e.session_store.revoke_called());
+    // A verdict is never retried.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn non_retryable_failure_without_verdict_retains_session_with_valid_token() {
+    // A failure that is not retryable but carries no `invalid_grant` verdict
+    // (a malformed or oversized response, a client misconfiguration) says
+    // nothing about the refresh token, so the session must survive it.
+    let session = refreshable_session(SystemTime::now() + Duration::from_secs(15));
+    let (e, calls) = engine_with_failing_refresh(false, session).await;
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    let (_session, set_cookies) = expect_active(loaded);
+    assert_eq!(set_cookies, [] as [HeaderValue; 0]);
+    assert!(!e.session_store.revoke_called());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn non_retryable_failure_without_verdict_after_expiry_is_unavailable() {
+    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    let (e, _) = engine_with_failing_refresh(false, session).await;
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+    assert!(
+        matches!(loaded, LoadedSession::RefreshUnavailable),
+        "expected RefreshUnavailable, got {}",
+        variant_name(&loaded)
+    );
+    assert!(!e.session_store.revoke_called());
+}
+
+#[tokio::test]
+async fn rejected_refresh_serves_concurrent_winner_without_clearing() {
+    // Two requests refreshed the same token; the other one rotated it and
+    // committed first, so this request's `invalid_grant` is stale. Deleting
+    // the record or clearing the shared pointer cookie would log the user
+    // out of the winner's fresh credentials.
+    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    let mut winner = refreshable_session(SystemTime::now() + Duration::from_hours(1));
+    winner.state.refresh_revision = 1;
+    let (e, _) = engine_rejecting_refresh(MockSessionStore::with_session_superseded_by(
+        session, winner,
+    ))
+    .await;
+
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+
+    let (current, set_cookies) = expect_active(loaded);
+    assert_eq!(current.state.refresh_revision, 1);
+    assert_eq!(set_cookies, [] as [HeaderValue; 0]);
+    assert!(!e.session_store.revoke_called());
+}
+
+#[tokio::test]
+async fn expired_concurrent_winner_is_retained_but_unavailable() {
+    // Both teardown paths must preserve a newer revision without serving
+    // its token if it has already expired.
+    for has_refresh_token in [true, false] {
+        let mut session = refreshable_session(SystemTime::now() - Duration::from_mins(2));
+        if !has_refresh_token {
+            session.state.refresh_token = None;
+        }
+        let mut winner = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+        winner.state.refresh_revision = 1;
+        let (e, calls) = engine_rejecting_refresh(MockSessionStore::with_session_superseded_by(
+            session, winner,
+        ))
+        .await;
+
+        let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+
+        assert!(matches!(loaded, LoadedSession::RefreshUnavailable));
+        assert!(!e.session_store.revoke_called());
+        assert_eq!(calls.load(Ordering::SeqCst), u32::from(has_refresh_token));
+    }
+}
+
+#[tokio::test]
+async fn missing_refresh_token_serves_concurrent_winner_without_clearing() {
+    let session = session_with(
+        SystemTime::now() - Duration::from_mins(1),
+        None,
+        SystemTime::now(),
+    );
+    let mut winner = refreshable_session(SystemTime::now() + Duration::from_hours(1));
+    winner.state.refresh_revision = 1;
+    let e = engine(MockSessionStore::with_session_superseded_by(
+        session, winner,
+    ))
+    .await;
+
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+
+    let (current, set_cookies) = expect_active(loaded);
+    assert!(current.refresh_token().is_some());
+    assert_eq!(set_cookies, [] as [HeaderValue; 0]);
+}
+
+#[tokio::test]
+async fn rejected_refresh_with_failed_teardown_retains_session() {
+    // The teardown could not establish whether a newer refresh exists, so
+    // neither the record nor the browser cookies may be cleared on a guess.
+    let session = refreshable_session(SystemTime::now() - Duration::from_mins(1));
+    let (e, _) =
+        engine_rejecting_refresh(MockSessionStore::with_session_failing_revoke(session)).await;
+
+    let loaded = e.load_session(&HeaderMap::new()).await.unwrap();
+
+    assert!(
+        matches!(loaded, LoadedSession::RefreshUnavailable),
+        "expected RefreshUnavailable, got {}",
+        variant_name(&loaded)
+    );
     assert!(e.session_store.revoke_called());
 }
 

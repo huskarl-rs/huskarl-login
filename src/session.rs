@@ -463,4 +463,24 @@ pub trait SessionDriver: sealed::Sealed + MaybeSendSync {
         &self,
         session: &Self::SessionType,
     ) -> impl Future<Output = Result<(), SessionError>> + MaybeSend;
+
+    /// Revoke a session because of what this request observed about its
+    /// credentials (a rejected or missing refresh token), unless another
+    /// request has since replaced them.
+    ///
+    /// Returns `Ok(None)` when the observed session is gone, and
+    /// `Ok(Some(current))` when the stored refresh revision no longer matches
+    /// `session`: the observation is stale, so the browser cookies must be
+    /// kept. Serve `current` only while its access token is still valid.
+    /// Unlike [`revoke`](Self::revoke), this never deletes a newer refresh
+    /// committed by a concurrent request.
+    ///
+    /// The default implementation calls [`revoke`](Self::revoke), which is
+    /// correct for cookie sessions: they have no authoritative state to check.
+    fn revoke_observed(
+        &self,
+        session: &Self::SessionType,
+    ) -> impl Future<Output = Result<Option<Self::SessionType>, SessionError>> + MaybeSend {
+        async move { self.revoke(session).await.map(|()| None) }
+    }
 }

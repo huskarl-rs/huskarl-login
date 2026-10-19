@@ -65,12 +65,15 @@ discards the cookies at compile time, so the engine hands them out wrapped in
 [`SetCookies`](crate::engine::SetCookies) — a drop guard that counts unconsumed,
 non-empty cookie updates when the `metrics` feature is enabled.
 
-## Transient vs conclusive failure
+## Unavailability vs rejection
 
-A *transient* refresh failure (a brief authorization-server blip) never tears
-the session down — only a conclusive rejection (the AS disowned the refresh
-token, e.g. `invalid_grant`) does. What a transient failure changes is whether
-the *request* can be served:
+Only a conclusive rejection tears the session down: an `invalid_grant` verdict,
+which is how the AS reports that the refresh token is invalid, expired or revoked
+(RFC 6749 §5.2). Every other failure says nothing about the refresh token and
+is handled as unavailability. That includes a brief authorization-server blip, a
+`5xx` or `429`, a malformed or oversized response, and client misconfiguration
+such as `invalid_client`. Such a failure changes whether the *request* can be
+served:
 
 - access token **still valid** → the session is retained and served as
   [`Active`](crate::engine::LoadedSession::Active); a later request re-enters
@@ -83,13 +86,14 @@ the *request* can be served:
   into a login flow against the same unavailable server.
 
 Failing the request instead of deleting the session matters because deletion is
-irreversible: an AS outage longer than a token lifetime would otherwise destroy
-every idle user's session (and refresh token) even though all of them would
-resume by themselves the moment the AS recovers. Refreshes are retried a few
-times with exponential backoff and jitter so a short outage doesn't produce a
-synchronized thundering herd. A delay the authorization server itself asks for
-(`Retry-After`, or a `slow_down` verdict) extends that backoff when it is
-longer, but only up to a one-second budget: the retries happen inside a request
+irreversible: an AS outage or a deployment misconfiguration that outlasts a token
+lifetime would otherwise destroy every idle user's session (and refresh token)
+even though they could resume once the AS recovers or the configuration is
+fixed. Retryable refresh failures are retried a few times with exponential
+backoff and jitter so a short outage doesn't produce a synchronized thundering
+herd. A delay requested by the authorization server (`Retry-After` or a
+`slow_down` verdict) extends that backoff when it is longer, but only up to a
+one-second budget: the retries happen inside a request
 the browser is waiting on, so a longer delay ends the attempts and leaves the
 outcome to the retained-session paths above.
 
@@ -112,6 +116,30 @@ provider-side reuse detection. It also cannot guarantee that the first result
 committed remains usable if another exchange invalidates it at the provider.
 Exchange coordination would require an explicit integration around this path,
 shared across replicas, and an appropriate provider policy.
+
+A rejection can itself be stale: the losing request's token was rotated by the
+winner. A store-backed teardown therefore applies only while the record still
+holds the refresh revision the rejected request observed. If a newer refresh
+has been committed, the loser keeps the browser cookies and serves that session
+while its access token is valid. If that token has already expired, the request
+yields [`RefreshUnavailable`](crate::engine::LoadedSession::RefreshUnavailable)
+and retains the session for a later refresh.
+If the store fails while checking, the request yields
+[`RefreshUnavailable`](crate::engine::LoadedSession::RefreshUnavailable) rather
+than tearing down on a guess. Cookie sessions have no shared record to check.
+
+### Unknown exchange outcomes
+
+A timeout or `5xx` does not show whether the AS consumed the refresh token. The
+engine keeps no durable record of that uncertainty, so a later attempt, whether
+an in-request retry or the next request, presents the same token again. Under
+strict rotation with reuse detection, this can revoke the session's token
+family. That includes credentials another request has already committed, because
+the original exchange may still reach the AS after a later one succeeds (see
+RFC 9700 §4.14.2). Changing the retry policy does not remove this: skipping a
+retry only moves the replay to the next request. Neither expiry of the original
+attempt nor token introspection establishes that the original exchange can no
+longer be processed.
 
 Cookie sessions additionally depend on browser delivery order. Even identical
 responses for one input token can be delivered after a later generation has

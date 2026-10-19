@@ -7,7 +7,7 @@
 //! |---------|--------|
 //! | `huskarl.login.start` | `outcome`: `ok`, `error` |
 //! | `huskarl.login.complete` | `outcome`: `ok`, `already_authenticated`, `as_denied`, `invalid_request`, `state_invalid`, `token_exchange_failed`, `session_create_failed`; `error`: the normalized AS error code for `as_denied` (RFC 6749 / OIDC Core codes, else `other`), `none` otherwise |
-//! | `huskarl.session.refresh` | `outcome`: `ok`, `no_refresh_token`, `failed`, `failed_retained`, `failed_unavailable` |
+//! | `huskarl.session.refresh` | `outcome`: `ok`, `no_refresh_token`, `failed`, `failed_retained`, `failed_unavailable`, `superseded` |
 //! | `huskarl.session.teardown` | `reason`: [`TeardownReason`] values (`max_lifetime`, `idle_timeout`, …); `invalid_reason`: the [`InvalidSessionReason`] value when `reason` is `invalid_session`, `none` otherwise |
 //! | `huskarl.session.superseded_delete` | `outcome`: `deleted`, `not_found`, `load_failed`, `delete_failed` |
 //! | `huskarl.session.liveness_failure` | `op`: `read` (failed open), `touch`, `clear` |
@@ -231,14 +231,18 @@ pub(crate) enum RefreshResult {
     Ok,
     /// The token refresh request failed conclusively — session was cleared.
     Failed,
-    /// The refresh failed with a retryable error while the access token was
-    /// still valid — the session was retained and keeps being served.
+    /// The refresh failed without an `invalid_grant` verdict while the access
+    /// token was still valid — the session was retained and keeps being served.
     FailedRetained,
-    /// The refresh failed with a retryable error after the access token had
-    /// expired — the session was retained for a later retry, but the request
-    /// could not be served
+    /// The request could not be served, but the session was retained: refresh
+    /// failed without an `invalid_grant` verdict after access-token expiry,
+    /// a concurrent winner's token had expired, or conditional teardown failed
     /// ([`LoadedSession::RefreshUnavailable`](crate::engine::LoadedSession::RefreshUnavailable)).
     FailedUnavailable,
+    /// The session's refresh token was rejected or missing, but another request
+    /// had already committed newer credentials, which were served instead of
+    /// tearing the session down.
+    Superseded,
 }
 
 impl RefreshResult {
