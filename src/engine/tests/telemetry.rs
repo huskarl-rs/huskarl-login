@@ -552,7 +552,14 @@ fn diagnostics_preserve_consumed_errors_independently_of_metrics() {
         1
     );
     #[cfg(not(feature = "metrics"))]
-    assert_eq!(counters, [] as [(std::string::String, std::vec::Vec<(std::string::String, std::string::String)>, u64); 0]);
+    assert_eq!(
+        counters,
+        [] as [(
+            std::string::String,
+            std::vec::Vec<(std::string::String, std::string::String)>,
+            u64
+        ); 0]
+    );
 }
 
 #[rstest]
@@ -626,7 +633,14 @@ fn diagnostics_allow_downcasting_consumed_session_errors(#[case] automatic_teard
         1
     );
     #[cfg(not(feature = "metrics"))]
-    assert_eq!(counters, [] as [(std::string::String, std::vec::Vec<(std::string::String, std::string::String)>, u64); 0]);
+    assert_eq!(
+        counters,
+        [] as [(
+            std::string::String,
+            std::vec::Vec<(std::string::String, std::string::String)>,
+            u64
+        ); 0]
+    );
 }
 
 #[test]
@@ -675,7 +689,14 @@ fn diagnostics_report_eager_persist_failure_once_before_deferred_recovery() {
         1
     );
     #[cfg(not(feature = "metrics"))]
-    assert_eq!(counters, [] as [(std::string::String, std::vec::Vec<(std::string::String, std::string::String)>, u64); 0]);
+    assert_eq!(
+        counters,
+        [] as [(
+            std::string::String,
+            std::vec::Vec<(std::string::String, std::string::String)>,
+            u64
+        ); 0]
+    );
 }
 
 #[test]
@@ -725,7 +746,14 @@ fn diagnostics_preserve_original_logout_load_error() {
         1
     );
     #[cfg(not(feature = "metrics"))]
-    assert_eq!(counters, [] as [(std::string::String, std::vec::Vec<(std::string::String, std::string::String)>, u64); 0]);
+    assert_eq!(
+        counters,
+        [] as [(
+            std::string::String,
+            std::vec::Vec<(std::string::String, std::string::String)>,
+            u64
+        ); 0]
+    );
 }
 
 #[test]
@@ -764,7 +792,14 @@ fn dropped_work_is_named_and_explicit_disposal_is_silent() {
         assert_eq!(counters.len(), 2);
     }
     #[cfg(not(feature = "metrics"))]
-    assert_eq!(counters, [] as [(std::string::String, std::vec::Vec<(std::string::String, std::string::String)>, u64); 0]);
+    assert_eq!(
+        counters,
+        [] as [(
+            std::string::String,
+            std::vec::Vec<(std::string::String, std::string::String)>,
+            u64
+        ); 0]
+    );
 }
 
 #[cfg(not(feature = "metrics"))]
@@ -791,7 +826,14 @@ fn disabled_metrics_emit_nothing_for_login_and_cookie_operations() {
         sealer.record_encrypt(Some("configured-key"));
         sealer.record_decrypt(&crate::metrics::DecryptResult::DecryptFailed);
     });
-    assert_eq!(counters, [] as [(std::string::String, std::vec::Vec<(std::string::String, std::string::String)>, u64); 0]);
+    assert_eq!(
+        counters,
+        [] as [(
+            std::string::String,
+            std::vec::Vec<(std::string::String, std::string::String)>,
+            u64
+        ); 0]
+    );
 }
 
 #[cfg(feature = "metrics")]
